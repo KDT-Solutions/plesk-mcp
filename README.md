@@ -105,7 +105,8 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8422` auf dem Docker-Hos
 | `lve_stats` | CloudLinux-LVE-Ressourcen-Faults (CPU/IO-Limits) |
 | `fpm_service_status` | Findet den PHP-FPM-Pool-Service der Domain und zeigt dessen Status |
 | `fpm_journal` | systemd-Journal des FPM-Service in einem Zeitfenster |
-| `search_log` | Durchsucht proxy_error_log/error_log/access_log |
+| `search_log` | Durchsucht proxy_error_log/error_log/access_log (optional inkl. rotierter .gz-Logs) |
+| `search_main_nginx_log` | Durchsucht das serverweite nginx-Log unter /var/log/nginx/ (access/error, optional inkl. rotierter .gz-Logs) - erfasst auch 408/523-Fehler vor dem Routing zum Vhost |
 | `check_oom_kills` | Kernel-OOM-Kills im Zeitfenster |
 | `disk_usage` | Speichernutzung des Vhost-Verzeichnisses |
 | `server_load` | Allgemeine Serverlast (uptime, free, Prozessanzahl) |

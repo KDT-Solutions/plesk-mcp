@@ -12,6 +12,10 @@
 """
 plesk-mcp
 
+Version: 0.2.0 (kein pyproject.toml mehr wie im alten src/-Package - Version
+wird hier im Docstring nachgeführt; Deployment-Tracking läuft sonst über den
+GHCR-Image-Tag/Git-SHA, analog zu bexio-mcp)
+
 Read-only MCP-Server für Diagnose auf einem Plesk-Server. Zwei Datenquellen:
 
 - SSH (paramiko) für alles, was nur auf Betriebssystem-Ebene existiert
@@ -109,6 +113,11 @@ ALLOWED_COMMAND_PREFIXES = {
     "free",
     "ps",
     "wc",
+    # Nur lesende Dekomprimierung von rotierten .gz-Logs - im Gegensatz zu
+    # "gunzip" (löscht standardmässig die Originaldatei) bewusst NICHT
+    # freigegeben, obwohl gunzip sonst ein plausibler Kandidat wäre.
+    "zcat",
+    "zgrep",
 }
 
 # Subcommands/Wörter, die trotz erlaubtem Programmnamen verboten bleiben
@@ -318,11 +327,16 @@ def backup_list(domain: str = "") -> str:
     oder gelöscht.
     """
     base = "/var/lib/psa/dumps"
+    # ".discovered"/".run" sind interne Plesk-Metadaten-Verzeichnisse (ein
+    # Eintrag pro Backup-Lauf, keine eigentlichen Backup-Dateien) - werden
+    # ausgeblendet (-prune), sonst ist die Ausgabe bei vielen Domains
+    # unlesbar lang.
+    prune = r"\( -name '.discovered' -o -name '.run' \) -prune -o"
     if domain:
         d = _domain_arg(domain)
-        cmd = f"find {base} -iname '*{d}*' -exec ls -lh {{}} \\; 2>&1"
+        cmd = f"find {base} {prune} -iname '*{d}*' -exec ls -lhd {{}} \\; 2>&1 | head -n 200"
     else:
-        cmd = f"find {base} -maxdepth 4 -type d 2>&1 | head -n 200"
+        cmd = f"find {base} {prune} -maxdepth 4 -type d -print 2>&1 | head -n 200"
     out = ssh_run(cmd)
     if not out or out == "(keine Ausgabe)":
         return f"Keine Backups gefunden (Pfad {base})."
@@ -424,22 +438,70 @@ def search_log(
     log_type: str = "proxy_error_log",
     pattern: str = "",
     lines: int = 200,
+    include_rotated: bool = False,
 ) -> str:
     """Durchsucht ein Vhost-Log der Domain nach einem optionalen Muster
     (regex, an grep -E übergeben) und gibt die letzten `lines` Treffer zurück.
     log_type: proxy_error_log | error_log | access_log
     Pfad: /var/www/vhosts/<domain>/logs/<log_type>
+    include_rotated: zusätzlich die rotierten, gzip-komprimierten Logs
+    (<log_type>-YYYYMMDD.gz im selben Verzeichnis) mit durchsuchen - nötig
+    für Vorfälle, die länger als die aktuelle Logrotation zurückliegen.
     """
     d = _domain_arg(domain)
     allowed_logs = {"proxy_error_log", "error_log", "access_log"}
     if log_type not in allowed_logs:
         raise ValueError(f"log_type muss einer von {allowed_logs} sein.")
 
-    path = f"/var/www/vhosts/{d}/logs/{log_type}"
+    log_dir = f"/var/www/vhosts/{d}/logs"
+    path = f"{log_dir}/{log_type}"
+
+    if include_rotated:
+        if not pattern:
+            raise ValueError(
+                "include_rotated benötigt ein pattern (sonst zu viele Treffer "
+                "über mehrere komprimierte Dateien hinweg)."
+            )
+        cmd = (
+            f"zgrep -E {shlex.quote(pattern)} "
+            f"{shlex.quote(log_dir)}/{log_type}*.gz 2>&1 | tail -n {int(lines)}"
+        )
+        return ssh_run(cmd)
+
     if pattern:
         cmd = f"grep -E {shlex.quote(pattern)} {shlex.quote(path)} 2>&1 | tail -n {int(lines)}"
     else:
         cmd = f"tail -n {int(lines)} {shlex.quote(path)} 2>&1"
+    return ssh_run(cmd)
+
+
+@mcp.tool()
+def search_main_nginx_log(
+    pattern: str,
+    log: str = "access",
+    lines: int = 200,
+    include_rotated: bool = False,
+) -> str:
+    """Durchsucht das serverweite nginx-Log (nicht pro-Vhost) unter
+    /var/log/nginx/ - dort landen u.a. 408/523-Fehler, die CloudLinux
+    Web-Monitoring-Reports zeigen, die einzelnen Vhost-Logs aber oft nicht
+    erfassen (Fehler vor dem Routing zum Backend).
+    log: "access" oder "error"
+    include_rotated: auch die rotierten .gz-Dateien der letzten Tage durchsuchen.
+    """
+    if log not in {"access", "error"}:
+        raise ValueError("log muss 'access' oder 'error' sein.")
+
+    if include_rotated:
+        cmd = (
+            f"zgrep -E {shlex.quote(pattern)} "
+            f"/var/log/nginx/{log}.log* 2>&1 | tail -n {int(lines)}"
+        )
+    else:
+        cmd = (
+            f"grep -E {shlex.quote(pattern)} "
+            f"/var/log/nginx/{log}.log 2>&1 | tail -n {int(lines)}"
+        )
     return ssh_run(cmd)
 
 
@@ -484,8 +546,9 @@ def run_diagnostic(command: str) -> str:
     die von den anderen Tools nicht abgedeckt sind. Nur eine Whitelist an
     Programmen ist erlaubt (plesk, lveinfo, lveps, systemctl, journalctl,
     grep, tail, head, cat, find, ls, du, df, dmesg, uptime, top, free, ps,
-    hostname, wc), destruktive Subcommands (restart/stop/kill/rm/delete/...)
-    sind blockiert. Beispiel: "journalctl -k --since '2026-09-17 21:00'"
+    hostname, wc, zcat, zgrep), destruktive Subcommands
+    (restart/stop/kill/rm/delete/...) sind blockiert. Beispiel:
+    "journalctl -k --since '2026-09-17 21:00'"
     """
     return ssh_run_whitelisted(command)
 
