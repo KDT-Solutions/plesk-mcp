@@ -24,7 +24,7 @@ Kein `pip install` nötig - `uv` lädt die Dependencies automatisch beim ersten 
       "command": "uv",
       "args": ["run", "C:\\Pfad\\zu\\plesk-mcp\\server.py"],
       "env": {
-        "PLESK_SSH_HOST": "server.tabside.ch",
+        "PLESK_SSH_HOST": "dein-plesk-server.example.com",
         "PLESK_SSH_PORT": "22",
         "PLESK_SSH_USER": "root",
         "PLESK_SSH_PASSWORD": "dein-passwort"
@@ -50,6 +50,7 @@ Ohne gesetztes `MCP_TRANSPORT` (oder mit `MCP_TRANSPORT=stdio`) verhält sich de
 | `PLESK_API_PORT` | nein | `8443` | Port der Plesk-REST-API |
 | `PLESK_API_KEY` | ja, für `plesk_api_get` | – | Secret Key, erzeugt via `plesk bin secret_key --create` |
 | `PLESK_API_VERIFY_SSL` | nein | `true` | `false`, falls der Plesk-Server ein selbstsigniertes Zertifikat nutzt |
+| `PLESK_API_TIMEOUT` | nein | `20` | Timeout in Sekunden für Requests gegen die Plesk-REST-API |
 | `MCP_TRANSPORT` | nein | `stdio` | `stdio` = lokal (Standard) / `http` = Cloud-Modus (Streamable HTTP) |
 | `MCP_API_KEY` | ja, nur im HTTP-Modus | – | Statisches Bearer-Token zum Schutz des öffentlichen Endpoints. Ohne dieses Token startet der HTTP-Modus nicht (fail-safe) |
 | `MCP_HOST` | nein | `0.0.0.0` | Bind-Adresse des HTTP-Servers *innerhalb* des Containers |
