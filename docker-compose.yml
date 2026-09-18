@@ -1,0 +1,31 @@
+services:
+  plesk-mcp:
+    # Fertiges Image aus der (privaten) GitHub Container Registry - wird per
+    # GitHub Actions bei jedem Push auf main automatisch gebaut und
+    # veroeffentlicht (.github/workflows/docker-publish.yml). Portainer
+    # braucht dafuer unter "Registries" einen ghcr.io-Eintrag mit einem
+    # GitHub Personal Access Token (Scope "read:packages"), da das Repo/
+    # Package privat ist.
+    image: ghcr.io/kdt-solutions/plesk-mcp:latest
+    container_name: plesk-mcp-cloud
+    restart: unless-stopped
+    environment:
+      - PLESK_SSH_HOST=${PLESK_SSH_HOST}
+      - PLESK_SSH_PORT=${PLESK_SSH_PORT:-22}
+      - PLESK_SSH_USER=${PLESK_SSH_USER:-root}
+      - PLESK_SSH_PASSWORD=${PLESK_SSH_PASSWORD}
+      - PLESK_SSH_KEY_PATH=${PLESK_SSH_KEY_PATH:-}
+      - PLESK_SSH_TIMEOUT=${PLESK_SSH_TIMEOUT:-20}
+      - PLESK_API_HOST=${PLESK_API_HOST:-}
+      - PLESK_API_PORT=${PLESK_API_PORT:-8443}
+      - PLESK_API_KEY=${PLESK_API_KEY:-}
+      - PLESK_API_VERIFY_SSL=${PLESK_API_VERIFY_SSL:-true}
+      - MCP_API_KEY=${MCP_API_KEY}
+      - MCP_TRANSPORT=http
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8000
+    ports:
+      # Standardmässig nur auf localhost binden - öffentlicher Zugriff läuft
+      # über einen Reverse-Proxy (Plesk/nginx) mit TLS. Bind-Adresse und Port
+      # sind über Env-Variablen überschreibbar (z.B. für Portainer).
+      - "${MCP_BIND_ADDR:-127.0.0.1}:${MCP_HOST_PORT:-8422}:8000"
