@@ -1,15 +1,15 @@
 # Plesk MCP Connector
 
-MCP-Server für read-only Diagnose auf einem Plesk-Server. Läuft in zwei Betriebsarten:
+MCP-Server für Diagnose (und, mit expliziter Bestätigung, gezielte Datei-Edits) auf einem Plesk-Server. Läuft in zwei Betriebsarten:
 
 - **stdio (lokal)** — klassischer lokaler MCP-Server via `uv`/Claude Desktop.
 - **HTTP (Cloud)** — als Docker-Container mit Streamable-HTTP-Transport (z.B. via Portainer), für den Zugriff aus Cloud-Sessions ohne laufenden lokalen Rechner.
 
-Zwei Datenquellen: SSH (für alles, was nur auf Betriebssystem-Ebene existiert - PHP-FPM-Status, systemd-Journal, OOM-Kills, Disk-Nutzung, Serverlast - sowie für Plesk-CLI-Befehle) und die Plesk-REST-API (für strukturierte Plesk-eigene Daten wie Domains/Subscriptions über das `plesk_api_get`-Tool).
+Zwei Datenquellen: SSH/SFTP (für alles, was nur auf Betriebssystem-Ebene existiert - PHP-FPM-Status, systemd-Journal, OOM-Kills, Disk-Nutzung, Serverlast, Vhost-Dateizugriff - sowie für Plesk-CLI-Befehle) und die Plesk-REST-API (für strukturierte Plesk-eigene Daten wie Domains/Subscriptions über das `plesk_api_get`-Tool).
 
 Alle Zugangsdaten (SSH, Plesk-API-Key, Auth-Token) werden ausschliesslich über Umgebungsvariablen konfiguriert - im Code stehen keine Secrets. Dieses Repo ist **privat** (verarbeitet SSH-Zugangsdaten zu Produktivservern).
 
-Alle Tools sind read-only: kein Neustart von Services, keine Datei-Änderungen, keine destruktiven Kommandos (Whitelist + Blacklist in `server.py`), und das `plesk_api_get`-Tool kann nur GET-Requests stellen.
+Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven Kommandos (Whitelist + Blacklist in `server.py`), und das `plesk_api_get`-Tool kann nur GET-Requests stellen. Ausnahme: `write_vhost_file` und `delete_vhost_backup` dürfen Dateien innerhalb von `/var/www/vhosts/<domain>/` anlegen/überschreiben/löschen - beide erfordern zwingend `confirm=true` pro Aufruf (keine globale Freischaltung), `write_vhost_file` legt vor dem Überschreiben automatisch ein Backup der alten Version an. Details siehe Abschnitt "Sicherheit" unten.
 
 ## Lokale Installation (stdio)
 
@@ -89,6 +89,9 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8422` auf dem Docker-Hos
 - `.env` ist in `.gitignore` und wird nie committet.
 - Repo und GHCR-Package sind privat - zusätzlich zur Bearer-Auth des Servers.
 - Für produktiven Einsatz: dedizierten SSH-User mit eingeschränkten Rechten (statt root) und/oder Key-Auth statt Passwort erwägen; für `plesk_api_get` den Secret Key optional per `-ip-address` auf die Docker-Host-IP einschränken (siehe `plesk bin secret_key --create`).
+- `write_vhost_file`/`delete_vhost_backup` sind strikt auf `/var/www/vhosts/<domain>/` beschränkt (Path-Traversal wie `../../etc/passwd` wird über `os.path.normpath` + Prefix-Check blockiert) und erfordern beide `confirm=true` als expliziten Parameter pro Aufruf - es gibt keinen globalen Schreib-Schalter, ein Aufruf ohne `confirm=true` schlägt immer fehl.
+- `write_vhost_file` legt vor jedem Überschreiben automatisch ein Backup der alten Version als `<path>.bak-<YYYYMMDDHHMMSS>` an und bricht ab, falls der Zielpfad bereits ein Symlink ist (kein Schreiben durch Symlinks hindurch).
+- `delete_vhost_backup` löscht ausschliesslich Dateien, deren Pfad auf `.bak-<14-stellige Zeitstempel>` endet - kein generisches Lösch-Tool für beliebige Vhost-Dateien.
 
 **Bekannte Einschränkung von `run_diagnostic`:** Die Wort-Blacklist (restart, stop, kill, rm, ...) matcht auch dann, wenn das Wort z.B. in einem Suchmuster für `find`/`grep` vorkommt (z.B. `find / -iname "*kill*"` wird blockiert). Für den Anwendungsfall "Fehler/Support-Tickets diagnostizieren" ist das unkritisch, da die dedizierten Tools (`check_oom_kills`, `search_log`) die relevanten Fälle direkt abdecken.
 
@@ -109,5 +112,8 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8422` auf dem Docker-Hos
 | `search_main_nginx_log` | Durchsucht das serverweite nginx-Log unter /var/log/nginx/ (access/error, optional inkl. rotierter .gz-Logs) - erfasst auch 408/523-Fehler vor dem Routing zum Vhost |
 | `check_oom_kills` | Kernel-OOM-Kills im Zeitfenster |
 | `disk_usage` | Speichernutzung des Vhost-Verzeichnisses |
+| `read_vhost_file` | Liest eine Datei aus dem Vhost-Verzeichnis (Text oder Base64) |
+| `write_vhost_file` | Schreibt/überschreibt eine Datei im Vhost-Verzeichnis - **erfordert `confirm=true`**, legt vorher automatisch ein Backup an |
+| `delete_vhost_backup` | Löscht eine von `write_vhost_file` angelegte `.bak-*`-Datei - **erfordert `confirm=true`** |
 | `server_load` | Allgemeine Serverlast (uptime, free, Prozessanzahl) |
 | `run_diagnostic` | Generischer Fallback, nur Whitelist an read-only Befehlen erlaubt |
