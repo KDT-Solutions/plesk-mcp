@@ -25,8 +25,12 @@ Read-only MCP-Server für Diagnose auf einem Plesk-Server. Zwei Datenquellen:
   (Domains, Subscriptions etc.) über das generische plesk_api_get-Tool.
 
 Gedacht für Fehleranalyse bei Support-Anfragen (z.B. "Website nicht erreichbar").
-Alle Tools sind read-only: kein Neustart von Services, keine Datei-Änderungen,
-keine destruktiven Kommandos (Whitelist + Blacklist weiter unten).
+Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven
+Kommandos (Whitelist + Blacklist weiter unten). Ausnahme: write_vhost_file und
+delete_vhost_backup dürfen Dateien innerhalb von /var/www/vhosts/<domain>/
+anlegen/überschreiben/löschen (Backups) - beide erfordern zwingend
+confirm=true pro Aufruf (keine globale Freischaltung), write_vhost_file legt
+vor dem Überschreiben automatisch ein Backup der alten Version an.
 
 Transport wird über die Umgebungsvariable MCP_TRANSPORT gesteuert:
 - "stdio" (Standard) - für die lokale Nutzung via uv/Claude Desktop.
@@ -40,9 +44,12 @@ hinterlegt.
 
 from __future__ import annotations
 
+import base64
+import datetime
 import os
 import re
 import shlex
+import stat
 import sys
 from typing import Any
 
@@ -252,6 +259,43 @@ def _domain_arg(domain: str) -> str:
     if not d or any(c in d for c in " ;|&`$(){}<>\"'\n\t"):
         raise ValueError(f"Ungültiger Domainname: {domain!r}")
     return d
+
+
+_VHOST_BASE = "/var/www/vhosts"
+_BACKUP_SUFFIX_RE = re.compile(r"\.bak-\d{14}$")
+
+
+def _vhost_path(domain: str, path: str) -> str:
+    """Löst domain+relativen Pfad zu einem absoluten Pfad auf, der zwingend
+    innerhalb von /var/www/vhosts/<domain>/ liegen muss. Verhindert
+    Path-Traversal (z.B. "../../../etc/passwd") über os.path.normpath +
+    Prefix-Check.
+    """
+    d = _domain_arg(domain)
+    base = f"{_VHOST_BASE}/{d}"
+    rel = path.strip().lstrip("/")
+    if not rel:
+        raise ValueError("path darf nicht leer sein.")
+    full = os.path.normpath(f"{base}/{rel}")
+    if full != base and not full.startswith(base + "/"):
+        raise ValueError(
+            f"Pfad {path!r} verlässt das Vhost-Verzeichnis von '{d}' - nicht erlaubt."
+        )
+    return full
+
+
+def _sftp_makedirs(sftp, remote_dir: str) -> None:
+    """Legt ein Verzeichnis inkl. Eltern über SFTP an, falls es noch nicht
+    existiert - paramikos SFTPClient hat kein makedirs eingebaut."""
+    if remote_dir in ("", "/", _VHOST_BASE):
+        return
+    try:
+        sftp.stat(remote_dir)
+        return
+    except FileNotFoundError:
+        pass
+    _sftp_makedirs(sftp, remote_dir.rsplit("/", 1)[0])
+    sftp.mkdir(remote_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -530,6 +574,151 @@ def disk_usage(domain: str) -> str:
     (httpdocs, logs, etc. einzeln aufgeschlüsselt)."""
     d = _domain_arg(domain)
     return ssh_run(f"du -sh /var/www/vhosts/{shlex.quote(d)}/* 2>&1")
+
+
+@mcp.tool()
+def read_vhost_file(domain: str, path: str, encoding: str = "text") -> str:
+    """Liest eine Datei aus dem Vhost-Verzeichnis der Domain
+    (/var/www/vhosts/<domain>/<path>, path relativ, z.B. "httpdocs/index.php").
+    encoding: "text" (UTF-8, Standard) oder "base64" (für Binärdateien wie
+    Bilder). Rein lesend - kein confirm nötig.
+    """
+    if encoding not in {"text", "base64"}:
+        raise ValueError("encoding muss 'text' oder 'base64' sein.")
+    full = _vhost_path(domain, path)
+
+    client = _ssh_connect()
+    try:
+        sftp = client.open_sftp()
+        try:
+            with sftp.open(full, "rb") as f:
+                data = f.read()
+        finally:
+            sftp.close()
+    finally:
+        client.close()
+
+    if encoding == "base64":
+        return base64.b64encode(data).decode("ascii")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError(
+            "Datei ist nicht UTF-8-dekodierbar (vermutlich Binärdatei) - "
+            "mit encoding='base64' erneut versuchen."
+        )
+
+
+@mcp.tool()
+def write_vhost_file(
+    domain: str,
+    path: str,
+    content: str,
+    confirm: bool = False,
+    encoding: str = "text",
+) -> str:
+    """Schreibt/überschreibt eine Datei im Vhost-Verzeichnis der Domain
+    (/var/www/vhosts/<domain>/<path>) - legt auch fehlende Zwischenordner an.
+    encoding: "text" (content ist Klartext, UTF-8 - Standard) oder "base64"
+    (content ist base64-kodiert, für Binärdateien wie Bilder/ZIPs).
+
+    ACHTUNG - schreibt auf einem Produktivserver: erfordert confirm=true als
+    bewusste Bestätigung PRO Aufruf (keine globale Freischaltung). Existiert
+    die Zieldatei bereits, wird vorher automatisch ein Backup als
+    "<path>.bak-<YYYYMMDDHHMMSS>" im selben Verzeichnis angelegt (siehe
+    delete_vhost_backup zum späteren Aufräumen, sobald die Änderung verifiziert ist).
+    Ist der Zielpfad bereits ein Symlink, wird aus Sicherheitsgründen
+    abgebrochen (kein Überschreiben durch Symlinks hindurch).
+    """
+    if not confirm:
+        raise ValueError(
+            "confirm=true erforderlich - dieses Tool schreibt auf einem "
+            "Produktivserver und braucht eine explizite Bestätigung pro Aufruf."
+        )
+    if encoding not in {"text", "base64"}:
+        raise ValueError("encoding muss 'text' oder 'base64' sein.")
+
+    full = _vhost_path(domain, path)
+
+    if encoding == "base64":
+        try:
+            data = base64.b64decode(content, validate=True)
+        except Exception as e:
+            raise ValueError(f"content ist kein gültiges Base64: {e}")
+    else:
+        data = content.encode("utf-8")
+
+    client = _ssh_connect()
+    try:
+        sftp = client.open_sftp()
+        try:
+            exists = False
+            backup_note = ""
+            try:
+                lst = sftp.lstat(full)
+                if stat.S_ISLNK(lst.st_mode):
+                    raise ValueError(
+                        f"'{full}' ist ein Symlink - wird aus Sicherheitsgründen "
+                        "nicht überschrieben."
+                    )
+                exists = True
+            except FileNotFoundError:
+                exists = False
+
+            if exists:
+                with sftp.open(full, "rb") as f:
+                    old_data = f.read()
+                timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+                backup_path = f"{full}.bak-{timestamp}"
+                with sftp.open(backup_path, "wb") as f:
+                    f.write(old_data)
+                backup_note = f" Backup der alten Version: {backup_path}"
+
+            _sftp_makedirs(sftp, full.rsplit("/", 1)[0])
+            with sftp.open(full, "wb") as f:
+                f.write(data)
+        finally:
+            sftp.close()
+    finally:
+        client.close()
+
+    verb = "Überschrieben" if exists else "Neu erstellt"
+    return f"{verb}: {full} ({len(data)} Bytes).{backup_note}"
+
+
+@mcp.tool()
+def delete_vhost_backup(domain: str, path: str, confirm: bool = False) -> str:
+    """Löscht eine von write_vhost_file angelegte Backup-Datei
+    (/var/www/vhosts/<domain>/<path>, path muss auf ".bak-<14-stellige
+    Zeitstempel>" enden, z.B. "httpdocs/index.php.bak-20260919143012") -
+    zum Aufräumen, nachdem eine Änderung verifiziert wurde. Löscht bewusst
+    NUR Dateien mit diesem Namensmuster, keine sonstigen Vhost-Dateien.
+    Erfordert confirm=true pro Aufruf.
+    """
+    if not confirm:
+        raise ValueError(
+            "confirm=true erforderlich - dieses Tool löscht eine Datei auf "
+            "einem Produktivserver und braucht eine explizite Bestätigung pro Aufruf."
+        )
+    full = _vhost_path(domain, path)
+    if not _BACKUP_SUFFIX_RE.search(full):
+        raise ValueError(
+            f"'{path}' sieht nicht wie eine von write_vhost_file angelegte "
+            "Backup-Datei aus (erwartet: ...bak-JJJJMMTTHHMMSS). Aus "
+            "Sicherheitsgründen löscht dieses Tool ausschliesslich solche Dateien."
+        )
+
+    client = _ssh_connect()
+    try:
+        sftp = client.open_sftp()
+        try:
+            sftp.remove(full)
+        finally:
+            sftp.close()
+    finally:
+        client.close()
+
+    return f"Backup gelöscht: {full}"
 
 
 @mcp.tool()
