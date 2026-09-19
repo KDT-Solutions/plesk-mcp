@@ -12,17 +12,21 @@
 """
 plesk-mcp
 
-Version: 0.2.0 (kein pyproject.toml mehr wie im alten src/-Package - Version
+Version: 0.3.0 (kein pyproject.toml mehr wie im alten src/-Package - Version
 wird hier im Docstring nachgeführt; Deployment-Tracking läuft sonst über den
 GHCR-Image-Tag/Git-SHA, analog zu bexio-mcp)
 
-Read-only MCP-Server für Diagnose auf einem Plesk-Server. Zwei Datenquellen:
+Read-only MCP-Server für Diagnose auf einem Plesk-Server. Drei Datenquellen:
 
 - SSH (paramiko) für alles, was nur auf Betriebssystem-Ebene existiert
   (PHP-FPM-Status, systemd-Journal, OOM-Kills, Disk-Nutzung, Serverlast) und
   für Plesk-CLI-Befehle (plesk bin ..., plesk ext ...).
 - Die Plesk-REST-API (X-API-Key) für strukturierte Plesk-eigene Daten
   (Domains, Subscriptions etc.) über das generische plesk_api_get-Tool.
+- MySQL/MariaDB direkt (über den Plesk-internen Admin-DB-Zugang aus
+  /etc/psa/.psa.shadow, siehe db_list/db_query/db_search) für read-only
+  Datenbank-Abfragen ohne eigene, zusätzlich zu konfigurierende
+  DB-Zugangsdaten.
 
 Gedacht für Fehleranalyse bei Support-Anfragen (z.B. "Website nicht erreichbar").
 Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven
@@ -335,6 +339,131 @@ def plesk_api_get_raw(path: str, params: dict[str, str] | None = None) -> str:
     )
     resp.raise_for_status()
     return resp.text
+
+
+# ---------------------------------------------------------------------------
+# MySQL/MariaDB-Datenbanken - read-only, via Plesk-internen Admin-DB-Zugang
+# ---------------------------------------------------------------------------
+#
+# Plesk legt den Login und das Klartext-Passwort seines eigenen MySQL/MariaDB-
+# Administrator-Accounts (Login "admin") in /etc/psa/.psa.shadow ab - damit
+# verwaltet Plesk selbst alle Kunden-Datenbanken (z.B. für phpMyAdmin-
+# Single-Sign-on, Backups, Migrationen). Da diese Tools ohnehin per SSH als
+# root laufen (also die Datei bereits lesen könnten), wird dieser Account
+# genutzt, um automatisch - ohne eigene, zusätzlich zu konfigurierende
+# Datenbank-Zugangsdaten - auf beliebige Datenbanken auf dem Server zugreifen
+# zu können. Das ist technisch ein sehr mächtiger Zugang (faktisch DB-root);
+# die Beschränkung auf read-only passiert daher ausschliesslich in diesem
+# Code (siehe _validate_select_sql) und nicht durch MySQL-Rechte selbst.
+
+_DB_SHADOW_PATH = "/etc/psa/.psa.shadow"
+_DB_ADMIN_USER = "admin"
+
+# Schlüsselwörter, die in einer db_query/db_search-Query verboten sind - auch
+# wenn das Statement mit SELECT/SHOW/EXPLAIN/DESCRIBE beginnt. Als ganzes Wort
+# geprüft (Regex \b...\b), damit z.B. eine Spalte "start_date" nicht wegen
+# "start" fälschlich blockiert wird (bekannte Einschränkung: eine Spalte, die
+# GENAU "start" heisst, würde blockiert - siehe README).
+_SQL_FORBIDDEN_WORDS = {
+    "insert", "update", "delete", "drop", "alter", "create", "truncate",
+    "grant", "revoke", "rename", "replace", "call", "exec", "execute",
+    "lock", "unlock", "commit", "rollback", "set", "load_file", "outfile",
+    "dumpfile", "sleep", "benchmark", "start",
+}
+_SQL_FORBIDDEN_WORD_RE = re.compile(
+    r"\b(" + "|".join(re.escape(w) for w in _SQL_FORBIDDEN_WORDS) + r")\b", re.IGNORECASE
+)
+
+_DB_SYSTEM_SCHEMAS = {
+    "information_schema", "mysql", "performance_schema", "sys",
+    "psa", "phpmyadmin", "roundcube", "horde",
+}
+
+
+def _db_admin_password() -> str:
+    """Liest das Plesk-Admin-DB-Passwort aus /etc/psa/.psa.shadow (root-only,
+    lesbar da wir ohnehin als root per SSH verbunden sind)."""
+    out = ssh_run(f"cat {_DB_SHADOW_PATH} 2>&1")
+    pw = out.strip()
+    if not pw or "No such file" in pw or "Permission denied" in pw or "\n" in pw:
+        raise RuntimeError(
+            f"Konnte das Plesk-DB-Admin-Passwort nicht aus {_DB_SHADOW_PATH} lesen "
+            f"(Ausgabe: {pw!r}). Ist dies ein Plesk-Server mit lokaler MySQL/"
+            "MariaDB-Installation und root-SSH-Zugang?"
+        )
+    return pw
+
+
+def _quote_ident(name: str) -> str:
+    """MySQL-Identifier-Escaping (Tabellen-/Spaltennamen) - verdoppelt
+    Backticks im Namen und umschliesst ihn mit Backticks."""
+    return "`" + name.replace("`", "``") + "`"
+
+
+def _sql_quote(value: str) -> str:
+    """Escaped einen String-Wert für die Verwendung als SQL-Literal (einfache
+    Anführungszeichen)."""
+    return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def _validate_select_sql(sql: str) -> str:
+    """Stellt sicher, dass sql ein einzelnes, reines Lese-Statement ist:
+    genau ein Statement (kein ';' zum Verketten, ein optionales
+    Trailing-';' ist erlaubt), beginnt mit SELECT/SHOW/EXPLAIN/DESCRIBE/DESC,
+    und enthält kein Wort aus _SQL_FORBIDDEN_WORDS (insert/update/delete/...,
+    load_file, into outfile/dumpfile, sleep/benchmark als DoS-Schutz, etc.)."""
+    s = sql.strip()
+    if not s:
+        raise ValueError("Leere Query.")
+    body = s[:-1].strip() if s.endswith(";") else s
+    if ";" in body:
+        raise ValueError(
+            "Mehrere Statements ('; ...') sind nicht erlaubt - nur eine "
+            "einzelne Lese-Query pro Aufruf."
+        )
+    if not body:
+        raise ValueError("Leere Query.")
+    first_word = body.split(None, 1)[0].lower()
+    if first_word not in ("select", "show", "explain", "describe", "desc"):
+        raise ValueError(
+            f"Nur SELECT/SHOW/EXPLAIN/DESCRIBE-Queries sind erlaubt, nicht "
+            f"'{first_word}'. Dieses Tool ist strikt read-only."
+        )
+    match = _SQL_FORBIDDEN_WORD_RE.search(body)
+    if match:
+        raise ValueError(
+            f"Query enthält verbotenes Schlüsselwort '{match.group(1)}'. "
+            "Dieses Tool ist strikt read-only (siehe README für die volle Blacklist)."
+        )
+    return body
+
+
+def _validate_db_name(database: str) -> str:
+    db = database.strip()
+    if not db or any(c in db for c in " ;|&`$(){}<>\"'\n\t"):
+        raise ValueError(f"Ungültiger Datenbankname: {database!r}")
+    return db
+
+
+def _mysql_exec(
+    sql: str,
+    database: str = "",
+    timeout: int | None = None,
+    skip_column_names: bool = False,
+) -> str:
+    """Führt sql via `mysql`-CLI als Plesk-Admin-User aus. Passwort wird über
+    die Umgebungsvariable MYSQL_PWD übergeben (nicht als -p-Flag), damit es
+    nicht in `ps aux` für andere lokale User auf dem Server sichtbar ist."""
+    pw = _db_admin_password()
+    db_part = f" {shlex.quote(database)}" if database else ""
+    flags = "--connect-timeout=10 --batch --raw"
+    if skip_column_names:
+        flags += " -N"
+    cmd = (
+        f"MYSQL_PWD={shlex.quote(pw)} mysql -u{_DB_ADMIN_USER} {flags}"
+        f"{db_part} -e {shlex.quote(sql)}"
+    )
+    return ssh_run(cmd, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -719,6 +848,147 @@ def delete_vhost_backup(domain: str, path: str, confirm: bool = False) -> str:
         client.close()
 
     return f"Backup gelöscht: {full}"
+
+
+@mcp.tool()
+def db_list(domain: str = "") -> str:
+    """Listet MySQL/MariaDB-Datenbanken auf dem Server auf (SHOW DATABASES,
+    authentifiziert über den Plesk-internen Admin-DB-Zugang aus
+    /etc/psa/.psa.shadow - keine eigenen Datenbank-Zugangsdaten nötig).
+
+    Mit domain werden nur Datenbanken gefiltert, deren Name die Domain
+    (Punkte durch Unterstriche ersetzt) enthält - Plesk benennt Datenbanken
+    nicht immer exakt nach der Domain, bei Bedarf ohne domain-Parameter alle
+    auflisten und selbst zuordnen. Für jede gefundene (Nicht-System-)
+    Datenbank werden zusätzlich deren Tabellen mit Zeilenanzahl und Grösse
+    in MB angezeigt (aus information_schema.tables).
+    """
+    out = _mysql_exec("SHOW DATABASES", skip_column_names=True)
+    all_dbs = [line.strip() for line in out.splitlines() if line.strip()]
+
+    if domain:
+        d = _domain_arg(domain)
+        needle = d.replace(".", "_")
+        matches = [db for db in all_dbs if needle in db or d in db]
+        if not matches:
+            return (
+                f"Keine Datenbank mit '{domain}' im Namen gefunden.\n"
+                f"Vorhandene Datenbanken: {', '.join(all_dbs)}"
+            )
+        detail_dbs = matches
+    else:
+        detail_dbs = [db for db in all_dbs if db not in _DB_SYSTEM_SCHEMAS]
+
+    lines = [f"Datenbanken: {', '.join(all_dbs)}", ""]
+    for db in detail_dbs:
+        if db in _DB_SYSTEM_SCHEMAS:
+            continue
+        tables = _mysql_exec(
+            "SELECT TABLE_NAME, TABLE_ROWS, "
+            "ROUND((DATA_LENGTH + INDEX_LENGTH) / 1024 / 1024, 2) AS size_mb "
+            f"FROM information_schema.tables WHERE table_schema = {_sql_quote(db)} "
+            "ORDER BY TABLE_NAME"
+        )
+        lines.append(f"--- {db} ---")
+        lines.append(tables or "(keine Tabellen)")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+@mcp.tool()
+def db_query(database: str, sql: str) -> str:
+    """Führt eine einzelne, reine Lese-Query gegen eine MySQL/MariaDB-
+    Datenbank auf dem Server aus (SELECT/SHOW/EXPLAIN/DESCRIBE). Nutzt
+    automatisch den Plesk-internen Admin-DB-Zugang (siehe db_list) - kein
+    eigener Datenbank-Zugang pro Domain nötig.
+
+    database: Datenbankname (siehe db_list für die vorhandenen Namen).
+    sql: genau ein Statement, kein ';' zum Verketten mehrerer Statements.
+    Schreibende oder dateisystemnahe Befehle (INSERT/UPDATE/DELETE/DROP/...,
+    LOAD_FILE, INTO OUTFILE/DUMPFILE, SLEEP/BENCHMARK etc.) werden per
+    Blacklist blockiert - siehe README für bekannte Einschränkungen dieser
+    Prüfung (z.B. eine Spalte namens exakt "start"). Ausgabe auf 200 Zeilen
+    begrenzt.
+    """
+    db = _validate_db_name(database)
+    checked_sql = _validate_select_sql(sql)
+    out = _mysql_exec(checked_sql, database=db, timeout=30)
+    result_lines = out.splitlines()
+    if len(result_lines) > 200:
+        out = "\n".join(result_lines[:200]) + (
+            f"\n... ({len(result_lines) - 200} weitere Zeilen abgeschnitten)"
+        )
+    return out or "(keine Ausgabe)"
+
+
+@mcp.tool()
+def db_search(
+    database: str,
+    term: str,
+    max_tables: int = 30,
+    limit_per_table: int = 5,
+) -> str:
+    """Durchsucht alle Text-Spalten (char/varchar/text/tinytext/mediumtext/
+    longtext) aller Tabellen einer Datenbank nach term (einfacher
+    LIKE '%term%'-Vergleich, kein Volltextindex nötig) - praktisch um z.B.
+    eine E-Mail-Adresse oder Bestellnummer zu finden, ohne die
+    Tabellenstruktur zu kennen. Scannt aus Performancegründen maximal
+    max_tables Tabellen und zeigt maximal limit_per_table Treffer pro
+    Tabelle - bei sehr grossen Datenbanken ggf. mehrfach mit gezielterem
+    term oder db_query direkt verwenden. Nutzt den Plesk-internen
+    Admin-DB-Zugang, strikt read-only.
+    """
+    db = _validate_db_name(database)
+    term = term.strip()
+    if not term:
+        raise ValueError("term darf nicht leer sein.")
+    if not (1 <= max_tables <= 100):
+        raise ValueError("max_tables muss zwischen 1 und 100 liegen.")
+    if not (1 <= limit_per_table <= 50):
+        raise ValueError("limit_per_table muss zwischen 1 und 50 liegen.")
+
+    cols_out = _mysql_exec(
+        "SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.columns "
+        f"WHERE table_schema = {_sql_quote(db)} AND DATA_TYPE IN "
+        "('char','varchar','text','tinytext','mediumtext','longtext') "
+        "ORDER BY TABLE_NAME",
+        database=db,
+        skip_column_names=True,
+    )
+    by_table: dict[str, list[str]] = {}
+    for line in cols_out.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 2:
+            continue
+        table, col = parts
+        by_table.setdefault(table, []).append(col)
+
+    if not by_table:
+        return f"Keine Text-Spalten in '{db}' gefunden (oder Datenbank existiert nicht)."
+
+    escaped_term = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    needle = _sql_quote(f"%{escaped_term}%")
+
+    results = []
+    scanned = 0
+    for table, cols in by_table.items():
+        if scanned >= max_tables:
+            break
+        scanned += 1
+        where = " OR ".join(f"{_quote_ident(c)} LIKE {needle}" for c in cols)
+        query = f"SELECT * FROM {_quote_ident(table)} WHERE {where} LIMIT {int(limit_per_table)}"
+        try:
+            out = _mysql_exec(query, database=db, timeout=15)
+        except Exception as e:
+            results.append(f"--- {table}: Fehler ({e}) ---")
+            continue
+        if out and out != "(keine Ausgabe)":
+            results.append(f"--- {table} ---\n{out}")
+
+    if not results:
+        return f"Kein Treffer für '{term}' in {scanned} durchsuchten Tabellen von '{db}'."
+    header = f"Treffer für '{term}' in '{db}' ({scanned} von {len(by_table)} Tabellen durchsucht):\n\n"
+    return header + "\n\n".join(results)
 
 
 @mcp.tool()
