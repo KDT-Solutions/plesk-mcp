@@ -5,7 +5,7 @@ MCP-Server für Diagnose (und, mit expliziter Bestätigung, gezielte Datei-Edits
 - **stdio (lokal)** — klassischer lokaler MCP-Server via `uv`/Claude Desktop.
 - **HTTP (Cloud)** — als Docker-Container mit Streamable-HTTP-Transport (z.B. via Portainer), für den Zugriff aus Cloud-Sessions ohne laufenden lokalen Rechner.
 
-Zwei Datenquellen: SSH/SFTP (für alles, was nur auf Betriebssystem-Ebene existiert - PHP-FPM-Status, systemd-Journal, OOM-Kills, Disk-Nutzung, Serverlast, Vhost-Dateizugriff - sowie für Plesk-CLI-Befehle) und die Plesk-REST-API (für strukturierte Plesk-eigene Daten wie Domains/Subscriptions über das `plesk_api_get`-Tool).
+Drei Datenquellen: SSH/SFTP (für alles, was nur auf Betriebssystem-Ebene existiert - PHP-FPM-Status, systemd-Journal, OOM-Kills, Disk-Nutzung, Serverlast, Vhost-Dateizugriff - sowie für Plesk-CLI-Befehle), die Plesk-REST-API (für strukturierte Plesk-eigene Daten wie Domains/Subscriptions über das `plesk_api_get`-Tool) und MySQL/MariaDB direkt (`db_list`/`db_query`/`db_search`, read-only, über den Plesk-internen Admin-DB-Zugang - siehe Abschnitt "Sicherheit").
 
 Alle Zugangsdaten (SSH, Plesk-API-Key, Auth-Token) werden ausschliesslich über Umgebungsvariablen konfiguriert - im Code stehen keine Secrets. Dieses Repo ist **privat** (verarbeitet SSH-Zugangsdaten zu Produktivservern).
 
@@ -92,8 +92,11 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8422` auf dem Docker-Hos
 - `write_vhost_file`/`delete_vhost_backup` sind strikt auf `/var/www/vhosts/<domain>/` beschränkt (Path-Traversal wie `../../etc/passwd` wird über `os.path.normpath` + Prefix-Check blockiert) und erfordern beide `confirm=true` als expliziten Parameter pro Aufruf - es gibt keinen globalen Schreib-Schalter, ein Aufruf ohne `confirm=true` schlägt immer fehl.
 - `write_vhost_file` legt vor jedem Überschreiben automatisch ein Backup der alten Version als `<path>.bak-<YYYYMMDDHHMMSS>` an und bricht ab, falls der Zielpfad bereits ein Symlink ist (kein Schreiben durch Symlinks hindurch).
 - `delete_vhost_backup` löscht ausschliesslich Dateien, deren Pfad auf `.bak-<14-stellige Zeitstempel>` endet - kein generisches Lösch-Tool für beliebige Vhost-Dateien.
+- `db_list`/`db_query`/`db_search` nutzen automatisch den Plesk-internen MySQL/MariaDB-Admin-Zugang (Login `admin`, Passwort im Klartext in `/etc/psa/.psa.shadow` - damit verwaltet Plesk selbst alle Kunden-Datenbanken, z.B. für phpMyAdmin-SSO). Das ist technisch ein sehr mächtiger Zugang (faktisch DB-root) und wird genutzt, weil die Tools ohnehin per Root-SSH laufen und diese Datei sonst ebenso lesen könnten - es wird also kein zusätzlicher, separat abgesicherter Zugang geschaffen. Die Beschränkung auf read-only passiert ausschliesslich in `server.py` (`_validate_select_sql`), nicht durch MySQL-Rechte: erlaubt sind nur einzelne SELECT/SHOW/EXPLAIN/DESCRIBE-Statements ohne `;`-Verkettung, eine Blacklist blockt zusätzlich Schreib-Befehle (INSERT/UPDATE/DELETE/DROP/...) sowie dateisystemnahe Funktionen (`LOAD_FILE`, `INTO OUTFILE`/`DUMPFILE`) und potenzielle DoS-Funktionen (`SLEEP`, `BENCHMARK`). Das Passwort wird beim Aufruf über die Umgebungsvariable `MYSQL_PWD` an den `mysql`-Client übergeben statt als `-p`-Flag, damit es nicht in `ps aux` für andere lokale User auf dem Server sichtbar ist.
 
 **Bekannte Einschränkung von `run_diagnostic`:** Die Wort-Blacklist (restart, stop, kill, rm, ...) matcht auch dann, wenn das Wort z.B. in einem Suchmuster für `find`/`grep` vorkommt (z.B. `find / -iname "*kill*"` wird blockiert). Für den Anwendungsfall "Fehler/Support-Tickets diagnostizieren" ist das unkritisch, da die dedizierten Tools (`check_oom_kills`, `search_log`) die relevanten Fälle direkt abdecken.
+
+**Bekannte Einschränkung von `db_query`/`db_search`:** Die SQL-Wort-Blacklist prüft auf ganze Wörter, blockt also z.B. eine Query mit einer Spalte, die exakt `start` heisst (nicht aber `start_date` o.ä.) - analog zur Einschränkung von `run_diagnostic`. `db_search` ist ein einfacher `LIKE '%term%'`-Scan ohne Index-Nutzung und daher bei sehr grossen Tabellen langsam; `max_tables`/`limit_per_table` begrenzen den Aufwand pro Aufruf.
 
 ## Verfügbare Tools
 
@@ -115,5 +118,8 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8422` auf dem Docker-Hos
 | `read_vhost_file` | Liest eine Datei aus dem Vhost-Verzeichnis (Text oder Base64) |
 | `write_vhost_file` | Schreibt/überschreibt eine Datei im Vhost-Verzeichnis - **erfordert `confirm=true`**, legt vorher automatisch ein Backup an |
 | `delete_vhost_backup` | Löscht eine von `write_vhost_file` angelegte `.bak-*`-Datei - **erfordert `confirm=true`** |
+| `db_list` | Listet MySQL/MariaDB-Datenbanken (optional gefiltert nach Domain) inkl. Tabellen, Zeilenanzahl und Grösse |
+| `db_query` | Führt eine einzelne read-only SQL-Query (SELECT/SHOW/EXPLAIN/DESCRIBE) gegen eine Datenbank aus |
+| `db_search` | Durchsucht alle Text-Spalten aller Tabellen einer Datenbank nach einem Begriff (LIKE-Scan) |
 | `server_load` | Allgemeine Serverlast (uptime, free, Prozessanzahl) |
 | `run_diagnostic` | Generischer Fallback, nur Whitelist an read-only Befehlen erlaubt |
