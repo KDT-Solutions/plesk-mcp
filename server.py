@@ -12,7 +12,7 @@
 """
 plesk-mcp
 
-Version: 0.4.0 (kein pyproject.toml mehr wie im alten src/-Package - Version
+Version: 0.5.0 (kein pyproject.toml mehr wie im alten src/-Package - Version
 wird hier im Docstring nachgeführt; Deployment-Tracking läuft sonst über den
 GHCR-Image-Tag/Git-SHA, analog zu bexio-mcp)
 
@@ -31,13 +31,14 @@ Read-only MCP-Server für Diagnose auf einem Plesk-Server. Drei Datenquellen:
 Gedacht für Fehleranalyse bei Support-Anfragen (z.B. "Website nicht erreichbar").
 Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven
 Kommandos (Whitelist + Blacklist weiter unten). Ausnahme: write_vhost_file,
-delete_vhost_backup, dns_add_record und dns_delete_record dürfen schreiben -
-die ersten beiden Dateien innerhalb von /var/www/vhosts/<domain>/
-anlegen/überschreiben/löschen (Backups), die letzten beiden DNS-Resource-
-Records der Domain-Zone anlegen/entfernen (plesk bin dns --add/--del). Alle
-vier erfordern zwingend confirm=true pro Aufruf (keine globale
-Freischaltung), write_vhost_file legt vor dem Überschreiben automatisch ein
-Backup der alten Version an.
+delete_vhost_backup, dns_add_record, dns_delete_record und dns_update_record
+dürfen schreiben - die ersten beiden Dateien innerhalb von
+/var/www/vhosts/<domain>/ anlegen/überschreiben/löschen (Backups), die
+letzten drei DNS-Resource-Records der Domain-Zone anlegen/entfernen/ändern
+(plesk bin dns --add/--del; dns_update_record kombiniert beides für einen
+bestehenden Record). Alle fünf erfordern zwingend confirm=true pro Aufruf
+(keine globale Freischaltung), write_vhost_file legt vor dem Überschreiben
+automatisch ein Backup der alten Version an.
 
 Transport wird über die Umgebungsvariable MCP_TRANSPORT gesteuert:
 - "stdio" (Standard) - für die lokale Nutzung via uv/Claude Desktop.
@@ -671,6 +672,97 @@ def dns_delete_record(
         srv_service, srv_protocol, srv_port, srv_weight,
     )
     return ssh_run(cmd)
+
+
+@mcp.tool()
+def dns_update_record(
+    domain: str,
+    record_type: str,
+    old_subdomain: str,
+    old_value: str,
+    new_subdomain: str = "",
+    new_value: str = "",
+    old_priority: str = "",
+    new_priority: str = "",
+    old_srv_service: str = "",
+    old_srv_protocol: str = "",
+    old_srv_port: str = "",
+    old_srv_weight: str = "",
+    new_srv_service: str = "",
+    new_srv_protocol: str = "",
+    new_srv_port: str = "",
+    new_srv_weight: str = "",
+    confirm: bool = False,
+) -> str:
+    """Ändert einen bestehenden DNS-Record. Plesk kennt kein natives
+    'Update' für einzelne Records (nur `--set` für die komplette Zone auf
+    einmal) - dieses Tool bildet die Änderung als zusammenhängenden
+    Delete+Add ab (`plesk bin dns --del` mit den old_*-Werten, direkt
+    gefolgt von `--add` mit den new_*-Werten), damit dafür nur ein
+    confirm=true-Aufruf nötig ist statt zwei einzelne (dns_delete_record +
+    dns_add_record).
+
+    old_subdomain/old_value/old_priority/old_srv_*: identifizieren den zu
+        ändernden Record - müssen exakt den aktuellen Werten entsprechen
+        (vorher am besten dns_records aufrufen, um sie zu bestätigen).
+    new_subdomain/new_value/new_priority/new_srv_*: die neuen Werte. Wird
+        einer davon leer gelassen, bleibt er wie im alten Record - z.B. nur
+        die IP eines A-Records ändern: record_type="a", old_subdomain="www",
+        old_value="<alte IP>", new_value="<neue IP>" (new_subdomain kann
+        weggelassen werden, bleibt dann "www").
+    record_type (Gross-/Kleinschreibung egal): a | aaaa | cname | mx | ns | txt | srv
+        - gilt für den Record vor UND nach der Änderung; um einen Record in
+        einen anderen Typ umzuwandeln, stattdessen dns_delete_record +
+        dns_add_record einzeln verwenden.
+
+    ACHTUNG - schreibt auf einem Produktivserver (ändert live auflösbare
+    DNS-Einträge): erfordert confirm=true als bewusste Bestätigung PRO
+    Aufruf (keine globale Freischaltung). Falls das nachträgliche --add
+    fehlschlägt (z.B. Tippfehler im neuen Wert), ist der alte Record
+    bereits gelöscht - die vollständige Fehlermeldung wird zurückgegeben,
+    damit der alte Record bei Bedarf manuell per dns_add_record wieder
+    angelegt werden kann. Scheitert bereits das --del (z.B. weil
+    old_subdomain/old_value nicht exakt zum aktuellen Record passen), wird
+    abgebrochen, BEVOR irgendetwas geändert wird.
+    """
+    if not confirm:
+        raise ValueError(
+            "confirm=true erforderlich - dieses Tool schreibt auf einem "
+            "Produktivserver (DNS-Zone) und braucht eine explizite "
+            "Bestätigung pro Aufruf."
+        )
+
+    eff_new_subdomain = new_subdomain.strip() or old_subdomain
+    eff_new_value = new_value.strip() or old_value
+    eff_new_priority = new_priority.strip() or old_priority
+    eff_new_srv_service = new_srv_service.strip() or old_srv_service
+    eff_new_srv_protocol = new_srv_protocol.strip() or old_srv_protocol
+    eff_new_srv_port = new_srv_port.strip() or old_srv_port
+    eff_new_srv_weight = new_srv_weight.strip() or old_srv_weight
+
+    del_cmd = _dns_build_cmd(
+        "del", domain, record_type, old_subdomain, old_value, old_priority,
+        old_srv_service, old_srv_protocol, old_srv_port, old_srv_weight,
+    )
+    del_result = ssh_run(del_cmd)
+    if "[exit code:" in del_result:
+        return (
+            "Abgebrochen - alter Record konnte nicht gelöscht werden, es "
+            "wurde nichts geändert. Prüfe old_subdomain/old_value/"
+            "old_priority (am besten zuerst dns_records aufrufen).\n\n"
+            f"Ausgabe von --del:\n{del_result}"
+        )
+
+    add_cmd = _dns_build_cmd(
+        "add", domain, record_type, eff_new_subdomain, eff_new_value, eff_new_priority,
+        eff_new_srv_service, eff_new_srv_protocol, eff_new_srv_port, eff_new_srv_weight,
+    )
+    add_result = ssh_run(add_cmd)
+
+    return (
+        f"Alter Record gelöscht:\n{del_result}\n\n"
+        f"Neuer Record angelegt:\n{add_result}"
+    )
 
 
 @mcp.tool()
