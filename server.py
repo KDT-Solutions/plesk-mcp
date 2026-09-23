@@ -12,7 +12,7 @@
 """
 plesk-mcp
 
-Version: 0.3.0 (kein pyproject.toml mehr wie im alten src/-Package - Version
+Version: 0.4.0 (kein pyproject.toml mehr wie im alten src/-Package - Version
 wird hier im Docstring nachgeführt; Deployment-Tracking läuft sonst über den
 GHCR-Image-Tag/Git-SHA, analog zu bexio-mcp)
 
@@ -30,11 +30,14 @@ Read-only MCP-Server für Diagnose auf einem Plesk-Server. Drei Datenquellen:
 
 Gedacht für Fehleranalyse bei Support-Anfragen (z.B. "Website nicht erreichbar").
 Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven
-Kommandos (Whitelist + Blacklist weiter unten). Ausnahme: write_vhost_file und
-delete_vhost_backup dürfen Dateien innerhalb von /var/www/vhosts/<domain>/
-anlegen/überschreiben/löschen (Backups) - beide erfordern zwingend
-confirm=true pro Aufruf (keine globale Freischaltung), write_vhost_file legt
-vor dem Überschreiben automatisch ein Backup der alten Version an.
+Kommandos (Whitelist + Blacklist weiter unten). Ausnahme: write_vhost_file,
+delete_vhost_backup, dns_add_record und dns_delete_record dürfen schreiben -
+die ersten beiden Dateien innerhalb von /var/www/vhosts/<domain>/
+anlegen/überschreiben/löschen (Backups), die letzten beiden DNS-Resource-
+Records der Domain-Zone anlegen/entfernen (plesk bin dns --add/--del). Alle
+vier erfordern zwingend confirm=true pro Aufruf (keine globale
+Freischaltung), write_vhost_file legt vor dem Überschreiben automatisch ein
+Backup der alten Version an.
 
 Transport wird über die Umgebungsvariable MCP_TRANSPORT gesteuert:
 - "stdio" (Standard) - für die lokale Nutzung via uv/Claude Desktop.
@@ -488,6 +491,186 @@ def dns_records(domain: str) -> str:
     """
     d = _domain_arg(domain)
     return ssh_run(f"plesk bin dns --info {shlex.quote(d)}")
+
+
+def _dns_build_cmd(
+    action: str,
+    domain: str,
+    record_type: str,
+    subdomain: str,
+    value: str,
+    priority: str,
+    srv_service: str,
+    srv_protocol: str,
+    srv_port: str,
+    srv_weight: str,
+) -> str:
+    """Baut das `plesk bin dns --add/--del`-Kommando für einen Record.
+    Gemeinsame Logik für dns_add_record/dns_delete_record - Plesk erwartet
+    beim Löschen exakt dieselben Parameter wie beim Anlegen (zur eindeutigen
+    Identifikation des Records), daher identischer Aufbau für beide Aktionen.
+    """
+    d = _domain_arg(domain)
+    rt = record_type.strip().lower()
+    sub = subdomain.strip()
+    if sub == "@":
+        sub = ""
+    val = value.strip()
+
+    flag = "--add" if action == "add" else "--del"
+    cmd = f"plesk bin dns {flag} {shlex.quote(d)}"
+
+    if rt == "a":
+        if not val:
+            raise ValueError("value (IP-Adresse) ist für A-Records erforderlich.")
+        cmd += f" -a {shlex.quote(sub)} -ip {shlex.quote(val)}"
+    elif rt == "aaaa":
+        if not val:
+            raise ValueError("value (IPv6-Adresse) ist für AAAA-Records erforderlich.")
+        cmd += f" -aaaa {shlex.quote(sub)} -ip {shlex.quote(val)}"
+    elif rt == "cname":
+        if not val:
+            raise ValueError("value (Zieldomain) ist für CNAME-Records erforderlich.")
+        cmd += f" -cname {shlex.quote(sub)} -canonical {shlex.quote(val)}"
+    elif rt == "mx":
+        if not val:
+            raise ValueError("value (Mailserver) ist für MX-Records erforderlich.")
+        if not priority.strip():
+            raise ValueError("priority ist für MX-Records erforderlich.")
+        cmd += (
+            f" -mx {shlex.quote(sub)} -mailexchanger {shlex.quote(val)}"
+            f" -priority {shlex.quote(priority.strip())}"
+        )
+    elif rt == "ns":
+        if not val:
+            raise ValueError("value (Nameserver) ist für NS-Records erforderlich.")
+        cmd += f" -ns {shlex.quote(sub)} -nameserver {shlex.quote(val)}"
+    elif rt == "txt":
+        if not val:
+            raise ValueError("value (Text-Inhalt) ist für TXT-Records erforderlich.")
+        cmd += f" -txt {shlex.quote(val)} -domain {shlex.quote(sub)}"
+    elif rt == "srv":
+        missing = [
+            name
+            for name, v in (
+                ("value (Ziel-Host)", val),
+                ("priority", priority.strip()),
+                ("srv_service", srv_service.strip()),
+                ("srv_protocol", srv_protocol.strip()),
+                ("srv_port", srv_port.strip()),
+                ("srv_weight", srv_weight.strip()),
+            )
+            if not v
+        ]
+        if missing:
+            raise ValueError(
+                "Für SRV-Records sind alle folgenden Parameter erforderlich, "
+                f"es fehlen: {', '.join(missing)}."
+            )
+        cmd += (
+            f" -srv {shlex.quote(sub)} -srv-service {shlex.quote(srv_service.strip())}"
+            f" -srv-target-host {shlex.quote(val)}"
+            f" -srv-protocol {shlex.quote(srv_protocol.strip())}"
+            f" -srv-port {shlex.quote(srv_port.strip())}"
+            f" -srv-priority {shlex.quote(priority.strip())}"
+            f" -srv-weight {shlex.quote(srv_weight.strip())}"
+        )
+    else:
+        raise ValueError(
+            f"Unbekannter record_type {record_type!r}. "
+            "Unterstützt: a, aaaa, cname, mx, ns, txt, srv."
+        )
+    return cmd
+
+
+@mcp.tool()
+def dns_add_record(
+    domain: str,
+    record_type: str,
+    subdomain: str = "",
+    value: str = "",
+    priority: str = "",
+    srv_service: str = "",
+    srv_protocol: str = "",
+    srv_port: str = "",
+    srv_weight: str = "",
+    confirm: bool = False,
+) -> str:
+    """Fügt einen DNS-Resource-Record zur Zone einer Domain hinzu.
+    Entspricht `plesk bin dns --add <domain> -<typ> ...`.
+
+    ACHTUNG - schreibt auf einem Produktivserver (ändert live auflösbare
+    DNS-Einträge): erfordert confirm=true als bewusste Bestätigung PRO
+    Aufruf (keine globale Freischaltung), analog zu write_vhost_file.
+    Existiert exakt derselbe Record bereits, meldet Plesk selbst einen
+    Fehler zurück (kein stillschweigendes Duplizieren/Überschreiben) - zum
+    Ändern eines bestehenden Records daher erst dns_delete_record, dann
+    dns_add_record mit dem neuen Wert.
+
+    record_type (Gross-/Kleinschreibung egal): a | aaaa | cname | mx | ns | txt | srv
+
+    subdomain: Hostname-Teil relativ zur Zone, z.B. "www" oder "mail3".
+               Leer ("") oder "@" steht für die Zone/Domain-Root selbst.
+    value: Zielwert je nach Typ - a/aaaa: IP-Adresse; cname: kanonischer
+           Name; mx: Mailserver; ns: Nameserver; txt: Text-Inhalt;
+           srv: Ziel-Host (srv-target-host).
+    priority: nur für mx (0-50) und srv (srv-priority) erforderlich.
+    srv_service/srv_protocol/srv_port/srv_weight: nur für record_type="srv"
+        erforderlich, zusätzlich zu subdomain, value und priority - z.B. für
+        einen SIP-SRV-Record: subdomain="", value="sipserver.example.com",
+        srv_service="sip", srv_protocol="tcp", srv_port="5060",
+        srv_weight="5", priority="0".
+    """
+    if not confirm:
+        raise ValueError(
+            "confirm=true erforderlich - dieses Tool schreibt auf einem "
+            "Produktivserver (DNS-Zone) und braucht eine explizite "
+            "Bestätigung pro Aufruf."
+        )
+    cmd = _dns_build_cmd(
+        "add", domain, record_type, subdomain, value, priority,
+        srv_service, srv_protocol, srv_port, srv_weight,
+    )
+    return ssh_run(cmd)
+
+
+@mcp.tool()
+def dns_delete_record(
+    domain: str,
+    record_type: str,
+    subdomain: str = "",
+    value: str = "",
+    priority: str = "",
+    srv_service: str = "",
+    srv_protocol: str = "",
+    srv_port: str = "",
+    srv_weight: str = "",
+    confirm: bool = False,
+) -> str:
+    """Entfernt einen DNS-Resource-Record aus der Zone einer Domain.
+    Entspricht `plesk bin dns --del <domain> -<typ> ...` - Plesk erfordert
+    dieselben Parameter wie beim Anlegen (dns_add_record), um den zu
+    löschenden Record eindeutig zu identifizieren; vorher am besten
+    dns_records aufrufen, um die exakten aktuellen Werte zu bestätigen.
+
+    ACHTUNG - schreibt auf einem Produktivserver (entfernt live auflösbare
+    DNS-Einträge): erfordert confirm=true als bewusste Bestätigung PRO
+    Aufruf (keine globale Freischaltung).
+
+    Parameter identisch zu dns_add_record (record_type, subdomain, value,
+    priority, srv_*) - siehe dort für die Bedeutung je Record-Typ.
+    """
+    if not confirm:
+        raise ValueError(
+            "confirm=true erforderlich - dieses Tool schreibt auf einem "
+            "Produktivserver (DNS-Zone) und braucht eine explizite "
+            "Bestätigung pro Aufruf."
+        )
+    cmd = _dns_build_cmd(
+        "del", domain, record_type, subdomain, value, priority,
+        srv_service, srv_protocol, srv_port, srv_weight,
+    )
+    return ssh_run(cmd)
 
 
 @mcp.tool()
