@@ -12,7 +12,7 @@
 """
 plesk-mcp
 
-Version: 0.5.0 (kein pyproject.toml mehr wie im alten src/-Package - Version
+Version: 0.5.1 (kein pyproject.toml mehr wie im alten src/-Package - Version
 wird hier im Docstring nachgeführt; Deployment-Tracking läuft sonst über den
 GHCR-Image-Tag/Git-SHA, analog zu bexio-mcp)
 
@@ -140,10 +140,18 @@ ALLOWED_COMMAND_PREFIXES = {
 # damit z.B. "lve_kill_log" (legitimer Dateiname) nicht fälschlich wegen
 # "kill" blockiert wird, "rm -rf" aber schon.
 FORBIDDEN_WORDS = {
-    "restart", "stop", "reload", "kill", "killall", "rm", "delete", "remove",
-    "passwd", "shutdown", "reboot", "mv", "dd", "chmod", "chown", "mkfs",
-    "bash", "sh", "zsh", "python", "python3", "perl", "curl", "wget", "nc",
-    "eval", "exec",
+    "restart", "stop", "reload", "start", "kill", "killall", "rm", "delete",
+    "remove", "passwd", "shutdown", "reboot", "mv", "dd", "chmod", "chown",
+    "mkfs", "bash", "sh", "zsh", "python", "python3", "perl", "curl", "wget",
+    "nc", "eval", "exec",
+    # Generische Schreib-/Zustands-Subcommands, v.a. relevant fuer
+    # "plesk bin dns/...": --add/-a, --del/-d, --set, --reset, --on/--off,
+    # --update-soa etc. sind alle schreibend, auch wenn "plesk" selbst in
+    # ALLOWED_COMMAND_PREFIXES steht - ohne diese Woerter waeren sie ueber
+    # run_diagnostic trotz "read-only"-Anspruch ausfuehrbar gewesen (siehe
+    # dns_add_record/dns_delete_record/dns_update_record fuer den
+    # vorgesehenen, confirm=true-abgesicherten Weg, DNS-Records zu aendern).
+    "add", "del", "set", "reset", "on", "off", "update",
 }
 _FORBIDDEN_WORD_RE = re.compile(
     r"\b(" + "|".join(re.escape(w) for w in FORBIDDEN_WORDS) + r")\b", re.IGNORECASE
