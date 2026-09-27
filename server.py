@@ -12,7 +12,7 @@
 """
 plesk-mcp
 
-Version: 0.6.0 (kein pyproject.toml mehr wie im alten src/-Package - Version
+Version: 0.7.0 (kein pyproject.toml mehr wie im alten src/-Package - Version
 wird hier im Docstring nachgeführt; Deployment-Tracking läuft sonst über den
 GHCR-Image-Tag/Git-SHA, analog zu bexio-mcp)
 
@@ -31,13 +31,16 @@ Read-only MCP-Server für Diagnose auf einem Plesk-Server. Drei Datenquellen:
 Gedacht für Fehleranalyse bei Support-Anfragen (z.B. "Website nicht erreichbar").
 Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven
 Kommandos (Whitelist + Blacklist weiter unten). Ausnahme: write_vhost_file,
-delete_vhost_backup, delete_vhost_log, dns_add_record, dns_delete_record und
-dns_update_record dürfen schreiben - die ersten beiden Dateien innerhalb von
+delete_vhost_backup, delete_vhost_log, dns_add_record, dns_delete_record,
+dns_update_record, imunify_ignore_add und imunify_ignore_remove dürfen
+schreiben - die ersten beiden Dateien innerhalb von
 /var/www/vhosts/<domain>/ anlegen/überschreiben/löschen (Backups),
 delete_vhost_log Logdateien unter /var/www/vhosts/<domain>/logs/ löschen
-(rotierte) bzw. leeren (aktive), die letzten drei DNS-Resource-Records der
+(rotierte) bzw. leeren (aktive), die drei dns_*-Tools DNS-Resource-Records der
 Domain-Zone anlegen/entfernen/ändern (plesk bin dns --add/--del;
-dns_update_record kombiniert beides für einen bestehenden Record). Alle sechs
+dns_update_record kombiniert beides für einen bestehenden Record).
+imunify_ignore_add/imunify_ignore_remove ändern ausschliesslich die
+Imunify360-Malware-Ignore-Liste (nur Pfade unter /var/www/vhosts/). Alle acht
 erfordern zwingend confirm=true pro Aufruf
 (keine globale Freischaltung), write_vhost_file legt vor dem Überschreiben
 automatisch ein Backup der alten Version an.
@@ -56,7 +59,9 @@ from __future__ import annotations
 
 import base64
 import datetime
+import json
 import os
+import posixpath
 import re
 import shlex
 import stat
@@ -193,10 +198,9 @@ def _ssh_connect() -> paramiko.SSHClient:
     return client
 
 
-def ssh_run(command: str, timeout: int | None = None) -> str:
-    """Führt ein Kommando ungeprüft aus (nur für die fest verdrahteten Tools,
-    NICHT für Nutzereingaben ohne Whitelist-Check - dafür ssh_run_whitelisted).
-    """
+def _ssh_exec(command: str, timeout: int | None = None) -> tuple[str, str, int]:
+    """Führt ein Kommando aus und liefert (stdout, stderr, exit_code) getrennt
+    zurück - für Tools, die stdout selbst parsen (z.B. JSON der Imunify-CLI)."""
     client = _ssh_connect()
     try:
         stdin, stdout, stderr = client.exec_command(command, timeout=timeout or _SSH_TIMEOUT)
@@ -205,6 +209,14 @@ def ssh_run(command: str, timeout: int | None = None) -> str:
         exit_code = stdout.channel.recv_exit_status()
     finally:
         client.close()
+    return out, err, exit_code
+
+
+def ssh_run(command: str, timeout: int | None = None) -> str:
+    """Führt ein Kommando ungeprüft aus (nur für die fest verdrahteten Tools,
+    NICHT für Nutzereingaben ohne Whitelist-Check - dafür ssh_run_whitelisted).
+    """
+    out, err, exit_code = _ssh_exec(command, timeout=timeout)
 
     result = out
     if err.strip():
@@ -1229,6 +1241,352 @@ def delete_vhost_log(
             sftp.close()
     finally:
         client.close()
+
+
+# ---------------------------------------------------------------------------
+# Imunify360 - Malware-Treffer und Malware-Ignore-Liste
+#
+# Aufbau der Kommandos gemäss den CLI-Schemas von imunify360-agent
+# (imav/malwarelib/rpc/schema/ignore.yaml + malicious.yaml auf dem Server):
+#   malware malicious list [--search S] [--by-status ST ...] [--limit N] [--offset N]
+#   malware ignore list    [--search S] [--limit N] [--offset N]
+#   malware ignore add     PATH ...   (absolute Pfade, keine Wildcards)
+#   malware ignore delete  ID ...     (nur IDs aus "malware ignore list")
+# Mit --json gibt die CLI bei Erfolg das data-Objekt ({"items": ...}) aus,
+# bei Fehlern {"error"|"warnings": <messages>} mit Exit-Code 11 bzw. 3.
+#
+# imunify360-agent ist bewusst NICHT in run_diagnostic freigegeben - nur
+# diese fest verdrahteten Unterbefehle sind erreichbar.
+# ---------------------------------------------------------------------------
+
+_IMUNIFY_BIN = "/usr/bin/imunify360-agent"
+
+# Erlaubte Zeichen in Imunify-Pfaden: bewusst konservativ (keine Leerzeichen,
+# keine Shell-Metazeichen, keine Wildcards - die CLI unterstützt laut Schema
+# ohnehin nur absolute Pfade ohne Glob-Muster).
+_IMUNIFY_PATH_CHARS_RE = re.compile(r"^[A-Za-z0-9._/+@=,~-]+$")
+
+_IMUNIFY_MALICIOUS_STATUSES = {
+    "found", "cleanup_pending", "cleanup_started", "cleanup_done",
+    "cleanup_removed", "cleanup_requires_myimunify_protection",
+    "cleanup_restore_pending", "cleanup_restore_started",
+    "restore_from_backup_started", "restored_from_backup",
+}
+
+
+def _imunify_search_term(term: str, name: str) -> str:
+    """Suchbegriff für --search: gleiche Zeichen-Whitelist wie Pfade, und
+    kein führendes "-" (würde die CLI sonst als Option interpretieren)."""
+    if not _IMUNIFY_PATH_CHARS_RE.match(term) or term.startswith("-"):
+        raise ValueError(f"{name} {term!r} enthält unerlaubte Zeichen.")
+    return term
+
+
+def _imunify_validate_path(path: str) -> str:
+    """Statische Prüfung eines Pfads für die Imunify-Ignore-Liste (ohne
+    Serverzugriff, daher separat testbar):
+    - absolut und unterhalb von /var/www/vhosts/<domain>/ (mind. eine Ebene
+      unter dem Domain-Verzeichnis - nie ganze Domains oder vhosts selbst)
+    - bereits normalisiert (kein "..", ".", "//", kein abschliessendes "/")
+    - nur unkritische Zeichen (keine Leerzeichen, Shell-Metazeichen, Wildcards)
+    Gibt den unveränderten Pfad zurück oder wirft ValueError.
+    """
+    if not isinstance(path, str) or not path:
+        raise ValueError("path darf nicht leer sein.")
+    if not _IMUNIFY_PATH_CHARS_RE.match(path):
+        raise ValueError(
+            f"Pfad {path!r} enthält unerlaubte Zeichen (erlaubt: A-Z a-z 0-9 "
+            "und . _ / + @ = , ~ -; keine Leerzeichen, Wildcards oder "
+            "Shell-Sonderzeichen)."
+        )
+    if not path.startswith("/"):
+        raise ValueError(f"Pfad {path!r} muss absolut sein.")
+    if posixpath.normpath(path) != path or "//" in path:
+        raise ValueError(
+            f"Pfad {path!r} ist nicht normalisiert ('..', '.', '//' oder "
+            "abschliessendes '/' sind nicht erlaubt)."
+        )
+    if not path.startswith(_VHOST_BASE + "/"):
+        raise ValueError(
+            f"Pfad {path!r} liegt nicht unter {_VHOST_BASE}/ - nicht erlaubt."
+        )
+    parts = path[len(_VHOST_BASE) + 1:].split("/")
+    # /var/www/vhosts/<domain>/<x>  bzw.  /var/www/vhosts/system/<domain>/<x>
+    min_parts = 3 if parts[0] == "system" else 2
+    if len(parts) < min_parts:
+        raise ValueError(
+            f"Pfad {path!r} ist zu allgemein - es muss eine Datei bzw. ein "
+            "Pfad innerhalb eines Domain-Verzeichnisses angegeben werden."
+        )
+    return path
+
+
+def _imunify_check_on_server(path: str, must_exist: bool) -> None:
+    """Prüft per SFTP auf dem Server, dass der Pfad keine Symlink-Tricks
+    enthält: Das Ziel selbst darf kein Symlink sein, und der kanonische Pfad
+    (alle Symlinks in Elternverzeichnissen aufgelöst) muss exakt dem
+    angegebenen Pfad entsprechen. Existiert der Pfad nicht, wird bei
+    must_exist=True abgebrochen, sonst nichts weiter geprüft.
+    """
+    client = _ssh_connect()
+    try:
+        sftp = client.open_sftp()
+        try:
+            try:
+                lst = sftp.lstat(path)
+            except FileNotFoundError:
+                if must_exist:
+                    raise ValueError(f"'{path}' existiert auf dem Server nicht.")
+                return
+            if stat.S_ISLNK(lst.st_mode or 0):
+                raise ValueError(
+                    f"'{path}' ist ein Symlink - aus Sicherheitsgründen nicht erlaubt."
+                )
+            real = sftp.normalize(path)
+        finally:
+            sftp.close()
+    finally:
+        client.close()
+    if real != path:
+        raise ValueError(
+            f"'{path}' zeigt über einen Symlink auf '{real}'. Bitte den "
+            "kanonischen Pfad verwenden (dieser wird ebenfalls geprüft)."
+        )
+
+
+def _imunify_run(args: list[str]) -> dict[str, Any]:
+    """Führt imunify360-agent mit fest vorgegebenen Argumenten aus. Die
+    Argumente werden als Liste übergeben und einzeln per shlex.join
+    gequotet (SSH exec kennt nur einen Kommando-String, eine Liste wird so
+    ohne Shell-Interpretation der Einzelwerte übertragen). Liefert
+    {"ok": True, "data": ...} oder {"ok": False, "error": ..., ...}.
+    """
+    argv = [_IMUNIFY_BIN, *args, "--json"]
+    out, err, code = _ssh_exec(shlex.join(argv), timeout=max(_SSH_TIMEOUT, 60))
+    parsed: Any = None
+    if out.strip():
+        try:
+            parsed = json.loads(out)
+        except json.JSONDecodeError:
+            parsed = None
+
+    if code == 0 and isinstance(parsed, dict):
+        return {"ok": True, "data": parsed}
+
+    if isinstance(parsed, dict) and ("error" in parsed or "warnings" in parsed):
+        msg = parsed.get("error", parsed.get("warnings"))
+    elif isinstance(parsed, dict) and isinstance(parsed.get("items"), str):
+        msg = parsed["items"]  # z.B. Socket-Fehler: {"items": "ERROR: ..."}
+    else:
+        msg = (err.strip() or out.strip() or "unbekannter Fehler")
+    return {
+        "ok": False,
+        "error": msg,
+        "exit_code": code,
+        "command": " ".join(argv[1:]),
+        "stderr": err.strip() or None,
+    }
+
+
+def _ts_iso(ts: Any) -> str | None:
+    try:
+        return datetime.datetime.fromtimestamp(float(ts), datetime.timezone.utc).isoformat()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+
+
+def _json(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def imunify_malware_list(
+    domain: str = "",
+    path: str = "",
+    status: str = "",
+    limit: int = 50,
+    offset: int = 0,
+) -> str:
+    """Listet die aktuellen Malware-Treffer von Imunify360 auf
+    (imunify360-agent malware malicious list) - read-only.
+    Rückgabe als JSON: id, file, created (Unix + ISO), type (Signatur),
+    status, username, scan_type, resource_type.
+
+    domain: nur Treffer unter /var/www/vhosts/<domain>/ (Suche über Pfad).
+    path: Suchbegriff für den Dateipfad (Teilstring, hat Vorrang vor domain).
+    status: optional, kommagetrennt, z.B. "found" oder
+    "found,cleanup_done" (Werte laut CLI-Hilfe).
+    limit/offset: Paging (Standard 50/0, max. limit 500).
+    """
+    args = ["malware", "malicious", "list"]
+    search = ""
+    if path:
+        search = _imunify_search_term(path, "path")
+    elif domain:
+        d = _imunify_search_term(_domain_arg(domain), "domain")
+        search = f"{_VHOST_BASE}/{d}/"
+    if search:
+        args += ["--search", search]
+    if status:
+        statuses = [s.strip() for s in status.split(",") if s.strip()]
+        bad = [s for s in statuses if s not in _IMUNIFY_MALICIOUS_STATUSES]
+        if bad:
+            raise ValueError(
+                f"Unbekannter status {bad}. Erlaubt: "
+                f"{', '.join(sorted(_IMUNIFY_MALICIOUS_STATUSES))}"
+            )
+        args += ["--by-status", *statuses]
+    args += ["--limit", str(max(1, min(int(limit), 500))), "--offset", str(max(0, int(offset)))]
+
+    res = _imunify_run(args)
+    if not res["ok"]:
+        return _json(res)
+    data = res["data"]
+    items = [
+        {
+            "id": it.get("id"),
+            "file": it.get("file"),
+            "created": it.get("created"),
+            "created_iso": _ts_iso(it.get("created")),
+            "type": it.get("type"),
+            "status": it.get("status"),
+            "username": it.get("username"),
+            "scan_type": it.get("scan_type"),
+            "resource_type": it.get("resource_type"),
+        }
+        for it in (data.get("items") or [])
+    ]
+    return _json({
+        "ok": True,
+        "total": data.get("max_count"),
+        "malicious_count": data.get("malicious_count"),
+        "returned": len(items),
+        "offset": int(offset),
+        "items": items,
+    })
+
+
+def _imunify_ignore_entries(search: str, limit: int = 500, offset: int = 0) -> dict[str, Any]:
+    args = ["malware", "ignore", "list"]
+    if search:
+        args += ["--search", search]
+    args += ["--limit", str(limit), "--offset", str(offset)]
+    return _imunify_run(args)
+
+
+@mcp.tool()
+def imunify_ignore_list(search: str = "", limit: int = 50, offset: int = 0) -> str:
+    """Listet die Einträge der Imunify360-Malware-Ignore-Liste auf
+    (imunify360-agent malware ignore list) - read-only.
+    Rückgabe als JSON: id, path, added_date (Unix + ISO), resource_type.
+    search: optionaler Suchbegriff für den Pfad (Teilstring).
+    limit/offset: Paging (Standard 50/0, max. limit 500).
+    """
+    if search:
+        _imunify_search_term(search, "search")
+    res = _imunify_ignore_entries(
+        search, limit=max(1, min(int(limit), 500)), offset=max(0, int(offset))
+    )
+    if not res["ok"]:
+        return _json(res)
+    data = res["data"]
+    items = [
+        {
+            "id": it.get("id"),
+            "path": it.get("path"),
+            "added_date": it.get("added_date"),
+            "added_date_iso": _ts_iso(it.get("added_date")),
+            "resource_type": it.get("resource_type"),
+        }
+        for it in (data.get("items") or [])
+    ]
+    return _json({
+        "ok": True,
+        "total": data.get("max_count"),
+        "returned": len(items),
+        "offset": int(offset),
+        "items": items,
+    })
+
+
+@mcp.tool()
+def imunify_ignore_add(path: str, confirm: bool = False) -> str:
+    """Fügt eine Datei zur Imunify360-Malware-Ignore-Liste hinzu
+    (imunify360-agent malware ignore add <path>) - z.B. für False Positives
+    in rotierten Logs wie /var/www/vhosts/example.com/logs/error_log.1.gz.
+
+    Nur absolute, normalisierte Pfade unter /var/www/vhosts/<domain>/...,
+    keine Wildcards (die CLI unterstützt laut Hilfe nur absolute Pfade).
+    Die Datei muss existieren, darf kein Symlink sein und nicht über einen
+    Symlink erreicht werden. Erfordert confirm=true pro Aufruf.
+    """
+    if not confirm:
+        raise ValueError(
+            "confirm=true erforderlich - dieses Tool ändert die Imunify360-"
+            "Ignore-Liste auf einem Produktivserver und braucht eine explizite "
+            "Bestätigung pro Aufruf."
+        )
+    p = _imunify_validate_path(path)
+    _imunify_check_on_server(p, must_exist=True)
+
+    res = _imunify_run(["malware", "ignore", "add", p])
+    if not res["ok"]:
+        return _json(res)
+    return _json({"ok": True, "path": p, "added": res["data"].get("items")})
+
+
+@mcp.tool()
+def imunify_ignore_remove(path: str, confirm: bool = False, skip_rescan: bool = False) -> str:
+    """Entfernt einen Pfad wieder aus der Imunify360-Malware-Ignore-Liste.
+    Die CLI löscht nur per ID (imunify360-agent malware ignore delete <id>),
+    daher wird die ID vorher über "malware ignore list --search <path>"
+    ermittelt - entfernt werden nur Einträge mit exakt diesem Pfad.
+    Pfadprüfung wie bei imunify_ignore_add (die Datei muss aber nicht mehr
+    existieren). Laut CLI wird die Datei nach dem Entfernen standardmässig
+    sofort neu gescannt; skip_rescan=true unterdrückt das.
+    Erfordert confirm=true pro Aufruf.
+    """
+    if not confirm:
+        raise ValueError(
+            "confirm=true erforderlich - dieses Tool ändert die Imunify360-"
+            "Ignore-Liste auf einem Produktivserver und braucht eine explizite "
+            "Bestätigung pro Aufruf."
+        )
+    p = _imunify_validate_path(path)
+    _imunify_check_on_server(p, must_exist=False)
+
+    ids: list[int] = []
+    offset = 0
+    page = 500
+    while True:
+        res = _imunify_ignore_entries(p, limit=page, offset=offset)
+        if not res["ok"]:
+            return _json(res)
+        items = res["data"].get("items") or []
+        ids += [int(it["id"]) for it in items if it.get("path") == p and "id" in it]
+        if len(items) < page:
+            break
+        offset += page
+
+    if not ids:
+        return _json({
+            "ok": False,
+            "error": f"Kein Eintrag mit exakt diesem Pfad in der Ignore-Liste: {p}",
+        })
+
+    args = ["malware", "ignore", "delete", *[str(i) for i in ids]]
+    if skip_rescan:
+        args.append("--skip-rescan")
+    res = _imunify_run(args)
+    if not res["ok"]:
+        return _json(res)
+    return _json({
+        "ok": True,
+        "path": p,
+        "removed_ids": ids,
+        "removed": res["data"].get("items"),
+        "rescan": not skip_rescan,
+    })
 
 
 @mcp.tool()
