@@ -105,6 +105,7 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8422` auf dem Docker-Hos
 
 | Tool | Beschreibung |
 |------|--------------|
+| `get_version` | Version des laufenden MCP-Servers (Redeploy-Kontrolle) |
 | `domain_info` | Plesk-Domain-Infos (Status, Disk, Traffic, SSL, Subscription) |
 | `dns_records` | DNS-Resource-Records der Domain-Zone (`plesk bin dns --info`) |
 | `dns_add_record` | Legt einen DNS-Resource-Record an (A/AAAA/CNAME/MX/NS/TXT/SRV) - **erfordert `confirm=true`** |
