@@ -12,7 +12,7 @@
 """
 plesk-mcp
 
-Version: 0.5.1 (kein pyproject.toml mehr wie im alten src/-Package - Version
+Version: 0.6.0 (kein pyproject.toml mehr wie im alten src/-Package - Version
 wird hier im Docstring nachgeführt; Deployment-Tracking läuft sonst über den
 GHCR-Image-Tag/Git-SHA, analog zu bexio-mcp)
 
@@ -31,12 +31,14 @@ Read-only MCP-Server für Diagnose auf einem Plesk-Server. Drei Datenquellen:
 Gedacht für Fehleranalyse bei Support-Anfragen (z.B. "Website nicht erreichbar").
 Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven
 Kommandos (Whitelist + Blacklist weiter unten). Ausnahme: write_vhost_file,
-delete_vhost_backup, dns_add_record, dns_delete_record und dns_update_record
-dürfen schreiben - die ersten beiden Dateien innerhalb von
-/var/www/vhosts/<domain>/ anlegen/überschreiben/löschen (Backups), die
-letzten drei DNS-Resource-Records der Domain-Zone anlegen/entfernen/ändern
-(plesk bin dns --add/--del; dns_update_record kombiniert beides für einen
-bestehenden Record). Alle fünf erfordern zwingend confirm=true pro Aufruf
+delete_vhost_backup, delete_vhost_log, dns_add_record, dns_delete_record und
+dns_update_record dürfen schreiben - die ersten beiden Dateien innerhalb von
+/var/www/vhosts/<domain>/ anlegen/überschreiben/löschen (Backups),
+delete_vhost_log Logdateien unter /var/www/vhosts/<domain>/logs/ löschen
+(rotierte) bzw. leeren (aktive), die letzten drei DNS-Resource-Records der
+Domain-Zone anlegen/entfernen/ändern (plesk bin dns --add/--del;
+dns_update_record kombiniert beides für einen bestehenden Record). Alle sechs
+erfordern zwingend confirm=true pro Aufruf
 (keine globale Freischaltung), write_vhost_file legt vor dem Überschreiben
 automatisch ein Backup der alten Version an.
 
@@ -1131,6 +1133,102 @@ def delete_vhost_backup(domain: str, path: str, confirm: bool = False) -> str:
         client.close()
 
     return f"Backup gelöscht: {full}"
+
+
+# Rotierte Logs (logrotate/Plesk): access_log.1, error_log.2.gz,
+# proxy_error_log-20260919.gz, access_log.processed.1.gz etc. - alles, was
+# NICHT die aktuell vom Webserver beschriebene Datei ist.
+_ROTATED_LOG_RE = re.compile(r"(\.gz|\.\d+|-\d{8})$")
+_LOG_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+@mcp.tool()
+def delete_vhost_log(
+    domain: str,
+    filename: str = "",
+    all_rotated: bool = False,
+    confirm: bool = False,
+) -> str:
+    """Löscht Logdateien im Log-Verzeichnis der Domain
+    (/var/www/vhosts/<domain>/logs/) - z.B. um Platz freizugeben.
+
+    filename: Dateiname direkt im logs-Verzeichnis (ohne Pfad), z.B.
+    "error_log.3.gz" oder "access_log".
+    - Rotierte Logs (Endung .gz, .<Zahl> oder -JJJJMMTT) werden gelöscht.
+    - Aktive Logs (z.B. "access_log", "error_log", "proxy_error_log") werden
+      stattdessen auf 0 Bytes geleert: Der Webserver hält diese Dateien
+      offen, ein echtes Löschen würde den Platz erst nach einem Reload
+      freigeben und bis dahin weitergeschriebene Einträge gingen verloren.
+    all_rotated: true löscht ALLE rotierten Logs im Verzeichnis auf einmal
+    (filename dann leer lassen); aktive Logs bleiben dabei unangetastet.
+
+    Symlinks und Verzeichnisse werden nie angefasst. Erfordert confirm=true
+    pro Aufruf.
+    """
+    if not confirm:
+        raise ValueError(
+            "confirm=true erforderlich - dieses Tool löscht Dateien auf "
+            "einem Produktivserver und braucht eine explizite Bestätigung pro Aufruf."
+        )
+    name = filename.strip()
+    if all_rotated == bool(name):
+        raise ValueError(
+            "Entweder filename angeben oder all_rotated=true setzen (nicht beides)."
+        )
+    if name and not _LOG_FILENAME_RE.match(name):
+        raise ValueError(
+            f"Ungültiger Dateiname {filename!r} - erlaubt ist nur ein reiner "
+            "Dateiname im logs-Verzeichnis (keine Pfade, kein '..')."
+        )
+
+    log_dir = _vhost_path(domain, "logs")
+
+    client = _ssh_connect()
+    try:
+        sftp = client.open_sftp()
+        try:
+            if all_rotated:
+                removed: list[str] = []
+                freed = 0
+                for entry in sftp.listdir_attr(log_dir):
+                    if not stat.S_ISREG(entry.st_mode or 0):
+                        continue
+                    if not _ROTATED_LOG_RE.search(entry.filename):
+                        continue
+                    sftp.remove(f"{log_dir}/{entry.filename}")
+                    removed.append(entry.filename)
+                    freed += entry.st_size or 0
+                if not removed:
+                    return f"Keine rotierten Logs in {log_dir} gefunden."
+                return (
+                    f"{len(removed)} rotierte Logs in {log_dir} gelöscht "
+                    f"({freed / 1024 / 1024:.1f} MB): " + ", ".join(sorted(removed))
+                )
+
+            full = f"{log_dir}/{name}"
+            try:
+                lst = sftp.lstat(full)
+            except FileNotFoundError:
+                raise ValueError(f"'{full}' existiert nicht.")
+            if not stat.S_ISREG(lst.st_mode or 0):
+                raise ValueError(
+                    f"'{full}' ist keine reguläre Datei (Symlink/Verzeichnis) - "
+                    "wird aus Sicherheitsgründen nicht angefasst."
+                )
+            size_mb = (lst.st_size or 0) / 1024 / 1024
+
+            if _ROTATED_LOG_RE.search(name):
+                sftp.remove(full)
+                return f"Log gelöscht: {full} ({size_mb:.1f} MB)"
+            sftp.truncate(full, 0)
+            return (
+                f"Aktives Log geleert (auf 0 Bytes gekürzt statt gelöscht): "
+                f"{full} ({size_mb:.1f} MB freigegeben)"
+            )
+        finally:
+            sftp.close()
+    finally:
+        client.close()
 
 
 @mcp.tool()
