@@ -12,9 +12,9 @@
 """
 plesk-mcp
 
-Version: 0.7.0 (kein pyproject.toml mehr wie im alten src/-Package - Version
-wird hier im Docstring nachgeführt; Deployment-Tracking läuft sonst über den
-GHCR-Image-Tag/Git-SHA, analog zu bexio-mcp)
+Version: siehe __version__ unten (kein pyproject.toml mehr wie im alten
+src/-Package). Abfragbar über das get_version-Tool bzw. serverInfo im
+MCP-Handshake, um nach einem Redeploy die ausgerollte Version zu prüfen.
 
 Read-only MCP-Server für Diagnose auf einem Plesk-Server. Drei Datenquellen:
 
@@ -96,7 +96,9 @@ if _HTTP_MODE and not _MCP_API_KEY:
         "aus Sicherheitsgruenden kein Start ohne Token."
     )
 
-mcp = MCPServer("plesk-mcp")
+__version__ = "0.8.0"
+
+mcp = MCPServer("plesk-mcp", version=__version__)
 
 # ---------------------------------------------------------------------------
 # SSH-Verbindung zum Plesk-Server
@@ -495,6 +497,12 @@ def _mysql_exec(
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def get_version() -> str:
+    """Version des laufenden Plesk-MCP-Servers abfragen (Redeploy-Kontrolle)."""
+    return json.dumps({"name": "plesk-mcp", "version": __version__})
 
 
 @mcp.tool()
