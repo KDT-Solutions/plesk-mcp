@@ -502,7 +502,7 @@ def _mysql_exec(
 @mcp.tool()
 def get_version() -> str:
     """Version des laufenden Plesk-MCP-Servers abfragen (Redeploy-Kontrolle)."""
-    return json.dumps({"name": "plesk-mcp", "version": __version__})
+    return json.dumps({"name": "plesk-mcp", "version": __version__, "commit": os.environ.get("GIT_SHA", "unbekannt")})
 
 
 @mcp.tool()
