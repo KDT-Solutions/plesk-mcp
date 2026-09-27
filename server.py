@@ -12,9 +12,9 @@
 """
 plesk-mcp
 
-Version: siehe __version__ unten (kein pyproject.toml mehr wie im alten
-src/-Package). Abfragbar über das get_version-Tool bzw. serverInfo im
-MCP-Handshake, um nach einem Redeploy die ausgerollte Version zu prüfen.
+Version: wird automatisch gezählt (siehe _read_version unten). Abfragbar über
+das get_version-Tool bzw. serverInfo im MCP-Handshake, um nach einem Redeploy
+die ausgerollte Version zu prüfen.
 
 Read-only MCP-Server für Diagnose auf einem Plesk-Server. Drei Datenquellen:
 
@@ -96,7 +96,34 @@ if _HTTP_MODE and not _MCP_API_KEY:
         "aus Sicherheitsgruenden kein Start ohne Token."
     )
 
-__version__ = "0.8.0"
+# Version = <Major.Minor>.<Patch>. Major.Minor wird hier von Hand gepflegt, der
+# Patch-Teil zaehlt automatisch: Anzahl Commits, die eine der build-relevanten
+# Dateien (server.py, Dockerfile, requirements.txt, Workflow) geaendert haben.
+# Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
+# lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
+_VERSION_BASE = "0.8"
+_VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
+
+
+def _read_version() -> str:
+    env_version = os.environ.get("APP_VERSION", "").strip()
+    if env_version:
+        return env_version
+    try:
+        import subprocess
+        count = subprocess.run(
+            ["git", "rev-list", "--count", "HEAD", "--", *_VERSION_PATHS],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
+        if count.isdigit():
+            return f"{_VERSION_BASE}.{count}"
+    except Exception:
+        pass
+    return f"{_VERSION_BASE}.0-dev"
+
+
+__version__ = _read_version()
 
 mcp = MCPServer("plesk-mcp", version=__version__)
 
