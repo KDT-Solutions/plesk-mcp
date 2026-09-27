@@ -7,6 +7,9 @@ services:
     # GitHub Personal Access Token (Scope "read:packages"), da das Repo/
     # Package privat ist.
     image: ghcr.io/kdt-solutions/plesk-mcp:latest
+    # Bei jedem Deploy/Redeploy das Image aus der Registry neu ziehen, statt
+    # eine lokal schon vorhandene (evtl. veraltete) :latest-Kopie zu verwenden.
+    pull_policy: always
     container_name: plesk-mcp-cloud
     restart: unless-stopped
     environment:
