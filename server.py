@@ -297,7 +297,9 @@ def _configure_host_keys(client: paramiko.SSHClient) -> None:
             if not cls:
                 raise SSHError(f"Nicht unterstuetzter Host-Key-Typ: {keytype}")
             key = cls(data=_b64.b64decode(keyblob))
-        client.get_host_keys().add(_SSH_HOST, keytype, key)
+        # paramiko sucht den Key bei Nicht-Standard-Port unter "[host]:port"
+        host_entry = _SSH_HOST if _SSH_PORT == 22 else f"[{_SSH_HOST}]:{_SSH_PORT}"
+        client.get_host_keys().add(host_entry, keytype, key)
         pinned = True
 
     if pinned:
