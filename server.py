@@ -137,6 +137,18 @@ _SSH_USER = os.environ.get("PLESK_SSH_USER", "root")
 _SSH_PASSWORD = os.environ.get("PLESK_SSH_PASSWORD")
 _SSH_KEY_PATH = os.environ.get("PLESK_SSH_KEY_PATH")  # Alternative zu Passwort
 _SSH_TIMEOUT = int(os.environ.get("PLESK_SSH_TIMEOUT", "20"))
+# Host-Key-Verifikation (MITM-Schutz). Beide Werte kommen aus der Umgebung -
+# im oeffentlichen Repo darf kein Host-Key hinterlegt sein.
+#   PLESK_SSH_KNOWN_HOSTS: Pfad zu einer known_hosts-Datei (gemountet).
+#   PLESK_SSH_HOST_KEY:    ein known_hosts-/authorized_keys-Zeilenrest, also
+#                          "<typ> <base64>" (z.B. "ssh-ed25519 AAAAC3Nza...").
+# Ist einer von beiden gesetzt, wird der Host-Key strikt geprueft (RejectPolicy
+# bei unbekanntem Key). Ist keiner gesetzt, wird der Key beim ersten Connect
+# automatisch akzeptiert (AutoAdd) - bequem, aber ohne MITM-Schutz; es wird
+# einmalig auf stderr gewarnt.
+_SSH_KNOWN_HOSTS = os.environ.get("PLESK_SSH_KNOWN_HOSTS", "").strip()
+_SSH_HOST_KEY = os.environ.get("PLESK_SSH_HOST_KEY", "").strip()
+_ssh_hostkey_warned = False
 
 # Kommandos, die der generische Diagnose-Tool (run_diagnostic) ausführen darf
 # (read-only). Jeder Eintrag ist ein erlaubtes erstes Wort (Programm) des
@@ -195,11 +207,110 @@ _FORBIDDEN_WORD_RE = re.compile(
 
 # Shell-Konstrukte, die Command-Chaining/Injection ermöglichen - werden als
 # reiner Substring-Check verboten, unabhängig vom Rest des Befehls.
-FORBIDDEN_SHELL_CONSTRUCTS = (";", "&&", "||", "`", "$(", ">", "<", "&")
+# Newline/Carriage-Return sind bewusst dabei: das Kommando wird als String an
+# eine Remote-Shell uebergeben, ein "\n" darin startet eine zweite Befehlszeile
+# (z.B. "ls /tmp\nid") - der per-Segment-Programmcheck sieht davon nichts.
+FORBIDDEN_SHELL_CONSTRUCTS = (";", "&&", "||", "`", "$(", ">", "<", "&", "\n", "\r")
+
+# find-Primitive, die Kommandos ausfuehren oder Dateien schreiben - fuer find
+# separat geprueft, weil der \b-Wortcheck sie nicht zuverlaessig fasst
+# (z.B. "-execdir" enthaelt "exec" nicht als eigenes Wort). Vergleich erfolgt
+# auf dem Token ohne fuehrende Bindestriche.
+FORBIDDEN_FIND_PRIMARIES = {
+    "exec", "execdir", "ok", "okdir", "delete",
+    "fprint", "fprintf", "fls", "fprint0",
+}
+
+# Positive Allowlist der erlaubten Subcommands/ersten Argumente je Programm,
+# das schreibende Unterbefehle kennt. Nur lesende Operationen. Fuer Programme,
+# die hier NICHT auftauchen (grep, tail, cat, du, df, ...), gilt weiter nur die
+# generische Wort-Blacklist. Eine Positiv-Liste ist hier noetig, weil eine
+# Blacklist bei "plesk"/"systemctl" die Schreib-Subcommands nicht dicht
+# bekommt (plesk db/login/bin extension --install-url, systemctl mask/disable
+# /poweroff/isolate ...).
+SAFE_SUBCOMMANDS = {
+    "systemctl": {
+        "status", "show", "show-environment", "list-units", "list-unit-files",
+        "list-timers", "list-sockets", "list-dependencies", "list-jobs",
+        "is-active", "is-enabled", "is-failed", "is-system-running",
+        "cat", "get-default",
+    },
+    # plesk: nur die lesenden CLI-Familien. Innerhalb davon fangen die
+    # generische Blacklist (add/del/set/...) und FORBIDDEN_SUBFLAGS die
+    # schreibenden Aktionen ab.
+    "plesk": {"version", "bin", "ext"},
+}
+
+# Verbotene erste Subcommands je Programm (haben Vorrang vor SAFE_SUBCOMMANDS).
+# "plesk db" oeffnet eine SQL-Shell auf der Plesk-Datenbank, "plesk login"
+# erzeugt einen Admin-Login-Link, "plesk repair" schreibt.
+FORBIDDEN_SUBCOMMANDS = {
+    "plesk": {"login", "db", "repair", "sbin", "daemon", "installer"},
+}
+
+# Schreibende Optionsflags, die unabhaengig vom Programm blockiert werden
+# (v.a. "plesk bin/ext ..."): install/create/enable/disable etc. sind
+# schreibend, tauchen aber als Langoptionen auf und werden von der reinen
+# Wort-Blacklist nicht erfasst.
+FORBIDDEN_SUBFLAGS = {
+    "install", "install-url", "create", "enable", "disable", "repair",
+    "exec", "execute", "uninstall", "upgrade", "activate", "deactivate",
+}
 
 
 class SSHError(RuntimeError):
     pass
+
+
+def _configure_host_keys(client: paramiko.SSHClient) -> None:
+    """Konfiguriert die Host-Key-Verifikation aus den Umgebungsvariablen.
+    Mit PLESK_SSH_KNOWN_HOSTS/PLESK_SSH_HOST_KEY: strikte Pruefung
+    (RejectPolicy). Ohne beides: AutoAdd mit einmaliger Warnung."""
+    global _ssh_hostkey_warned
+    pinned = False
+
+    if _SSH_KNOWN_HOSTS:
+        client.load_host_keys(_SSH_KNOWN_HOSTS)  # wirft, wenn Pfad fehlt
+        pinned = True
+
+    if _SSH_HOST_KEY:
+        import base64 as _b64
+        parts = _SSH_HOST_KEY.split()
+        if len(parts) < 2:
+            raise SSHError(
+                "PLESK_SSH_HOST_KEY muss das Format '<typ> <base64>' haben "
+                "(z.B. 'ssh-ed25519 AAAAC3Nza...')."
+            )
+        keytype, keyblob = parts[0], parts[1]
+        try:
+            key = paramiko.PKey.from_type_string(keytype, _b64.b64decode(keyblob))
+        except Exception:
+            # Fallback fuer aeltere paramiko-Versionen ohne from_type_string
+            key_classes = {
+                "ssh-ed25519": paramiko.Ed25519Key,
+                "ssh-rsa": paramiko.RSAKey,
+                "ecdsa-sha2-nistp256": paramiko.ECDSAKey,
+                "ecdsa-sha2-nistp384": paramiko.ECDSAKey,
+                "ecdsa-sha2-nistp521": paramiko.ECDSAKey,
+            }
+            cls = key_classes.get(keytype)
+            if not cls:
+                raise SSHError(f"Nicht unterstuetzter Host-Key-Typ: {keytype}")
+            key = cls(data=_b64.b64decode(keyblob))
+        client.get_host_keys().add(_SSH_HOST, keytype, key)
+        pinned = True
+
+    if pinned:
+        client.set_missing_host_key_policy(paramiko.RejectPolicy())
+    else:
+        if not _ssh_hostkey_warned:
+            print(
+                "WARNUNG: PLESK_SSH_KNOWN_HOSTS/PLESK_SSH_HOST_KEY nicht gesetzt "
+                "- SSH-Host-Key wird nicht geprueft (kein MITM-Schutz).",
+                file=sys.stderr, flush=True,
+            )
+            _ssh_hostkey_warned = True
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
 
 def _ssh_connect() -> paramiko.SSHClient:
@@ -208,7 +319,7 @@ def _ssh_connect() -> paramiko.SSHClient:
             "PLESK_SSH_HOST/PLESK_SSH_USER sind nicht gesetzt (Umgebungsvariablen fehlen)."
         )
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    _configure_host_keys(client)
     connect_kwargs: dict[str, Any] = dict(
         hostname=_SSH_HOST,
         port=_SSH_PORT,
@@ -255,21 +366,89 @@ def ssh_run(command: str, timeout: int | None = None) -> str:
     return result.strip() or "(keine Ausgabe)"
 
 
+def _check_segment(seg: list[str]) -> None:
+    """Prueft ein einzelnes Pipe-Segment (Token-Liste) read-only-tauglich:
+    erlaubtes Programm, erlaubtes Subcommand (Positiv-Liste, wo noetig),
+    keine schreibenden Optionsflags, keine gefaehrlichen find-Primitive."""
+    if not seg:
+        raise SSHError("Leeres Pipe-Segment im Kommando.")
+    program = seg[0]
+    if program not in ALLOWED_COMMAND_PREFIXES:
+        raise SSHError(
+            f"Programm '{program}' ist nicht erlaubt. "
+            f"Erlaubt sind: {', '.join(sorted(ALLOWED_COMMAND_PREFIXES))}"
+        )
+    args = seg[1:]
+
+    # 1) Erstes echtes Subcommand (erstes Argument, das nicht mit '-' beginnt).
+    first_sub = next((a for a in args if not a.startswith("-")), None)
+
+    forbidden_subs = FORBIDDEN_SUBCOMMANDS.get(program)
+    if forbidden_subs and first_sub and first_sub.lower() in forbidden_subs:
+        raise SSHError(
+            f"Subcommand '{program} {first_sub}' ist nicht erlaubt "
+            "(schreibend/interaktiv). Dieses Tool ist read-only."
+        )
+
+    safe_subs = SAFE_SUBCOMMANDS.get(program)
+    if safe_subs is not None:
+        if first_sub is None:
+            raise SSHError(
+                f"'{program}' erfordert ein Subcommand. Erlaubt (read-only): "
+                f"{', '.join(sorted(safe_subs))}"
+            )
+        if first_sub.lower() not in safe_subs:
+            raise SSHError(
+                f"Subcommand '{program} {first_sub}' ist nicht erlaubt. "
+                f"Erlaubt (read-only): {', '.join(sorted(safe_subs))}"
+            )
+
+    # 2) Schreibende Optionsflags (Langoptionen wie --install-url, --create).
+    for tok in args:
+        if not tok.startswith("-"):
+            continue
+        flag = tok.lstrip("-").split("=", 1)[0].lower()
+        if flag in FORBIDDEN_SUBFLAGS:
+            raise SSHError(
+                f"Optionsflag '{tok}' ist schreibend und nicht erlaubt. "
+                "Dieses Tool ist read-only für Diagnosezwecke."
+            )
+
+    # 3) find-Aktions-Primitive (fuehren Kommandos aus / schreiben Dateien).
+    if program == "find":
+        for tok in args:
+            if not tok.startswith("-"):
+                continue
+            if tok.lstrip("-").lower() in FORBIDDEN_FIND_PRIMARIES:
+                raise SSHError(
+                    f"find-Primitiv '{tok}' ist nicht erlaubt "
+                    "(kann Kommandos ausfuehren oder Dateien schreiben)."
+                )
+
+
 def ssh_run_whitelisted(command: str, timeout: int | None = None) -> str:
     """Führt ein Kommando aus, das direkt von Claude/dem Nutzer kommt. Prüft:
-    1. Keine Shell-Chaining-Konstrukte (;, &&, ||, `, $(, >, <, &)
-    2. Jedes Pipe-Segment beginnt mit einem erlaubten Programm
-    3. Keine verbotenen Wörter (restart/stop/kill/rm/... als eigenständiges
-       Wort, nicht als Teilstring in Dateinamen wie "lve_kill_log")
+    1. Keine Shell-Chaining-Konstrukte (;, &&, ||, `, $(, >, <, &, Newline)
+    2. Keine verbotenen Wörter (restart/stop/kill/rm/... als eigenständiges Wort)
+    3. Jedes Pipe-Segment: erlaubtes Programm, erlaubtes Subcommand
+       (Positiv-Liste für plesk/systemctl), keine schreibenden Flags, keine
+       gefährlichen find-Primitive.
     """
     stripped = command.strip()
     if not stripped:
         raise SSHError("Leeres Kommando.")
 
+    # Zusaetzlich alle uebrigen Steuerzeichen ablehnen (nur normale Leerzeichen
+    # und druckbare Zeichen erlaubt) - schuetzt vor Injection ueber exotische
+    # Whitespace-/Steuerzeichen, die eine Remote-Shell interpretieren koennte.
+    if any(ord(c) < 32 and c != " " for c in stripped):
+        raise SSHError("Kommando enthält unerlaubte Steuerzeichen.")
+
     for construct in FORBIDDEN_SHELL_CONSTRUCTS:
         if construct in stripped:
+            label = construct.encode("unicode_escape").decode("ascii")
             raise SSHError(
-                f"Kommando enthält verbotenes Shell-Konstrukt '{construct}'. "
+                f"Kommando enthält verbotenes Shell-Konstrukt '{label}'. "
                 "Command-Chaining/Umleitung ist nicht erlaubt."
             )
 
@@ -298,14 +477,7 @@ def ssh_run_whitelisted(command: str, timeout: int | None = None) -> str:
             segment.append(tok)
 
     for seg in segments:
-        if not seg:
-            raise SSHError("Leeres Pipe-Segment im Kommando.")
-        program = seg[0]
-        if program not in ALLOWED_COMMAND_PREFIXES:
-            raise SSHError(
-                f"Programm '{program}' ist nicht erlaubt. "
-                f"Erlaubt sind: {', '.join(sorted(ALLOWED_COMMAND_PREFIXES))}"
-            )
+        _check_segment(seg)
 
     return ssh_run(stripped, timeout=timeout)
 
@@ -341,6 +513,42 @@ def _vhost_path(domain: str, path: str) -> str:
             f"Pfad {path!r} verlässt das Vhost-Verzeichnis von '{d}' - nicht erlaubt."
         )
     return full
+
+
+def _assert_real_within_vhost(sftp, full: str, domain: str) -> None:
+    """Stellt sicher, dass der kanonische Pfad (alle Symlinks in
+    Elternverzeichnissen aufgeloest) innerhalb von /var/www/vhosts/<domain>/
+    bleibt. _vhost_path prueft nur den Pfad-String; ein symlinktes
+    Zwischenverzeichnis (z.B. httpdocs/x -> /etc) wuerde sonst als root aus
+    dem Vhost-Verzeichnis herausfuehren."""
+    d = _domain_arg(domain)
+    base = f"{_VHOST_BASE}/{d}"
+    try:
+        base_real = sftp.normalize(base)
+    except IOError as e:
+        raise ValueError(f"Vhost-Verzeichnis von '{d}' nicht auffindbar: {e}")
+
+    # Tiefsten bereits existierenden Vorfahren von full kanonisieren; der
+    # (noch) nicht existierende Rest kann keine Symlinks enthalten.
+    probe = full
+    tail = ""
+    while True:
+        try:
+            probe_real = sftp.normalize(probe)
+            break
+        except IOError:
+            parent, _, name = probe.rpartition("/")
+            if not parent or parent == probe:
+                raise ValueError(f"Pfad {full!r} nicht aufloesbar.")
+            tail = "/" + name + tail
+            probe = parent
+
+    real_full = probe_real + tail
+    if real_full != base_real and not real_full.startswith(base_real + "/"):
+        raise ValueError(
+            f"Pfad {full!r} zeigt (ueber einen Symlink) auf {real_full!r} "
+            f"ausserhalb des Vhost-Verzeichnisses von '{d}' - nicht erlaubt."
+        )
 
 
 def _sftp_makedirs(sftp, remote_dir: str) -> None:
@@ -470,6 +678,16 @@ def _validate_select_sql(sql: str) -> str:
     s = sql.strip()
     if not s:
         raise ValueError("Leere Query.")
+    # Backslashes sind in Lese-Queries nicht noetig und ermoeglichen sonst
+    # Client-Kommandos des mysql-CLI (\!, \., \T ...). Sie werden zwar durch
+    # --binary-mode in _mysql_exec neutralisiert, hier aber zusaetzlich
+    # abgelehnt (Defense-in-Depth, verhindert Shell-/Datei-Zugriff wie
+    # "SELECT 1 \\! id").
+    if "\\" in s:
+        raise ValueError(
+            "Backslash ('\\') ist in Queries nicht erlaubt (verhindert "
+            "mysql-Client-Kommandos wie \\! oder \\.)."
+        )
     body = s[:-1].strip() if s.endswith(";") else s
     if ";" in body:
         raise ValueError(
@@ -511,7 +729,11 @@ def _mysql_exec(
     nicht in `ps aux` für andere lokale User auf dem Server sichtbar ist."""
     pw = _db_admin_password()
     db_part = f" {shlex.quote(database)}" if database else ""
-    flags = "--connect-timeout=10 --batch --raw"
+    # --binary-mode: deaktiviert die mysql-CLI-eigenen Kommandos (\!, \., system,
+    # source, tee ...) und behandelt Backslashes als literal. Ohne dieses Flag
+    # fuehrt der Client z.B. "SELECT 1 \! id" als Shell-Kommando aus (RCE als
+    # root), obwohl die SQL-Blacklist das Statement fuer harmlos haelt.
+    flags = "--connect-timeout=10 --batch --raw --binary-mode"
     if skip_column_names:
         flags += " -N"
     cmd = (
@@ -1052,6 +1274,7 @@ def read_vhost_file(domain: str, path: str, encoding: str = "text") -> str:
     try:
         sftp = client.open_sftp()
         try:
+            _assert_real_within_vhost(sftp, full, domain)
             with sftp.open(full, "rb") as f:
                 data = f.read()
         finally:
@@ -1113,6 +1336,7 @@ def write_vhost_file(
     try:
         sftp = client.open_sftp()
         try:
+            _assert_real_within_vhost(sftp, full, domain)
             exists = False
             backup_note = ""
             try:
@@ -1173,6 +1397,13 @@ def delete_vhost_backup(domain: str, path: str, confirm: bool = False) -> str:
     try:
         sftp = client.open_sftp()
         try:
+            _assert_real_within_vhost(sftp, full, domain)
+            lst = sftp.lstat(full)
+            if stat.S_ISLNK(lst.st_mode):
+                raise ValueError(
+                    f"'{full}' ist ein Symlink - wird aus Sicherheitsgründen "
+                    "nicht gelöscht."
+                )
             sftp.remove(full)
         finally:
             sftp.close()
@@ -1234,6 +1465,7 @@ def delete_vhost_log(
     try:
         sftp = client.open_sftp()
         try:
+            _assert_real_within_vhost(sftp, log_dir, domain)
             if all_rotated:
                 removed: list[str] = []
                 freed = 0
