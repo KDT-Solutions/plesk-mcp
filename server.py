@@ -552,18 +552,75 @@ def _assert_real_within_vhost(sftp, full: str, domain: str) -> None:
         )
 
 
-def _sftp_makedirs(sftp, remote_dir: str) -> None:
+def _sftp_makedirs(sftp, remote_dir: str, mode: int = 0o755) -> list[str]:
     """Legt ein Verzeichnis inkl. Eltern über SFTP an, falls es noch nicht
-    existiert - paramikos SFTPClient hat kein makedirs eingebaut."""
+    existiert - paramikos SFTPClient hat kein makedirs eingebaut. Gibt die
+    neu angelegten Verzeichnisse zurück (oberstes zuerst)."""
     if remote_dir in ("", "/", _VHOST_BASE):
-        return
+        return []
     try:
         sftp.stat(remote_dir)
-        return
+        return []
     except FileNotFoundError:
         pass
-    _sftp_makedirs(sftp, remote_dir.rsplit("/", 1)[0])
-    sftp.mkdir(remote_dir)
+    created = _sftp_makedirs(sftp, remote_dir.rsplit("/", 1)[0], mode)
+    sftp.mkdir(remote_dir, mode)
+    created.append(remote_dir)
+    return created
+
+
+def _client_exec(client: paramiko.SSHClient, command: str) -> tuple[str, str, int]:
+    """Wie _ssh_exec, aber auf einer bereits offenen SSH-Verbindung."""
+    stdin, stdout, stderr = client.exec_command(command, timeout=_SSH_TIMEOUT)
+    out = stdout.read().decode("utf-8", errors="replace")
+    err = stderr.read().decode("utf-8", errors="replace")
+    return out, err, stdout.channel.recv_exit_status()
+
+
+def _vhost_owner_reference(sftp, full: str, domain: str) -> tuple[int, int]:
+    """uid/gid für eine neu anzulegende Datei unter /var/www/vhosts/<domain>/:
+    Besitzer des nächsten bereits existierenden übergeordneten Ordners
+    (lstat, Symlinks werden übersprungen). Gehört dieser root, wird der
+    Besitzer von httpdocs (Subscription-User) verwendet - nie root."""
+    base = f"{_VHOST_BASE}/{_domain_arg(domain)}"
+    probe = full.rsplit("/", 1)[0]
+    ref = None
+    while probe == base or probe.startswith(base + "/"):
+        try:
+            st = sftp.lstat(probe)
+            if stat.S_ISDIR(st.st_mode):
+                ref = st
+                break
+        except FileNotFoundError:
+            pass
+        probe = probe.rsplit("/", 1)[0]
+    if ref is not None and ref.st_uid != 0 and ref.st_gid != 0:
+        return ref.st_uid, ref.st_gid
+
+    httpdocs = f"{base}/httpdocs"
+    try:
+        st = sftp.lstat(httpdocs)
+    except FileNotFoundError:
+        raise ValueError(
+            f"{httpdocs} existiert nicht - Subscription-User für den Besitzer "
+            "nicht ermittelbar, es wurde nichts geschrieben."
+        )
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid == 0 or st.st_gid == 0:
+        raise ValueError(
+            f"{httpdocs} ist kein Ordner oder gehört root - Subscription-User "
+            "für den Besitzer nicht ermittelbar, es wurde nichts geschrieben."
+        )
+    return st.st_uid, st.st_gid
+
+
+def _owner_names(client: paramiko.SSHClient, uid: int, gid: int) -> str:
+    """Liefert "user:group" zu uid/gid (via getent), numerisch als Fallback."""
+    out, _, _ = _client_exec(
+        client,
+        f'echo "$(getent passwd {int(uid)} | cut -d: -f1):$(getent group {int(gid)} | cut -d: -f1)"',
+    )
+    user, _, group = out.strip().partition(":")
+    return f"{user or uid}:{group or gid}"
 
 
 # ---------------------------------------------------------------------------
@@ -1318,6 +1375,11 @@ def write_vhost_file(
     delete_vhost_backup zum späteren Aufräumen, sobald die Änderung verifiziert ist).
     Ist der Zielpfad bereits ein Symlink, wird aus Sicherheitsgründen
     abgebrochen (kein Überschreiben durch Symlinks hindurch).
+    Besitzer/Rechte: Bestehende Dateien (und ihr Backup) behalten Besitzer,
+    Gruppe und Rechte der alten Datei. Neue Dateien (0644) und neu angelegte
+    Ordner (0755) erhalten Besitzer/Gruppe des nächsten existierenden
+    übergeordneten Ordners - gehört dieser root, den Besitzer von httpdocs
+    (Subscription-User). Nie root.
     """
     if not confirm:
         raise ValueError(
@@ -1351,29 +1413,80 @@ def write_vhost_file(
                         f"'{full}' ist ein Symlink - wird aus Sicherheitsgründen "
                         "nicht überschrieben."
                     )
+                if not stat.S_ISREG(lst.st_mode):
+                    raise ValueError(f"'{full}' ist keine reguläre Datei.")
                 exists = True
             except FileNotFoundError:
                 exists = False
 
             if exists:
+                # Bestehende Datei: Besitzer/Gruppe/Rechte der alten Datei.
+                uid, gid = lst.st_uid, lst.st_gid
+                file_mode = stat.S_IMODE(lst.st_mode)
                 with sftp.open(full, "rb") as f:
+                    # fstat des geöffneten Handles muss zum lstat passen -
+                    # sonst wurde die Datei zwischenzeitlich (z.B. gegen einen
+                    # Symlink) ausgetauscht.
+                    fst = f.stat()
+                    if (fst.st_uid, fst.st_gid, fst.st_mode, fst.st_size) != (
+                        lst.st_uid, lst.st_gid, lst.st_mode, lst.st_size
+                    ):
+                        raise ValueError(
+                            f"'{full}' wurde während des Schreibvorgangs verändert - abgebrochen."
+                        )
                     old_data = f.read()
                 timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
                 backup_path = f"{full}.bak-{timestamp}"
-                with sftp.open(backup_path, "wb") as f:
+                # "x" = O_EXCL (plus "w" für Schreibzugriff): legt nie etwas durch einen vorhandenen Symlink an;
+                # chown/chmod laufen über das Handle (fchown/fchmod).
+                with sftp.open(backup_path, "wbx") as f:
+                    f.chown(uid, gid)
+                    f.chmod(file_mode)
                     f.write(old_data)
                 backup_note = f" Backup der alten Version: {backup_path}"
+                created_dirs: list[str] = []
+            else:
+                uid, gid = _vhost_owner_reference(sftp, full, domain)
+                file_mode = 0o644
+                created_dirs = _sftp_makedirs(sftp, full.rsplit("/", 1)[0])
+                for d in created_dirs:
+                    dst = sftp.lstat(d)
+                    if not stat.S_ISDIR(dst.st_mode):
+                        raise ValueError(f"'{d}' ist kein Ordner mehr - abgebrochen.")
+                    if stat.S_IMODE(dst.st_mode) != 0o755:
+                        sftp.chmod(d, 0o755)
+                    # chown -h: Symlinks werden nie verfolgt
+                    _, err, rc = _client_exec(
+                        client, f"chown -h -- {int(uid)}:{int(gid)} {shlex.quote(d)}"
+                    )
+                    if rc != 0:
+                        raise SSHError(f"chown für '{d}' fehlgeschlagen: {err.strip()}")
 
-            _sftp_makedirs(sftp, full.rsplit("/", 1)[0])
-            with sftp.open(full, "wb") as f:
-                f.write(data)
+            if exists:
+                # Überschreiben behält Inode und damit Besitzer/Gruppe/Rechte.
+                with sftp.open(full, "wb") as f:
+                    f.write(data)
+            else:
+                try:
+                    f = sftp.open(full, "wbx")
+                except IOError as e:
+                    raise ValueError(f"'{full}' konnte nicht neu angelegt werden: {e}")
+                with f:
+                    f.chown(uid, gid)
+                    f.chmod(file_mode)
+                    f.write(data)
+            owner = _owner_names(client, uid, gid)
         finally:
             sftp.close()
     finally:
         client.close()
 
     verb = "Überschrieben" if exists else "Neu erstellt"
-    return f"{verb}: {full} ({len(data)} Bytes).{backup_note}"
+    dirs_note = f" Neu angelegte Ordner: {', '.join(created_dirs)}." if created_dirs else ""
+    return (
+        f"{verb}: {full} ({len(data)} Bytes). Besitzer: {owner}, "
+        f"Rechte: {file_mode:04o}.{dirs_note}{backup_note}"
+    )
 
 
 @mcp.tool()
