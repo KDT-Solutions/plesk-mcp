@@ -51,6 +51,8 @@ Ohne gesetztes `MCP_TRANSPORT` (oder mit `MCP_TRANSPORT=stdio`) verhält sich de
 | `PLESK_API_KEY` | ja, für `plesk_api_get` | – | Secret Key, erzeugt via `plesk bin secret_key --create` |
 | `PLESK_API_VERIFY_SSL` | nein | `true` | `false`, falls der Plesk-Server ein selbstsigniertes Zertifikat nutzt |
 | `PLESK_API_TIMEOUT` | nein | `20` | Timeout in Sekunden für Requests gegen die Plesk-REST-API |
+| `PAGESPEED_API_KEY` | ja, für `pagespeed_insights` | – | Google-API-Key für die PageSpeed Insights API v5 (ohne Key praktisch immer HTTP 429) |
+| `PAGESPEED_TIMEOUT` | nein | `120` | Timeout in Sekunden pro PageSpeed-Analyse |
 | `MCP_TRANSPORT` | nein | `stdio` | `stdio` = lokal (Standard) / `http` = Cloud-Modus (Streamable HTTP) |
 | `MCP_API_KEY` | ja, nur im HTTP-Modus | – | Statisches Bearer-Token zum Schutz des öffentlichen Endpoints. Ohne dieses Token startet der HTTP-Modus nicht (fail-safe) |
 | `MCP_HOST` | nein | `0.0.0.0` | Bind-Adresse des HTTP-Servers *innerhalb* des Containers |
@@ -134,7 +136,16 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8422` auf dem Docker-Hos
 | `db_query` | Führt eine einzelne read-only SQL-Query (SELECT/SHOW/EXPLAIN/DESCRIBE) gegen eine Datenbank aus |
 | `db_search` | Durchsucht alle Text-Spalten aller Tabellen einer Datenbank nach einem Begriff (LIKE-Scan) |
 | `server_load` | Allgemeine Serverlast (uptime, free, Prozessanzahl) |
+| `pagespeed_insights` | Google PageSpeed Insights (Lighthouse) für eine URL/Domain: Scores, Labor-Messwerte, CrUX-Felddaten, Top-Verbesserungen - mobile/desktop/both, read-only und extern |
 | `run_diagnostic` | Generischer Fallback, nur Whitelist an read-only Befehlen erlaubt |
+
+- `pagespeed_insights` läuft komplett extern: Die Ziel-URL wird von Google geladen, nicht vom Container oder vom Plesk-Server - kein SSH, kein Request vom Container auf die Ziel-URL. Erlaubt sind nur `http`/`https` mit öffentlichem Hostnamen (keine IPs, kein `localhost`, keine `user:pass@`-Zugangsdaten in der URL, da diese an Google übermittelt würden). Der `PAGESPEED_API_KEY` wird als Query-Parameter an Google geschickt und aus Fehlermeldungen entfernt; den Key in der Google Cloud Console per API-Einschränkung nur für die PageSpeed Insights API freigeben.
+
+## Beispiel: PageSpeed einer Kundenseite prüfen
+
+1. `pagespeed_insights(url="example.com", strategy="both")` - Scores, LCP/CLS/TBT und Top-Verbesserungen für mobile und desktop
+2. `pagespeed_insights(url="https://www.example.com/shop", categories="all")` - zusätzlich Accessibility, Best Practices und SEO
+3. Bei hoher Server-Antwortzeit (`server-response-time`) auf dem Plesk-Server weiter mit `server_load`, `lve_stats` und `fpm_service_status` der Domain
 
 ## Beispiel: Imunify-False-Positive in rotierten Logs
 
@@ -147,7 +158,7 @@ Imunify360 meldet gelegentlich "Malware" in rotierten Logdateien, weil dort prot
 
 ## Tests
 
-Die Pfadvalidierung der Imunify-Tools ist ohne Serverzugriff testbar:
+Die Pfadvalidierung der Imunify-Tools sowie URL-Validierung und Auswertung von `pagespeed_insights` sind ohne Server-/Netzwerkzugriff testbar:
 
 ```bash
 pip install -r requirements.txt pytest
