@@ -2019,6 +2019,237 @@ def run_diagnostic(command: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Google PageSpeed Insights (Lighthouse) - externe, read-only Analyse
+# ---------------------------------------------------------------------------
+#
+# Ruft die öffentliche PageSpeed-Insights-API v5 von Google auf. Die Seite wird
+# von Google geladen und analysiert, nicht von diesem Container oder dem
+# Plesk-Server - es gibt also keinen SSH-/Plesk-Zugriff und keinen Request vom
+# Container auf die Ziel-URL (kein SSRF-Risiko). Ohne API-Key teilt man sich
+# das anonyme Kontingent mit allen anderen Nutzern und bekommt praktisch immer
+# HTTP 429 - PAGESPEED_API_KEY sollte daher gesetzt sein (kostenlos, Google
+# Cloud Console -> "PageSpeed Insights API" aktivieren -> API-Key, idealerweise
+# per API-Restriction auf genau diese API beschränken).
+
+_PSI_ENDPOINT = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+_PSI_API_KEY = os.environ.get("PAGESPEED_API_KEY", "").strip()
+_PSI_TIMEOUT = int(os.environ.get("PAGESPEED_TIMEOUT", "120"))
+_PSI_CATEGORIES = {"performance", "accessibility", "best-practices", "seo"}
+_PSI_STRATEGIES = {"mobile", "desktop"}
+_PSI_LAB_METRICS = [
+    "first-contentful-paint",
+    "largest-contentful-paint",
+    "total-blocking-time",
+    "cumulative-layout-shift",
+    "speed-index",
+    "interactive",
+]
+_PSI_HOST_RE = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$", re.IGNORECASE)
+
+
+def _psi_normalize_url(url: str) -> str:
+    """Akzeptiert eine volle URL oder nur eine Domain (-> https://<domain>/).
+    Nur http/https, öffentlicher Hostname (kein localhost/IP), keine
+    Zugangsdaten in der URL (würden sonst an Google übermittelt)."""
+    from urllib.parse import urlsplit
+
+    raw = (url or "").strip()
+    if not raw or len(raw) > 2048 or any(c.isspace() for c in raw):
+        raise ValueError("Ungültige URL (leer, zu lang oder enthält Leerzeichen).")
+    if "://" not in raw:
+        raw = "https://" + raw
+    parts = urlsplit(raw)
+    if parts.scheme not in ("http", "https"):
+        raise ValueError("Nur http:// oder https:// URLs sind erlaubt.")
+    if parts.username or parts.password or "@" in parts.netloc:
+        raise ValueError("URLs mit Zugangsdaten (user:pass@host) sind nicht erlaubt.")
+    host = (parts.hostname or "").rstrip(".")
+    if not _PSI_HOST_RE.match(host) or host.replace(".", "").isdigit():
+        raise ValueError(
+            f"Ungültiger Hostname {host!r} - nur öffentliche Domainnamen, keine IPs/localhost."
+        )
+    return parts._replace(path=parts.path or "/").geturl()
+
+
+def _psi_parse_list(value: str, allowed: set[str], name: str) -> list[str]:
+    items = [v.strip().lower() for v in (value or "").split(",") if v.strip()]
+    if not items:
+        raise ValueError(f"{name} darf nicht leer sein.")
+    bad = [v for v in items if v not in allowed]
+    if bad:
+        raise ValueError(f"Ungültige Werte für {name}: {bad}. Erlaubt: {sorted(allowed)}")
+    return list(dict.fromkeys(items))
+
+
+def _psi_field_data(exp: dict[str, Any] | None) -> dict[str, Any] | None:
+    """CrUX-Felddaten (echte Chrome-Nutzer, 28-Tage-Fenster) kompakt."""
+    if not exp or not exp.get("metrics"):
+        return None
+    metrics = {}
+    for key, m in exp["metrics"].items():
+        metrics[key.replace("_MS", "").lower()] = {
+            "p75": m.get("percentile"),
+            "rating": m.get("category"),
+        }
+    return {
+        "scope": exp.get("id"),
+        "overall": exp.get("overall_category"),
+        "origin_fallback": exp.get("origin_fallback", False),
+        "metrics": metrics,
+    }
+
+
+def _psi_savings(audit: dict[str, Any]) -> tuple[float, float]:
+    details = audit.get("details") or {}
+    ms = details.get("overallSavingsMs") or 0
+    ms_metric = max(
+        (v for k, v in (audit.get("metricSavings") or {}).items() if k != "CLS" and isinstance(v, (int, float))),
+        default=0,
+    )
+    return float(max(ms, ms_metric)), float(details.get("overallSavingsBytes") or 0)
+
+
+def _psi_summarize(data: dict[str, Any], categories: list[str], max_findings: int) -> dict[str, Any]:
+    lr = data.get("lighthouseResult") or {}
+    audits = lr.get("audits") or {}
+    cats = lr.get("categories") or {}
+    out: dict[str, Any] = {
+        "final_url": lr.get("finalDisplayedUrl") or lr.get("finalUrl"),
+        "analyzed_at": lr.get("fetchTime"),
+        "lighthouse_version": lr.get("lighthouseVersion"),
+        "scores": {
+            c: (round(cats[c]["score"] * 100) if cats.get(c, {}).get("score") is not None else None)
+            for c in categories
+        },
+    }
+    if lr.get("runtimeError"):
+        out["runtime_error"] = lr["runtimeError"]
+    if lr.get("runWarnings"):
+        out["run_warnings"] = lr["runWarnings"]
+
+    if "performance" in cats:
+        out["lab_metrics"] = {
+            m: {"value": audits[m].get("displayValue"), "score": audits[m].get("score")}
+            for m in _PSI_LAB_METRICS
+            if m in audits
+        }
+        out["field_data_url"] = _psi_field_data(data.get("loadingExperience"))
+        out["field_data_origin"] = _psi_field_data(data.get("originLoadingExperience"))
+
+        findings = []
+        for ref in cats["performance"].get("auditRefs", []):
+            if ref.get("group") in ("metrics", "hidden", "budgets"):
+                continue
+            a = audits.get(ref.get("id")) or {}
+            score = a.get("score")
+            if score is None or score >= 0.9 or a.get("scoreDisplayMode") in ("informative", "notApplicable", "manual"):
+                continue
+            ms, by = _psi_savings(a)
+            findings.append({
+                "id": ref.get("id"),
+                "title": a.get("title"),
+                "display_value": a.get("displayValue"),
+                "score": score,
+                "est_savings_ms": round(ms) or None,
+                "est_savings_kib": round(by / 1024) or None,
+            })
+        findings.sort(key=lambda f: (f["est_savings_ms"] or 0, f["est_savings_kib"] or 0), reverse=True)
+        out["performance_findings"] = findings[:max_findings]
+
+    for c in categories:
+        if c == "performance" or c not in cats:
+            continue
+        failed = []
+        for ref in cats[c].get("auditRefs", []):
+            a = audits.get(ref.get("id")) or {}
+            if a.get("scoreDisplayMode") == "binary" and a.get("score") == 0:
+                failed.append({"id": ref.get("id"), "title": a.get("title")})
+        out[f"{c}_failed_audits"] = failed[:max_findings]
+    return out
+
+
+def _psi_run(url: str, strategy: str, categories: list[str], locale: str) -> dict[str, Any]:
+    params: list[tuple[str, str]] = [("url", url), ("strategy", strategy), ("locale", locale)]
+    params += [("category", c.upper().replace("-", "_")) for c in categories]
+    if _PSI_API_KEY:
+        params.append(("key", _PSI_API_KEY))
+    try:
+        resp = httpx.get(_PSI_ENDPOINT, params=params, timeout=_PSI_TIMEOUT)
+    except httpx.TimeoutException:
+        return {"error": f"Timeout nach {_PSI_TIMEOUT}s - Google hat die Analyse nicht rechtzeitig geliefert."}
+    except httpx.HTTPError as exc:
+        # Bewusst ohne Request-URL, da diese den API-Key enthält
+        return {"error": f"Verbindungsfehler zur PageSpeed-API: {type(exc).__name__}"}
+    if resp.status_code != 200:
+        try:
+            msg = resp.json().get("error", {}).get("message", "")
+        except Exception:
+            msg = resp.text[:300]
+        if _PSI_API_KEY:
+            msg = msg.replace(_PSI_API_KEY, "***")
+        hint = ""
+        if resp.status_code == 429 and not _PSI_API_KEY:
+            hint = " (Kein PAGESPEED_API_KEY gesetzt - anonymes Kontingent erschöpft.)"
+        return {"error": f"HTTP {resp.status_code}: {msg}{hint}"}
+    return resp.json()
+
+
+@mcp.tool()
+def pagespeed_insights(
+    url: str,
+    strategy: str = "mobile",
+    categories: str = "performance",
+    max_findings: int = 10,
+    locale: str = "de",
+) -> str:
+    """Analysiert eine Website mit Google PageSpeed Insights (Lighthouse) und
+    liefert eine kompakte Zusammenfassung als JSON.
+
+    Read-only und extern: Google lädt die Seite selbst, der Plesk-Server wird
+    nicht angefasst. Eine Analyse dauert je Strategie ca. 10-60 Sekunden.
+
+    Parameter:
+    - url: volle URL (https://www.example.com/seite) oder nur die Domain
+      (example.com -> https://example.com/). Nur öffentliche Hostnamen.
+    - strategy: "mobile" (Standard), "desktop" oder "both" (beide parallel).
+    - categories: kommagetrennt aus performance, accessibility,
+      best-practices, seo (Standard: performance). "all" = alle vier.
+    - max_findings: max. Anzahl Verbesserungspunkte pro Kategorie (1-50).
+    - locale: Sprache der Audit-Titel (Standard "de").
+
+    Rückgabe pro Strategie: Scores (0-100), Labor-Messwerte (FCP, LCP, TBT,
+    CLS, Speed Index, TTI), Felddaten echter Nutzer aus dem Chrome UX Report
+    (URL- und Origin-Ebene, falls genug Traffic vorhanden), die wichtigsten
+    Performance-Verbesserungen sortiert nach geschätzter Zeitersparnis sowie
+    fehlgeschlagene Audits der übrigen Kategorien.
+
+    Tipp für Plesk-Diagnose: bei schlechter TTFB ("server-response-time")
+    zusätzlich server_load, lve_stats und fpm_service_status der Domain prüfen.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    try:
+        target = _psi_normalize_url(url)
+        strat = strategy.strip().lower()
+        strategies = ["mobile", "desktop"] if strat == "both" else _psi_parse_list(strat, _PSI_STRATEGIES, "strategy")
+        cats = sorted(_PSI_CATEGORIES) if categories.strip().lower() == "all" else _psi_parse_list(
+            categories, _PSI_CATEGORIES, "categories"
+        )
+    except ValueError as exc:
+        return _json({"error": str(exc)})
+    max_findings = max(1, min(int(max_findings), 50))
+    loc = locale.strip() if re.fullmatch(r"[A-Za-z]{2}([-_][A-Za-z]{2})?", locale.strip() or "") else "de"
+
+    with ThreadPoolExecutor(max_workers=len(strategies)) as pool:
+        results = dict(zip(strategies, pool.map(lambda s: _psi_run(target, s, cats, loc), strategies)))
+
+    out: dict[str, Any] = {"url": target, "api_key_configured": bool(_PSI_API_KEY)}
+    for s, data in results.items():
+        out[s] = data if "error" in data else _psi_summarize(data, cats, max_findings)
+    return _json(out)
+
+
+# ---------------------------------------------------------------------------
 # HTTP-Transport (Cloud/Docker) mit Bearer-Auth
 # ---------------------------------------------------------------------------
 
