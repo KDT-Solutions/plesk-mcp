@@ -623,6 +623,35 @@ def _owner_names(client: paramiko.SSHClient, uid: int, gid: int) -> str:
     return f"{user or uid}:{group or gid}"
 
 
+def _chown_nofollow(client: paramiko.SSHClient, path: str, uid: int, gid: int) -> None:
+    """chown -h: ändert nie das Ziel eines Symlinks (SFTP-SETSTAT würde folgen)."""
+    _, err, rc = _client_exec(
+        client, f"chown -h -- {int(uid)}:{int(gid)} {shlex.quote(path)}"
+    )
+    if rc != 0:
+        raise SSHError(f"chown für '{path}' fehlgeschlagen: {err.strip()}")
+
+
+def _fix_root_dirs_in_httpdocs(
+    sftp, client: paramiko.SSHClient, full: str, domain: str, uid: int, gid: int
+) -> list[str]:
+    """Stellt bestehende übergeordnete Ordner von full, die root gehören, auf
+    uid/gid um (z.B. von früheren Versionen angelegte wp-content/mu-plugins).
+    Nur unterhalb von httpdocs (httpdocs selbst ausgenommen) - ausserhalb
+    (conf/, logs/ ...) sind root-Ordner von Plesk so vorgesehen."""
+    httpdocs = f"{_VHOST_BASE}/{_domain_arg(domain)}/httpdocs"
+    fixed: list[str] = []
+    probe = full.rsplit("/", 1)[0]
+    while probe.startswith(httpdocs + "/"):
+        st = sftp.lstat(probe)
+        if stat.S_ISDIR(st.st_mode) and (st.st_uid == 0 or st.st_gid == 0):
+            _chown_nofollow(client, probe, uid, gid)
+            fixed.append(probe)
+        probe = probe.rsplit("/", 1)[0]
+    fixed.reverse()
+    return fixed
+
+
 # ---------------------------------------------------------------------------
 # Plesk-REST-API (X-API-Key) - für strukturierte Plesk-eigene Daten
 # ---------------------------------------------------------------------------
@@ -1379,7 +1408,9 @@ def write_vhost_file(
     Gruppe und Rechte der alten Datei. Neue Dateien (0644) und neu angelegte
     Ordner (0755) erhalten Besitzer/Gruppe des nächsten existierenden
     übergeordneten Ordners - gehört dieser root, den Besitzer von httpdocs
-    (Subscription-User). Nie root.
+    (Subscription-User). Nie root. Unterhalb von httpdocs werden zudem
+    bestehende Dateien und übergeordnete Ordner, die root gehören, auf diesen
+    Besitzer umgestellt (Rechte bleiben).
     """
     if not confirm:
         raise ValueError(
@@ -1419,10 +1450,19 @@ def write_vhost_file(
             except FileNotFoundError:
                 exists = False
 
+            httpdocs = f"{_VHOST_BASE}/{_domain_arg(domain)}/httpdocs"
+            in_httpdocs = full.startswith(httpdocs + "/")
+            fix_owner = False
             if exists:
                 # Bestehende Datei: Besitzer/Gruppe/Rechte der alten Datei.
+                # Gehört sie unter httpdocs root (z.B. von einer früheren
+                # Version dieses Tools angelegt), wird sie auf den
+                # Subscription-User umgestellt.
                 uid, gid = lst.st_uid, lst.st_gid
                 file_mode = stat.S_IMODE(lst.st_mode)
+                if in_httpdocs and (uid == 0 or gid == 0):
+                    uid, gid = _vhost_owner_reference(sftp, full, domain)
+                    fix_owner = True
                 with sftp.open(full, "rb") as f:
                     # fstat des geöffneten Handles muss zum lstat passen -
                     # sonst wurde die Datei zwischenzeitlich (z.B. gegen einen
@@ -1455,17 +1495,28 @@ def write_vhost_file(
                         raise ValueError(f"'{d}' ist kein Ordner mehr - abgebrochen.")
                     if stat.S_IMODE(dst.st_mode) != 0o755:
                         sftp.chmod(d, 0o755)
-                    # chown -h: Symlinks werden nie verfolgt
-                    _, err, rc = _client_exec(
-                        client, f"chown -h -- {int(uid)}:{int(gid)} {shlex.quote(d)}"
-                    )
-                    if rc != 0:
-                        raise SSHError(f"chown für '{d}' fehlgeschlagen: {err.strip()}")
+                    _chown_nofollow(client, d, uid, gid)
 
-            if exists:
+            fixed_dirs = _fix_root_dirs_in_httpdocs(sftp, client, full, domain, uid, gid)
+
+            if exists and not fix_owner:
                 # Überschreiben behält Inode und damit Besitzer/Gruppe/Rechte.
                 with sftp.open(full, "wb") as f:
                     f.write(data)
+            elif exists:
+                # Besitzerwechsel: neue Datei exklusiv anlegen, per Handle
+                # anpassen und atomar über die alte umbenennen - rename folgt
+                # keinem Symlink am Ziel.
+                tmp_path = f"{full}.tmp-{os.urandom(6).hex()}"
+                with sftp.open(tmp_path, "wbx") as f:
+                    f.chown(uid, gid)
+                    f.chmod(file_mode)
+                    f.write(data)
+                try:
+                    sftp.posix_rename(tmp_path, full)
+                except Exception:
+                    sftp.remove(tmp_path)
+                    raise
             else:
                 try:
                     f = sftp.open(full, "wbx")
@@ -1483,6 +1534,10 @@ def write_vhost_file(
 
     verb = "Überschrieben" if exists else "Neu erstellt"
     dirs_note = f" Neu angelegte Ordner: {', '.join(created_dirs)}." if created_dirs else ""
+    if fix_owner:
+        dirs_note += " Besitzer der Datei von root umgestellt."
+    if fixed_dirs:
+        dirs_note += f" Ordner von root umgestellt: {', '.join(fixed_dirs)}."
     return (
         f"{verb}: {full} ({len(data)} Bytes). Besitzer: {owner}, "
         f"Rechte: {file_mode:04o}.{dirs_note}{backup_note}"
