@@ -60,6 +60,7 @@ from __future__ import annotations
 import base64
 import datetime
 import json
+import logging
 import os
 import posixpath
 import re
@@ -101,7 +102,7 @@ if _HTTP_MODE and not _MCP_API_KEY:
 # Dateien (server.py, Dockerfile, requirements.txt, Workflow) geaendert haben.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.8"
+_VERSION_BASE = "0.9"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -570,6 +571,10 @@ def _sftp_makedirs(sftp, remote_dir: str) -> None:
 # ---------------------------------------------------------------------------
 
 import httpx  # noqa: E402  (bewusst nach den Konstanten, analog zu bexio-mcp)
+
+# httpx loggt jeden Request inkl. voller URL auf INFO - nur Warnungen/Fehler
+# durchlassen, damit keine Query-Parameter im Container-Log landen
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 _API_HOST = os.environ.get("PLESK_API_HOST", _SSH_HOST)
 _API_PORT = int(os.environ.get("PLESK_API_PORT", "8443"))
@@ -2109,7 +2114,238 @@ def _psi_savings(audit: dict[str, Any]) -> tuple[float, float]:
     return float(max(ms, ms_metric)), float(details.get("overallSavingsBytes") or 0)
 
 
-def _psi_summarize(data: dict[str, Any], categories: list[str], max_findings: int) -> dict[str, Any]:
+_PSI_MISSING = "nicht im Lighthouse-Ergebnis enthalten"
+# Teilchecks des Insights "document-latency-insight" (Lighthouse 12.6+/13)
+_PSI_LATENCY_CHECKS = ["noRedirects", "serverResponseIsFast", "usesCompression"]
+# Hauptdokument kleiner als das (unkomprimiert) -> mögliche Challenge-/Zwischenseite
+_PSI_MIN_DOC_BYTES = 20 * 1024
+# Textmuster typischer Bot-Schutz-/Challenge-Seiten (Vergleich ohne Gross-/Kleinschreibung)
+_PSI_CHALLENGE_PATTERNS = [
+    "one moment, please",
+    "just a moment",
+    "checking your browser",
+    "checking if the site connection is secure",
+    "verifying you are human",
+    "please wait while we verify",
+    "attention required",
+    "ddos protection by",
+]
+
+
+def _psi_num(value: Any) -> float | int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return round(value, 2) if isinstance(value, float) and not value.is_integer() else int(value)
+
+
+def _psi_audit_base(audit: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "title": audit.get("title"),
+        "score": audit.get("score"),
+        "score_display_mode": audit.get("scoreDisplayMode"),
+        "display_value": audit.get("displayValue"),
+    }
+    if audit.get("numericValue") is not None:
+        out["numeric_value"] = _psi_num(audit.get("numericValue"))
+        out["numeric_unit"] = audit.get("numericUnit")
+    if audit.get("errorMessage"):
+        out["error"] = audit["errorMessage"]
+    return out
+
+
+def _psi_origin_table(audit: dict[str, Any], key: str, out_key: str) -> list[dict[str, Any]] | str:
+    items = (audit.get("details") or {}).get("items")
+    if not isinstance(items, list):
+        return _PSI_MISSING
+    return [
+        {"origin": it.get("origin"), out_key: _psi_num(it.get(key))}
+        for it in items
+        if isinstance(it, dict)
+    ]
+
+
+def _psi_server_timing(audits: dict[str, Any]) -> dict[str, Any]:
+    """TTFB/Server-Antwortzeit aus allen dafür vorhandenen Audits. Fehlende
+    Audits werden explizit als fehlend markiert, nichts wird geschätzt."""
+    out: dict[str, Any] = {}
+
+    a = audits.get("server-response-time")
+    if a is None:
+        out["server_response_time"] = _PSI_MISSING
+    else:
+        entry = _psi_audit_base(a)
+        items = (a.get("details") or {}).get("items")
+        if isinstance(items, list) and items and isinstance(items[0], dict):
+            entry["url"] = items[0].get("url")
+            entry["response_time_ms"] = _psi_num(items[0].get("responseTime"))
+        out["server_response_time"] = entry
+
+    a = audits.get("document-latency-insight")
+    if a is None:
+        out["document_latency_insight"] = _PSI_MISSING
+    else:
+        entry = _psi_audit_base(a)
+        details = a.get("details") or {}
+        checklist = details.get("items") if details.get("type") == "checklist" else None
+        if isinstance(checklist, dict):
+            checks = {}
+            for key in list(dict.fromkeys(_PSI_LATENCY_CHECKS + list(checklist))):
+                c = checklist.get(key)
+                checks[key] = (
+                    {"passed": c.get("value"), "label": c.get("label")} if isinstance(c, dict) else _PSI_MISSING
+                )
+            entry["checks"] = checks
+        else:
+            entry["checks"] = _PSI_MISSING
+        debug = details.get("debugData")
+        if isinstance(debug, dict):
+            for src, dst in (
+                ("redirectDuration", "redirect_duration_ms"),
+                ("serverResponseTime", "server_response_time_ms"),
+                ("uncompressedResponseBytes", "uncompressed_response_bytes"),
+            ):
+                entry[dst] = _psi_num(debug[src]) if src in debug else _PSI_MISSING
+        ms, _ = _psi_savings(a)
+        entry["est_savings_ms"] = round(ms) or None
+        out["document_latency_insight"] = entry
+
+    for audit_id, key, out_key in (
+        ("network-server-latency", "serverResponseTime", "server_response_time_ms"),
+        ("network-rtt", "rtt", "rtt_ms"),
+    ):
+        a = audits.get(audit_id)
+        if a is None:
+            out[audit_id.replace("-", "_")] = _PSI_MISSING
+        else:
+            entry = _psi_audit_base(a)
+            entry["origins"] = _psi_origin_table(a, key, out_key)
+            out[audit_id.replace("-", "_")] = entry
+    return out
+
+
+def _psi_node_text(node: Any) -> dict[str, Any] | None:
+    if not isinstance(node, dict) or node.get("type") != "node":
+        return None
+    out = {k: str(node[k])[:200] for k in ("nodeLabel", "selector", "snippet") if node.get(k)}
+    return out or None
+
+
+def _psi_finding_details(audit: dict[str, Any], max_items: int) -> dict[str, Any]:
+    """Top-N Einträge aus details.items eines Findings (URL + Einsparung)."""
+    details = audit.get("details") or {}
+    items = details.get("items")
+    if details.get("type") not in ("table", "opportunity") or not isinstance(items, list):
+        return {"items_total": 0, "items": [], "note": f"keine Einzel-Ressourcen im Lighthouse-Ergebnis "
+                                                        f"(details.type={details.get('type')!r})"}
+    rows = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        url = it.get("url")
+        if isinstance(url, dict):
+            url = url.get("url") or url.get("value")
+        if url is None and isinstance(it.get("source"), dict):
+            url = it["source"].get("url")
+        row: dict[str, Any] = {"url": url if isinstance(url, str) else None}
+        for key in ("wastedMs", "wastedBytes", "totalBytes", "wastedPercent", "cacheLifetimeMs", "responseTime"):
+            val = _psi_num(it.get(key))
+            if val is not None:
+                row[key] = val
+        if isinstance(it.get("entity"), str):
+            row["entity"] = it["entity"]
+        node = _psi_node_text(it.get("node"))
+        if node:
+            row["node"] = node
+        sub = (it.get("subItems") or {}).get("items") if isinstance(it.get("subItems"), dict) else None
+        if isinstance(sub, list):
+            reasons = [
+                {k: (_psi_num(v) if k == "wastedBytes" else v) for k, v in si.items() if k in ("reason", "wastedBytes")}
+                for si in sub
+                if isinstance(si, dict) and si.get("reason")
+            ]
+            if reasons:
+                row["reasons"] = reasons
+        if len(row) > 1 or row["url"]:
+            rows.append(row)
+    rows.sort(key=lambda r: (r.get("wastedMs") or 0, r.get("wastedBytes") or 0, r.get("totalBytes") or 0), reverse=True)
+    return {"items_total": len(rows), "items": rows[:max_items]}
+
+
+def _psi_iter_nodes(obj: Any, depth: int = 0):
+    if depth > 8:
+        return
+    if isinstance(obj, dict):
+        if obj.get("type") == "node":
+            yield obj
+        for v in obj.values():
+            yield from _psi_iter_nodes(v, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _psi_iter_nodes(v, depth + 1)
+
+
+def _psi_page_check(lr: dict[str, Any]) -> dict[str, Any]:
+    """Plausibilitätscheck: hat Google wirklich die Zielseite analysiert oder
+    eine Bot-Schutz-/Challenge-Zwischenseite?"""
+    audits = lr.get("audits") or {}
+    out: dict[str, Any] = {
+        "requested_url": lr.get("requestedUrl"),
+        "final_displayed_url": lr.get("finalDisplayedUrl") or _PSI_MISSING,
+        # Lighthouse liefert den <title>-Text nicht im Ergebnis (document-title
+        # ist nur ein Pass/Fail-Audit ohne Text)
+        "title": _PSI_MISSING,
+    }
+    warnings: list[str] = []
+
+    items = ((audits.get("network-requests") or {}).get("details") or {}).get("items")
+    doc = None
+    if isinstance(items, list):
+        main_url = lr.get("mainDocumentUrl") or lr.get("finalUrl")
+        docs = [i for i in items if isinstance(i, dict) and i.get("resourceType") == "Document"]
+        doc = next((i for i in docs if main_url and i.get("url") == main_url), None) or (docs[0] if docs else None)
+    if doc is None:
+        out["main_document"] = _PSI_MISSING
+    else:
+        out["main_document"] = {
+            "url": doc.get("url"),
+            "status_code": doc.get("statusCode"),
+            "mime_type": doc.get("mimeType"),
+            "transfer_size_bytes": _psi_num(doc.get("transferSize")),
+            "resource_size_bytes": _psi_num(doc.get("resourceSize")),
+        }
+        size = _psi_num(doc.get("resourceSize"))
+        size_basis = "unkomprimiert"
+        if size is None:
+            size, size_basis = _psi_num(doc.get("transferSize")), "übertragen"
+        if size is not None and size < _PSI_MIN_DOC_BYTES:
+            warnings.append(
+                f"moegliche Challenge-/Zwischenseite: Hauptdokument nur {size} Bytes ({size_basis}, "
+                f"Schwelle {_PSI_MIN_DOC_BYTES} Bytes)"
+            )
+        status = doc.get("statusCode")
+        if isinstance(status, int) and status >= 400:
+            warnings.append(f"Hauptdokument lieferte HTTP {status}")
+
+    # Challenge-Texte: <title> fehlt im Ergebnis, daher Abgleich mit den
+    # Element-Texten (nodeLabel/snippet), die Lighthouse in den Audits liefert
+    # (z.B. LCP-Element)
+    hits: list[str] = []
+    for audit_id, a in audits.items():
+        for node in _psi_iter_nodes((a or {}).get("details")):
+            text = f"{node.get('nodeLabel') or ''} {node.get('snippet') or ''}".lower()
+            for pat in _PSI_CHALLENGE_PATTERNS:
+                if pat in text and f"{pat}|{audit_id}" not in hits:
+                    hits.append(f"{pat}|{audit_id}")
+    for hit in hits:
+        pat, audit_id = hit.split("|", 1)
+        warnings.append(f"moegliche Challenge-/Zwischenseite: Text {pat!r} in Seitenelement (Audit {audit_id})")
+    out["challenge_patterns_checked"] = "Titel nicht verfügbar - geprüft gegen Element-Texte aus den Audits"
+    out["warnings"] = warnings
+    return out
+
+
+def _psi_summarize(data: dict[str, Any], categories: list[str], max_findings: int,
+                   include_details: bool = False, max_items: int = 10) -> dict[str, Any]:
     lr = data.get("lighthouseResult") or {}
     audits = lr.get("audits") or {}
     cats = lr.get("categories") or {}
@@ -2126,6 +2362,7 @@ def _psi_summarize(data: dict[str, Any], categories: list[str], max_findings: in
         out["runtime_error"] = lr["runtimeError"]
     if lr.get("runWarnings"):
         out["run_warnings"] = lr["runWarnings"]
+    out["page_check"] = _psi_page_check(lr)
 
     if "performance" in cats:
         out["lab_metrics"] = {
@@ -2133,6 +2370,7 @@ def _psi_summarize(data: dict[str, Any], categories: list[str], max_findings: in
             for m in _PSI_LAB_METRICS
             if m in audits
         }
+        out["lab_metrics"]["server_timing"] = _psi_server_timing(audits)
         out["field_data_url"] = _psi_field_data(data.get("loadingExperience"))
         out["field_data_origin"] = _psi_field_data(data.get("originLoadingExperience"))
 
@@ -2145,14 +2383,17 @@ def _psi_summarize(data: dict[str, Any], categories: list[str], max_findings: in
             if score is None or score >= 0.9 or a.get("scoreDisplayMode") in ("informative", "notApplicable", "manual"):
                 continue
             ms, by = _psi_savings(a)
-            findings.append({
+            finding = {
                 "id": ref.get("id"),
                 "title": a.get("title"),
                 "display_value": a.get("displayValue"),
                 "score": score,
                 "est_savings_ms": round(ms) or None,
                 "est_savings_kib": round(by / 1024) or None,
-            })
+            }
+            if include_details:
+                finding["details"] = _psi_finding_details(a, max_items)
+            findings.append(finding)
         findings.sort(key=lambda f: (f["est_savings_ms"] or 0, f["est_savings_kib"] or 0), reverse=True)
         out["performance_findings"] = findings[:max_findings]
 
@@ -2171,14 +2412,15 @@ def _psi_summarize(data: dict[str, Any], categories: list[str], max_findings: in
 def _psi_run(url: str, strategy: str, categories: list[str], locale: str) -> dict[str, Any]:
     params: list[tuple[str, str]] = [("url", url), ("strategy", strategy), ("locale", locale)]
     params += [("category", c.upper().replace("-", "_")) for c in categories]
-    if _PSI_API_KEY:
-        params.append(("key", _PSI_API_KEY))
+    # API-Key als Header statt Query-Parameter: so steht er nie in der
+    # Request-URL und damit auch nicht in Logs (httpx loggt die volle URL)
+    headers = {"X-goog-api-key": _PSI_API_KEY} if _PSI_API_KEY else {}
     try:
-        resp = httpx.get(_PSI_ENDPOINT, params=params, timeout=_PSI_TIMEOUT)
+        resp = httpx.get(_PSI_ENDPOINT, params=params, headers=headers, timeout=_PSI_TIMEOUT)
     except httpx.TimeoutException:
         return {"error": f"Timeout nach {_PSI_TIMEOUT}s - Google hat die Analyse nicht rechtzeitig geliefert."}
     except httpx.HTTPError as exc:
-        # Bewusst ohne Request-URL, da diese den API-Key enthält
+        # Bewusst ohne Details/URL - nichts aus dem Request zurückgeben
         return {"error": f"Verbindungsfehler zur PageSpeed-API: {type(exc).__name__}"}
     if resp.status_code != 200:
         try:
@@ -2201,6 +2443,8 @@ def pagespeed_insights(
     categories: str = "performance",
     max_findings: int = 10,
     locale: str = "de",
+    include_details: bool = False,
+    max_items: int = 10,
 ) -> str:
     """Analysiert eine Website mit Google PageSpeed Insights (Lighthouse) und
     liefert eine kompakte Zusammenfassung als JSON.
@@ -2216,12 +2460,24 @@ def pagespeed_insights(
       best-practices, seo (Standard: performance). "all" = alle vier.
     - max_findings: max. Anzahl Verbesserungspunkte pro Kategorie (1-50).
     - locale: Sprache der Audit-Titel (Standard "de").
+    - include_details: true = je Performance-Finding die betroffenen
+      Ressourcen (URL mit wastedMs / wastedBytes / totalBytes) mitliefern,
+      z.B. für render-blocking-insight, unused-css-rules, unused-javascript,
+      image-delivery-insight, cache-insight, unsized-images (Standard false).
+    - max_items: max. Anzahl Ressourcen je Finding bei include_details
+      (Standard 10, max. 50).
 
     Rückgabe pro Strategie: Scores (0-100), Labor-Messwerte (FCP, LCP, TBT,
     CLS, Speed Index, TTI), Felddaten echter Nutzer aus dem Chrome UX Report
     (URL- und Origin-Ebene, falls genug Traffic vorhanden), die wichtigsten
     Performance-Verbesserungen sortiert nach geschätzter Zeitersparnis sowie
     fehlgeschlagene Audits der übrigen Kategorien.
+    Zusätzlich lab_metrics.server_timing (server-response-time,
+    document-latency-insight inkl. Teilchecks Redirects/Serverantwort/
+    Textkomprimierung, network-server-latency, network-rtt - fehlende Audits
+    werden als "nicht im Lighthouse-Ergebnis enthalten" markiert) und
+    page_check (finale URL, HTTP-Status und Grösse des Hauptdokuments,
+    Warnung bei möglicher Challenge-/Zwischenseite).
 
     Tipp für Plesk-Diagnose: bei schlechter TTFB ("server-response-time")
     zusätzlich server_load, lve_stats und fpm_service_status der Domain prüfen.
@@ -2238,6 +2494,7 @@ def pagespeed_insights(
     except ValueError as exc:
         return _json({"error": str(exc)})
     max_findings = max(1, min(int(max_findings), 50))
+    max_items = max(1, min(int(max_items), 50))
     loc = locale.strip() if re.fullmatch(r"[A-Za-z]{2}([-_][A-Za-z]{2})?", locale.strip() or "") else "de"
 
     with ThreadPoolExecutor(max_workers=len(strategies)) as pool:
@@ -2245,7 +2502,7 @@ def pagespeed_insights(
 
     out: dict[str, Any] = {"url": target, "api_key_configured": bool(_PSI_API_KEY)}
     for s, data in results.items():
-        out[s] = data if "error" in data else _psi_summarize(data, cats, max_findings)
+        out[s] = data if "error" in data else _psi_summarize(data, cats, max_findings, bool(include_details), max_items)
     return _json(out)
 
 
