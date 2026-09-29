@@ -577,11 +577,28 @@ def _client_exec(client: paramiko.SSHClient, command: str) -> tuple[str, str, in
     return out, err, stdout.channel.recv_exit_status()
 
 
-def _vhost_owner_reference(sftp, full: str, domain: str) -> tuple[int, int]:
-    """uid/gid für eine neu anzulegende Datei unter /var/www/vhosts/<domain>/:
-    Besitzer des nächsten bereits existierenden übergeordneten Ordners
-    (lstat, Symlinks werden übersprungen). Gehört dieser root, wird der
-    Besitzer von httpdocs (Subscription-User) verwendet - nie root."""
+def _primary_gid(client: paramiko.SSHClient, uid: int) -> int:
+    """Primäre Gruppe des Users (getent passwd, Feld 4) - bei Plesk-
+    Subscription-Usern psacln."""
+    out, _, rc = _client_exec(client, f"getent passwd {int(uid)} | cut -d: -f4")
+    gid = out.strip()
+    if rc != 0 or not gid.isdigit():
+        raise ValueError(
+            f"Primäre Gruppe von uid {uid} nicht ermittelbar - es wurde nichts geschrieben."
+        )
+    return int(gid)
+
+
+def _vhost_owner_reference(
+    sftp, client: paramiko.SSHClient, full: str, domain: str
+) -> tuple[int, int]:
+    """uid/gid für neue bzw. von root umzustellende Einträge unter
+    /var/www/vhosts/<domain>/. User: Besitzer des nächsten bereits
+    existierenden übergeordneten Ordners (lstat, Symlinks werden
+    übersprungen); gehört dieser root, der Besitzer von httpdocs
+    (Subscription-User) - nie root. Gruppe: immer die primäre Gruppe dieses
+    Users (psacln). Die psaserv-Gruppe von httpdocs selbst (damit der
+    Webserver hineinkommt) wird bewusst nicht übernommen."""
     base = f"{_VHOST_BASE}/{_domain_arg(domain)}"
     probe = full.rsplit("/", 1)[0]
     ref = None
@@ -594,23 +611,29 @@ def _vhost_owner_reference(sftp, full: str, domain: str) -> tuple[int, int]:
         except FileNotFoundError:
             pass
         probe = probe.rsplit("/", 1)[0]
-    if ref is not None and ref.st_uid != 0 and ref.st_gid != 0:
-        return ref.st_uid, ref.st_gid
-
-    httpdocs = f"{base}/httpdocs"
-    try:
-        st = sftp.lstat(httpdocs)
-    except FileNotFoundError:
+    if ref is not None and ref.st_uid != 0:
+        uid = ref.st_uid
+    else:
+        httpdocs = f"{base}/httpdocs"
+        try:
+            st = sftp.lstat(httpdocs)
+        except FileNotFoundError:
+            raise ValueError(
+                f"{httpdocs} existiert nicht - Subscription-User für den Besitzer "
+                "nicht ermittelbar, es wurde nichts geschrieben."
+            )
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid == 0:
+            raise ValueError(
+                f"{httpdocs} ist kein Ordner oder gehört root - Subscription-User "
+                "für den Besitzer nicht ermittelbar, es wurde nichts geschrieben."
+            )
+        uid = st.st_uid
+    gid = _primary_gid(client, uid)
+    if gid == 0:
         raise ValueError(
-            f"{httpdocs} existiert nicht - Subscription-User für den Besitzer "
-            "nicht ermittelbar, es wurde nichts geschrieben."
+            f"Primäre Gruppe von uid {uid} ist root - es wurde nichts geschrieben."
         )
-    if not stat.S_ISDIR(st.st_mode) or st.st_uid == 0 or st.st_gid == 0:
-        raise ValueError(
-            f"{httpdocs} ist kein Ordner oder gehört root - Subscription-User "
-            "für den Besitzer nicht ermittelbar, es wurde nichts geschrieben."
-        )
-    return st.st_uid, st.st_gid
+    return uid, gid
 
 
 def _owner_names(client: paramiko.SSHClient, uid: int, gid: int) -> str:
@@ -1406,9 +1429,10 @@ def write_vhost_file(
     abgebrochen (kein Überschreiben durch Symlinks hindurch).
     Besitzer/Rechte: Bestehende Dateien (und ihr Backup) behalten Besitzer,
     Gruppe und Rechte der alten Datei. Neue Dateien (0644) und neu angelegte
-    Ordner (0755) erhalten Besitzer/Gruppe des nächsten existierenden
+    Ordner (0755) erhalten als Besitzer den User des nächsten existierenden
     übergeordneten Ordners - gehört dieser root, den Besitzer von httpdocs
-    (Subscription-User). Nie root. Unterhalb von httpdocs werden zudem
+    (Subscription-User) - und als Gruppe dessen primäre Gruppe (psacln).
+    Nie root. Unterhalb von httpdocs werden zudem
     bestehende Dateien und übergeordnete Ordner, die root gehören, auf diesen
     Besitzer umgestellt (Rechte bleiben).
     """
@@ -1461,7 +1485,7 @@ def write_vhost_file(
                 uid, gid = lst.st_uid, lst.st_gid
                 file_mode = stat.S_IMODE(lst.st_mode)
                 if in_httpdocs and (uid == 0 or gid == 0):
-                    uid, gid = _vhost_owner_reference(sftp, full, domain)
+                    uid, gid = _vhost_owner_reference(sftp, client, full, domain)
                     fix_owner = True
                 with sftp.open(full, "rb") as f:
                     # fstat des geöffneten Handles muss zum lstat passen -
@@ -1486,7 +1510,7 @@ def write_vhost_file(
                 backup_note = f" Backup der alten Version: {backup_path}"
                 created_dirs: list[str] = []
             else:
-                uid, gid = _vhost_owner_reference(sftp, full, domain)
+                uid, gid = _vhost_owner_reference(sftp, client, full, domain)
                 file_mode = 0o644
                 created_dirs = _sftp_makedirs(sftp, full.rsplit("/", 1)[0])
                 for d in created_dirs:
