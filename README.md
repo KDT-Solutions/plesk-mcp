@@ -136,16 +136,19 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8422` auf dem Docker-Hos
 | `db_query` | Führt eine einzelne read-only SQL-Query (SELECT/SHOW/EXPLAIN/DESCRIBE) gegen eine Datenbank aus |
 | `db_search` | Durchsucht alle Text-Spalten aller Tabellen einer Datenbank nach einem Begriff (LIKE-Scan) |
 | `server_load` | Allgemeine Serverlast (uptime, free, Prozessanzahl) |
-| `pagespeed_insights` | Google PageSpeed Insights (Lighthouse) für eine URL/Domain: Scores, Labor-Messwerte, CrUX-Felddaten, Top-Verbesserungen - mobile/desktop/both, read-only und extern |
+| `pagespeed_insights` | Google PageSpeed Insights (Lighthouse) für eine URL/Domain: Scores, Labor-Messwerte inkl. Server-Antwortzeit/TTFB (`lab_metrics.server_timing`), CrUX-Felddaten, Top-Verbesserungen (optional mit betroffenen Ressourcen via `include_details`), Plausibilitätscheck der analysierten Seite (`page_check`) - mobile/desktop/both, read-only und extern |
 | `run_diagnostic` | Generischer Fallback, nur Whitelist an read-only Befehlen erlaubt |
 
-- `pagespeed_insights` läuft komplett extern: Die Ziel-URL wird von Google geladen, nicht vom Container oder vom Plesk-Server - kein SSH, kein Request vom Container auf die Ziel-URL. Erlaubt sind nur `http`/`https` mit öffentlichem Hostnamen (keine IPs, kein `localhost`, keine `user:pass@`-Zugangsdaten in der URL, da diese an Google übermittelt würden). Der `PAGESPEED_API_KEY` wird als Query-Parameter an Google geschickt und aus Fehlermeldungen entfernt; den Key in der Google Cloud Console per API-Einschränkung nur für die PageSpeed Insights API freigeben.
+- `pagespeed_insights` läuft komplett extern: Die Ziel-URL wird von Google geladen, nicht vom Container oder vom Plesk-Server - kein SSH, kein Request vom Container auf die Ziel-URL. Erlaubt sind nur `http`/`https` mit öffentlichem Hostnamen (keine IPs, kein `localhost`, keine `user:pass@`-Zugangsdaten in der URL, da diese an Google übermittelt würden). Der `PAGESPEED_API_KEY` wird als Header (`X-goog-api-key`) an Google geschickt, nie in der Request-URL, nie geloggt und aus Fehlermeldungen entfernt; den Key in der Google Cloud Console per API-Einschränkung nur für die PageSpeed Insights API freigeben.
 
 ## Beispiel: PageSpeed einer Kundenseite prüfen
 
 1. `pagespeed_insights(url="example.com", strategy="both")` - Scores, LCP/CLS/TBT und Top-Verbesserungen für mobile und desktop
 2. `pagespeed_insights(url="https://www.example.com/shop", categories="all")` - zusätzlich Accessibility, Best Practices und SEO
-3. Bei hoher Server-Antwortzeit (`server-response-time`) auf dem Plesk-Server weiter mit `server_load`, `lve_stats` und `fpm_service_status` der Domain
+3. `pagespeed_insights(url="example.com", include_details=true, max_items=5)` - je Performance-Finding die Top-5-Ressourcen mit `wastedMs` / `wastedBytes` / `totalBytes` (z.B. render-blocking-insight, unused-css-rules, unused-javascript, image-delivery-insight, cache-insight, unsized-images)
+4. Server-Antwortzeit in `lab_metrics.server_timing` prüfen: `server_response_time`, `document_latency_insight` (Teilchecks Redirects, Serverantwort, Textkomprimierung), `network_server_latency`, `network_rtt`. Fehlt ein Audit im Lighthouse-Ergebnis, steht dort `"nicht im Lighthouse-Ergebnis enthalten"` - es wird nichts geschätzt.
+5. `page_check` kontrollieren: finale URL, HTTP-Status und Grösse des Hauptdokuments. Eine Warnung `moegliche Challenge-/Zwischenseite` erscheint, wenn das Hauptdokument kleiner als 20 KB ist oder ein Seitenelement typische Challenge-Texte enthält ("Just a moment", "One moment, please", "Checking your browser" usw.). Den `<title>` liefert Lighthouse nicht mit, daher steht dort immer `"nicht im Lighthouse-Ergebnis enthalten"`.
+6. Bei hoher Server-Antwortzeit auf dem Plesk-Server weiter mit `server_load`, `lve_stats` und `fpm_service_status` der Domain
 
 ## Beispiel: Imunify-False-Positive in rotierten Logs
 
