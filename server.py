@@ -32,16 +32,17 @@ Gedacht für Fehleranalyse bei Support-Anfragen (z.B. "Website nicht erreichbar"
 Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven
 Kommandos (Whitelist + Blacklist weiter unten). Ausnahme: write_vhost_file,
 delete_vhost_backup, delete_vhost_log, dns_add_record, dns_delete_record,
-dns_update_record, imunify_ignore_add und imunify_ignore_remove dürfen
-schreiben - die ersten beiden Dateien innerhalb von
+dns_update_record, imunify_ignore_add, imunify_ignore_remove, wp_option_update
+und wp_option_rollback dürfen schreiben - die ersten beiden Dateien innerhalb von
 /var/www/vhosts/<domain>/ anlegen/überschreiben/löschen (Backups),
 delete_vhost_log Logdateien unter /var/www/vhosts/<domain>/logs/ löschen
 (rotierte) bzw. leeren (aktive), die drei dns_*-Tools DNS-Resource-Records der
 Domain-Zone anlegen/entfernen/ändern (plesk bin dns --add/--del;
 dns_update_record kombiniert beides für einen bestehenden Record).
 imunify_ignore_add/imunify_ignore_remove ändern ausschliesslich die
-Imunify360-Malware-Ignore-Liste (nur Pfade unter /var/www/vhosts/). Alle acht
-erfordern zwingend confirm=true pro Aufruf
+Imunify360-Malware-Ignore-Liste (nur Pfade unter /var/www/vhosts/),
+wp_option_update/wp_option_rollback einzelne freigegebene WordPress-Optionen
+(per WP-CLI als Subscription-User). Alle zehn erfordern zwingend confirm=true pro Aufruf
 (keine globale Freischaltung), write_vhost_file legt vor dem Überschreiben
 automatisch ein Backup der alten Version an.
 
@@ -569,9 +570,17 @@ def _sftp_makedirs(sftp, remote_dir: str, mode: int = 0o755) -> list[str]:
     return created
 
 
-def _client_exec(client: paramiko.SSHClient, command: str) -> tuple[str, str, int]:
+def _client_exec(
+    client: paramiko.SSHClient,
+    command: str,
+    timeout: int | None = None,
+    stdin_data: bytes | None = None,
+) -> tuple[str, str, int]:
     """Wie _ssh_exec, aber auf einer bereits offenen SSH-Verbindung."""
-    stdin, stdout, stderr = client.exec_command(command, timeout=_SSH_TIMEOUT)
+    stdin, stdout, stderr = client.exec_command(command, timeout=timeout or _SSH_TIMEOUT)
+    if stdin_data is not None:
+        stdin.write(stdin_data)
+    stdin.channel.shutdown_write()
     out = stdout.read().decode("utf-8", errors="replace")
     err = stderr.read().decode("utf-8", errors="replace")
     return out, err, stdout.channel.recv_exit_status()
@@ -595,8 +604,9 @@ def _vhost_owner_reference(
     """uid/gid für neue bzw. von root umzustellende Einträge unter
     /var/www/vhosts/<domain>/. User: Besitzer des nächsten bereits
     existierenden übergeordneten Ordners (lstat, Symlinks werden
-    übersprungen); gehört dieser root, der Besitzer von httpdocs
-    (Subscription-User) - nie root. Gruppe: immer die primäre Gruppe dieses
+    übersprungen); gehört dieser root, der Besitzer von httpdocs, sonst der
+    von /var/www/vhosts/<domain>/ (Subscription-User) - nie root. Gehören
+    alle root, wird abgebrochen. Gruppe: immer die primäre Gruppe dieses
     Users (psacln). Die psaserv-Gruppe von httpdocs selbst (damit der
     Webserver hineinkommt) wird bewusst nicht übernommen."""
     base = f"{_VHOST_BASE}/{_domain_arg(domain)}"
@@ -611,23 +621,22 @@ def _vhost_owner_reference(
         except FileNotFoundError:
             pass
         probe = probe.rsplit("/", 1)[0]
-    if ref is not None and ref.st_uid != 0:
-        uid = ref.st_uid
-    else:
-        httpdocs = f"{base}/httpdocs"
+    uid = ref.st_uid if ref is not None else 0
+    for fallback in (f"{base}/httpdocs", base):
+        if uid != 0:
+            break
         try:
-            st = sftp.lstat(httpdocs)
+            st = sftp.lstat(fallback)
         except FileNotFoundError:
-            raise ValueError(
-                f"{httpdocs} existiert nicht - Subscription-User für den Besitzer "
-                "nicht ermittelbar, es wurde nichts geschrieben."
-            )
-        if not stat.S_ISDIR(st.st_mode) or st.st_uid == 0:
-            raise ValueError(
-                f"{httpdocs} ist kein Ordner oder gehört root - Subscription-User "
-                "für den Besitzer nicht ermittelbar, es wurde nichts geschrieben."
-            )
-        uid = st.st_uid
+            continue
+        if stat.S_ISDIR(st.st_mode):
+            uid = st.st_uid
+    if uid == 0:
+        raise ValueError(
+            f"Referenzordner, {base}/httpdocs und {base} gehören root (oder "
+            "fehlen) - Subscription-User für den Besitzer nicht ermittelbar, "
+            "es wurde nichts geschrieben."
+        )
     gid = _primary_gid(client, uid)
     if gid == 0:
         raise ValueError(
@@ -660,15 +669,25 @@ def _fix_root_dirs_in_httpdocs(
 ) -> list[str]:
     """Stellt bestehende übergeordnete Ordner von full, die root gehören, auf
     uid/gid um (z.B. von früheren Versionen angelegte wp-content/mu-plugins).
-    Nur unterhalb von httpdocs (httpdocs selbst ausgenommen) - ausserhalb
-    (conf/, logs/ ...) sind root-Ordner von Plesk so vorgesehen."""
+    httpdocs selbst bekommt uid:psaserv (Plesk-Standard, damit der Webserver
+    hineinkommt). Nur httpdocs und darunter - ausserhalb (conf/, logs/ ...)
+    sind root-Ordner von Plesk so vorgesehen."""
     httpdocs = f"{_VHOST_BASE}/{_domain_arg(domain)}/httpdocs"
     fixed: list[str] = []
     probe = full.rsplit("/", 1)[0]
-    while probe.startswith(httpdocs + "/"):
+    while probe == httpdocs or probe.startswith(httpdocs + "/"):
         st = sftp.lstat(probe)
         if stat.S_ISDIR(st.st_mode) and (st.st_uid == 0 or st.st_gid == 0):
-            _chown_nofollow(client, probe, uid, gid)
+            dir_gid = gid
+            if probe == httpdocs:
+                out, _, rc = _client_exec(client, "getent group psaserv | cut -d: -f3")
+                if rc != 0 or not out.strip().isdigit():
+                    raise ValueError(
+                        f"{httpdocs} gehört root, Gruppe psaserv nicht gefunden - "
+                        "es wurde nichts geschrieben."
+                    )
+                dir_gid = int(out.strip())
+            _chown_nofollow(client, probe, uid, dir_gid)
             fixed.append(probe)
         probe = probe.rsplit("/", 1)[0]
     fixed.reverse()
@@ -1432,9 +1451,12 @@ def write_vhost_file(
     Ordner (0755) erhalten als Besitzer den User des nächsten existierenden
     übergeordneten Ordners - gehört dieser root, den Besitzer von httpdocs
     (Subscription-User) - und als Gruppe dessen primäre Gruppe (psacln).
-    Nie root. Unterhalb von httpdocs werden zudem
-    bestehende Dateien und übergeordnete Ordner, die root gehören, auf diesen
-    Besitzer umgestellt (Rechte bleiben).
+    Fallback-Reihenfolge für den User: Referenzordner, httpdocs,
+    /var/www/vhosts/<domain>/. Nie root - sonst Fehler. Unterhalb von
+    httpdocs werden zudem bestehende Dateien und übergeordnete Ordner, die
+    root gehören, auf diesen Besitzer umgestellt (Rechte bleiben; httpdocs
+    selbst auf <user>:psaserv). Eine root-eigene Datei ausserhalb von
+    httpdocs wird nicht überschrieben.
     """
     if not confirm:
         raise ValueError(
@@ -1487,6 +1509,14 @@ def write_vhost_file(
                 if in_httpdocs and (uid == 0 or gid == 0):
                     uid, gid = _vhost_owner_reference(sftp, client, full, domain)
                     fix_owner = True
+                elif uid == 0:
+                    # Nie mit root abschliessen. Ausserhalb von httpdocs
+                    # (z.B. conf/) wird eine root-Datei bewusst nicht an den
+                    # Kunden übergeben.
+                    raise ValueError(
+                        f"'{full}' gehört root und liegt ausserhalb von httpdocs - "
+                        "wird nicht überschrieben (Ergebnis wäre root-eigen)."
+                    )
                 with sftp.open(full, "rb") as f:
                     # fstat des geöffneten Handles muss zum lstat passen -
                     # sonst wurde die Datei zwischenzeitlich (z.B. gegen einen
@@ -1615,6 +1645,425 @@ def delete_vhost_backup(domain: str, path: str, confirm: bool = False) -> str:
 # NICHT die aktuell vom Webserver beschriebene Datei ist.
 _ROTATED_LOG_RE = re.compile(r"(\.gz|\.\d+|-\d{8})$")
 _LOG_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+# ---------------------------------------------------------------------------
+# WordPress-Optionen (wp_option_update / wp_option_rollback)
+# ---------------------------------------------------------------------------
+#
+# Änderungen laufen über WP-CLI als System-User der Subscription (runuser,
+# nie als root) mit der PHP-Version der Domain. So laufen die WordPress-Hooks
+# (update_option) und ein Objekt-Cache (z.B. Redis) wird korrekt aktualisiert.
+# Nur Optionen aus der Allowlist sind erlaubt. Zugangsdaten (wp-config.php,
+# DB-Passwort, Salts, /etc/psa/.psa.shadow) werden von diesen Tools weder
+# gelesen noch ausgegeben: die Domain-Daten kommen über "plesk db", das sich
+# selbst authentifiziert.
+
+_WP_CLI_PATH = os.environ.get("WP_CLI_PATH", "/usr/local/bin/wp-standalone").strip()
+_WP_CLI_TIMEOUT = int(os.environ.get("WP_CLI_TIMEOUT", "120"))
+_WP_OPTION_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]{1,191}$")
+_WP_OPTION_ALLOWLIST_DEFAULT = ("wp_rocket_settings", "elementor_font_display")
+_WP_DOMAIN_RE = re.compile(r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")
+_WP_SYSUSER_RE = re.compile(r"^[a-z_][a-z0-9_.-]{0,63}$")
+_WP_BACKUP_ID_RE = re.compile(r"^(\d{14})-([0-9a-f]{8})@([a-z0-9.-]+)$")
+_WP_BACKUP_SUBDIR = ".plesk-mcp/wp-option-backups"
+
+
+def _wp_option_allowlist() -> set[str]:
+    """Standard-Allowlist plus Einträge aus WP_OPTION_ALLOWLIST (kommagetrennt)."""
+    names = set(_WP_OPTION_ALLOWLIST_DEFAULT)
+    for n in os.environ.get("WP_OPTION_ALLOWLIST", "").split(","):
+        n = n.strip()
+        if n and _WP_OPTION_NAME_RE.match(n):
+            names.add(n)
+    return names
+
+
+def _wp_check_option(option_name: str) -> str:
+    name = option_name.strip()
+    allowed = _wp_option_allowlist()
+    if not _WP_OPTION_NAME_RE.match(name) or name not in allowed:
+        raise ValueError(
+            f"Option {option_name!r} ist nicht freigegeben. Erlaubt: "
+            f"{', '.join(sorted(allowed))} (erweiterbar per ENV WP_OPTION_ALLOWLIST)."
+        )
+    return name
+
+
+def _wp_domain(domain: str) -> str:
+    d = domain.strip().lower()
+    if not _WP_DOMAIN_RE.match(d) or ".." in d:
+        raise ValueError(f"Ungültiger Domainname: {domain!r}")
+    return d
+
+
+def _wp_context(client: paramiko.SSHClient, domain: str) -> dict[str, str]:
+    """System-User, Home und PHP-CLI der Domain aus der Plesk-Datenbank."""
+    sql = (
+        "SELECT s.login, s.home, h.php_handler_id FROM domains d "
+        "JOIN hosting h ON h.dom_id = d.id JOIN sys_users s ON s.id = h.sys_user_id "
+        f"WHERE d.name = {_sql_quote(domain)}"
+    )
+    out, err, rc = _client_exec(client, f"plesk db -Ne {shlex.quote(sql)}")
+    rows = [line.split("\t") for line in out.strip().splitlines() if line.strip()]
+    if rc != 0 or len(rows) != 1 or len(rows[0]) != 3:
+        raise ValueError(
+            f"Domain '{domain}' nicht als Hosting in Plesk gefunden"
+            + (f": {err.strip()}" if err.strip() else ".")
+        )
+    login, home, handler = (c.strip() for c in rows[0])
+    if not _WP_SYSUSER_RE.match(login):
+        raise ValueError(f"Unerwarteter System-User {login!r} für '{domain}'.")
+    if home != posixpath.normpath(home) or not home.startswith(_VHOST_BASE + "/"):
+        raise ValueError(f"Unerwartetes Home-Verzeichnis {home!r} für '{domain}'.")
+    out, _, rc = _client_exec(client, f"id -u {shlex.quote(login)}")
+    if rc != 0 or not out.strip().isdigit() or int(out.strip()) == 0:
+        raise ValueError(f"System-User {login!r} fehlt oder ist root - abgebrochen.")
+
+    out, err, rc = _client_exec(client, "plesk bin php_handler --list -json true")
+    try:
+        handlers = json.loads(out)
+    except ValueError:
+        raise ValueError(f"PHP-Handler-Liste nicht lesbar: {err.strip() or out[:200]}")
+    php = next((h.get("clipath") for h in handlers if h.get("id") == handler), None)
+    if not php or not php.startswith("/") or any(c.isspace() for c in php):
+        raise ValueError(
+            f"PHP-CLI für den Handler {handler!r} der Domain '{domain}' nicht gefunden."
+        )
+    return {"domain": domain, "login": login, "home": home, "php": php}
+
+
+def _wp_run_as_user(
+    client: paramiko.SSHClient,
+    ctx: dict[str, str],
+    argv: list[str],
+    cwd: str,
+    stdin_data: bytes | None = None,
+) -> tuple[str, str, int]:
+    """Führt argv als System-User der Subscription aus (runuser, leere
+    Umgebung, HOME = Subscription-Home) - nie als root."""
+    cmd = (
+        f"cd {shlex.quote(cwd)} && runuser -u {shlex.quote(ctx['login'])} -- "
+        f"env -i HOME={shlex.quote(ctx['home'])} PATH=/usr/bin:/bin "
+        + " ".join(shlex.quote(a) for a in argv)
+    )
+    return _client_exec(client, cmd, timeout=_WP_CLI_TIMEOUT, stdin_data=stdin_data)
+
+
+def _wp_cli(
+    client: paramiko.SSHClient, ctx: dict[str, str], wp_dir: str, args: list[str]
+) -> str:
+    out, err, rc = _wp_run_as_user(
+        client, ctx,
+        [ctx["php"], _WP_CLI_PATH, f"--path={wp_dir}", "--no-color", *args],
+        cwd=wp_dir,
+    )
+    if rc != 0:
+        msg = "\n".join(line for line in (err.strip() or out.strip()).splitlines()[-5:])
+        raise SSHError(f"WP-CLI 'wp {args[0]} {args[1] if len(args) > 1 else ''}' fehlgeschlagen: {msg}")
+    return out
+
+
+def _wp_json(text: str) -> Any:
+    """JSON aus WP-CLI-Ausgabe; toleriert Zeilen, die Plugins vorneweg ausgeben."""
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except ValueError:
+        pass
+    for line in reversed(text.splitlines()):
+        try:
+            return json.loads(line)
+        except ValueError:
+            continue
+    raise ValueError("WP-CLI-Ausgabe ist kein gültiges JSON.")
+
+
+_WP_MISSING = object()
+
+
+def _wp_get_option(
+    client: paramiko.SSHClient, ctx: dict[str, str], wp_dir: str, name: str
+) -> Any:
+    """Aktueller Wert oder _WP_MISSING, falls die Option nicht existiert."""
+    out, err, rc = _wp_run_as_user(
+        client, ctx,
+        [ctx["php"], _WP_CLI_PATH, f"--path={wp_dir}", "--no-color",
+         "option", "get", name, "--format=json"],
+        cwd=wp_dir,
+    )
+    if rc != 0:
+        if "does it exist" in (err + out).lower():
+            return _WP_MISSING
+        msg = "\n".join((err.strip() or out.strip()).splitlines()[-5:])
+        raise SSHError(f"WP-CLI 'wp option get' fehlgeschlagen: {msg}")
+    return _wp_json(out)
+
+
+def _wp_install_dir(sftp, domain: str, wp_path: str) -> str:
+    wp_dir = _vhost_path(domain, wp_path)
+    _assert_real_within_vhost(sftp, wp_dir, domain)
+    try:
+        st = sftp.lstat(f"{wp_dir}/wp-load.php")
+    except FileNotFoundError:
+        raise ValueError(f"Keine WordPress-Installation in {wp_dir} (wp-load.php fehlt).")
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"{wp_dir}/wp-load.php ist keine reguläre Datei.")
+    return wp_dir
+
+
+def _wp_plan(current: Any, mode: str, targets: dict[str, Any]) -> dict[str, Any]:
+    """Vergleicht aktuelle mit Zielwerten. targets: key -> Wert oder
+    _WP_MISSING (= Schlüssel/Option löschen). Im value-Modus ist der einzige
+    Schlüssel "" (die ganze Option)."""
+    plan: dict[str, Any] = {}
+    for key, new in targets.items():
+        if mode == "keys":
+            old = current.get(key, _WP_MISSING)
+        else:
+            old = current
+        plan[key] = {
+            "old": old,
+            "new": new,
+            "changed": not (old is not _WP_MISSING and new is not _WP_MISSING and old == new)
+            and not (old is _WP_MISSING and new is _WP_MISSING),
+        }
+    return plan
+
+
+def _wp_plan_view(plan: dict[str, Any]) -> dict[str, Any]:
+    view = {}
+    for key, p in plan.items():
+        view[key or "(Wert)"] = {
+            "alt": "(nicht vorhanden)" if p["old"] is _WP_MISSING else p["old"],
+            "neu": "(wird entfernt)" if p["new"] is _WP_MISSING else p["new"],
+            "status": "ändern" if p["changed"] else "unverändert",
+        }
+    return view
+
+
+def _wp_write_backup(
+    client: paramiko.SSHClient,
+    ctx: dict[str, str],
+    wp_dir: str,
+    wp_path: str,
+    option: str,
+    mode: str,
+    current: Any,
+    plan: dict[str, Any],
+    source: str,
+) -> str:
+    """Legt den alten Zustand als JSON unter <home>/.plesk-mcp/wp-option-backups/
+    ab - ausserhalb des Webroots, geschrieben als Subscription-User (0600)."""
+    ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    backup_id = f"{ts}-{os.urandom(4).hex()}@{ctx['domain']}"
+    record = {
+        "id": backup_id,
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "source": source,
+        "domain": ctx["domain"],
+        "wp_path": wp_path,
+        "option_name": option,
+        "mode": mode,
+        "option_existed": current is not _WP_MISSING,
+        "old_option_value": None if current is _WP_MISSING else current,
+        "entries": {
+            key: {"existed": p["old"] is not _WP_MISSING,
+                  "value": None if p["old"] is _WP_MISSING else p["old"]}
+            for key, p in plan.items() if p["changed"]
+        },
+    }
+    data = json.dumps(record, ensure_ascii=False, indent=2).encode("utf-8")
+    bdir = f"{ctx['home']}/{_WP_BACKUP_SUBDIR}"
+    _, err, rc = _wp_run_as_user(
+        client, ctx,
+        ["/bin/sh", "-c", 'umask 077 && mkdir -p "$1" && set -C && cat > "$2"',
+         "sh", bdir, f"{bdir}/{backup_id}.json"],
+        cwd=ctx["home"], stdin_data=data,
+    )
+    if rc != 0:
+        raise SSHError(f"Backup konnte nicht angelegt werden - nichts geändert: {err.strip()}")
+    return backup_id
+
+
+def _wp_apply(
+    client: paramiko.SSHClient,
+    ctx: dict[str, str],
+    wp_dir: str,
+    option: str,
+    mode: str,
+    plan: dict[str, Any],
+) -> list[str]:
+    """Schreibt die geänderten Einträge über WP-CLI; gibt Fehler je Schlüssel zurück."""
+    errors = []
+    for key, p in plan.items():
+        if not p["changed"]:
+            continue
+        try:
+            if mode == "value":
+                if p["new"] is _WP_MISSING:
+                    args = ["option", "delete", option]
+                else:
+                    args = ["option", "update", option, json.dumps(p["new"]), "--format=json"]
+            elif p["new"] is _WP_MISSING:
+                args = ["option", "patch", "delete", option, key]
+            else:
+                verb = "insert" if p["old"] is _WP_MISSING else "update"
+                args = ["option", "patch", verb, option, key, json.dumps(p["new"]), "--format=json"]
+            _wp_cli(client, ctx, wp_dir, args)
+        except SSHError as e:
+            errors.append(f"{key or option}: {e}")
+    return errors
+
+
+def _wp_change(
+    domain: str,
+    wp_path: str,
+    option: str,
+    mode: str,
+    targets: dict[str, Any],
+    confirm: bool,
+    source: str,
+) -> str:
+    """Gemeinsamer Ablauf für Update und Rollback: Kontext, alter Wert,
+    Vorschau bzw. Backup + Schreiben + Kontrolle."""
+    d = _wp_domain(domain)
+    client = _ssh_connect()
+    try:
+        ctx = _wp_context(client, d)
+        sftp = client.open_sftp()
+        try:
+            wp_dir = _wp_install_dir(sftp, d, wp_path)
+        finally:
+            sftp.close()
+        current = _wp_get_option(client, ctx, wp_dir, option)
+        if mode == "keys":
+            if current is _WP_MISSING:
+                raise ValueError(f"Option '{option}' existiert nicht - Teilschlüssel nicht setzbar.")
+            if not isinstance(current, dict):
+                raise ValueError(
+                    f"Option '{option}' ist kein Array mit Schlüsseln - 'value' statt 'keys' verwenden."
+                )
+        plan = _wp_plan(current, mode, targets)
+        result: dict[str, Any] = {
+            "domain": d,
+            "wp_path": wp_dir,
+            "option": option,
+            "system_user": ctx["login"],
+            "aenderungen": _wp_plan_view(plan),
+        }
+        if not any(p["changed"] for p in plan.values()):
+            result["ergebnis"] = "Keine Änderung nötig - alle Werte sind bereits gesetzt."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        if not confirm:
+            result["ergebnis"] = "Vorschau - nichts geschrieben. Mit confirm=true ausführen."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+
+        backup_id = _wp_write_backup(
+            client, ctx, wp_dir, wp_path, option, mode, current, plan, source
+        )
+        errors = _wp_apply(client, ctx, wp_dir, option, mode, plan)
+        after = _wp_get_option(client, ctx, wp_dir, option)
+        mismatches = []
+        for key, p in plan.items():
+            if not p["changed"]:
+                continue
+            now = after.get(key, _WP_MISSING) if (mode == "keys" and isinstance(after, dict)) else after
+            if now != p["new"] and not (now is _WP_MISSING and p["new"] is _WP_MISSING):
+                mismatches.append(key or option)
+    finally:
+        client.close()
+
+    result["backup_id"] = backup_id
+    result["backup_datei"] = f"{ctx['home']}/{_WP_BACKUP_SUBDIR}/{backup_id}.json"
+    if errors or mismatches:
+        result["ergebnis"] = "Teilweise fehlgeschlagen - Rollback mit backup_id möglich."
+        result["fehler"] = errors
+        result["abweichend_nach_kontrolle"] = mismatches
+    else:
+        result["ergebnis"] = "Geschrieben und kontrolliert."
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def wp_option_update(
+    domain: str,
+    wp_path: str,
+    option_name: str,
+    keys: dict[str, Any] | None = None,
+    value: Any = None,
+    confirm: bool = False,
+) -> str:
+    """Ändert eine einzelne WordPress-Option gezielt über WP-CLI - auch bei
+    Installationen, die nicht im WP Toolkit eingebunden sind.
+
+    domain: z.B. "example.com"; wp_path: WordPress-Verzeichnis relativ zu
+    /var/www/vhosts/<domain>/ (z.B. "httpdocs").
+    keys: für serialisierte Arrays - dict Teilschlüssel (oberste Ebene) ->
+    neuer Wert, z.B. {"minify_css": 1} (wp option patch update/insert).
+    value: für einfache Optionen der neue Wert, z.B. "swap" (wp option update).
+    Genau eines von beiden angeben.
+
+    Läuft als System-User der Subscription (nie root) mit der PHP-Version
+    der Domain; WordPress-Hooks und Objekt-Cache (Redis) werden dadurch
+    korrekt bedient. Nur Optionen aus der Allowlist (wp_rocket_settings,
+    elementor_font_display, erweiterbar per ENV WP_OPTION_ALLOWLIST).
+    Ohne confirm=true nur Vorschau (alt/neu je Schlüssel, nichts geschrieben).
+    Mit confirm=true wird vorher ein JSON-Backup ausserhalb des Webroots
+    angelegt; Rückgabe mit backup_id (für wp_option_rollback) und alt/neu.
+    """
+    option = _wp_check_option(option_name)
+    if (keys is None) == (value is None):
+        raise ValueError("Genau eines von 'keys' (Teilschlüssel) oder 'value' angeben.")
+    if keys is not None:
+        if not isinstance(keys, dict) or not keys:
+            raise ValueError("'keys' muss ein nicht-leeres dict Teilschlüssel -> Wert sein.")
+        for k in keys:
+            if not isinstance(k, str) or not k.strip() or len(k) > 191:
+                raise ValueError(f"Ungültiger Teilschlüssel: {k!r}")
+        return _wp_change(domain, wp_path, option, "keys", dict(keys), confirm, "wp_option_update")
+    return _wp_change(domain, wp_path, option, "value", {"": value}, confirm, "wp_option_update")
+
+
+@mcp.tool()
+def wp_option_rollback(backup_id: str, confirm: bool = False) -> str:
+    """Spielt ein von wp_option_update angelegtes Backup zurück (nur die
+    damals geänderten Schlüssel bzw. den Wert; damals fehlende Schlüssel
+    werden wieder entfernt). Ohne confirm=true nur Vorschau. Vor dem
+    Zurückspielen wird der aktuelle Stand selbst wieder als Backup abgelegt
+    (neue backup_id in der Rückgabe).
+    """
+    m = _WP_BACKUP_ID_RE.match(backup_id.strip())
+    if not m:
+        raise ValueError(f"Ungültige backup_id: {backup_id!r}")
+    bid = m.group(0)
+    d = _wp_domain(m.group(3))
+    client = _ssh_connect()
+    try:
+        ctx = _wp_context(client, d)
+        out, err, rc = _wp_run_as_user(
+            client, ctx,
+            ["/bin/cat", "--", f"{ctx['home']}/{_WP_BACKUP_SUBDIR}/{bid}.json"],
+            cwd=ctx["home"],
+        )
+    finally:
+        client.close()
+    if rc != 0:
+        raise ValueError(f"Backup '{bid}' nicht gefunden: {err.strip()}")
+    try:
+        record = json.loads(out)
+        option = _wp_check_option(record["option_name"])
+        mode = record["mode"]
+        wp_path = record["wp_path"]
+        entries = record["entries"]
+        if record.get("domain") != d or mode not in ("keys", "value") or not isinstance(entries, dict):
+            raise ValueError("Inhalt passt nicht zur backup_id")
+    except (ValueError, KeyError, TypeError) as e:
+        raise ValueError(f"Backup '{bid}' ist ungültig: {e}")
+    targets = {
+        key: (e["value"] if e.get("existed") else _WP_MISSING) for key, e in entries.items()
+    }
+    return _wp_change(d, wp_path, option, mode, targets, confirm, f"wp_option_rollback:{bid}")
 
 
 @mcp.tool()
