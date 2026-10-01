@@ -46,6 +46,8 @@ Ohne gesetztes `MCP_TRANSPORT` (oder mit `MCP_TRANSPORT=stdio`) verhält sich de
 | `PLESK_SSH_PASSWORD` | ja, ausser bei Key-Auth | – | SSH-Passwort |
 | `PLESK_SSH_KEY_PATH` | nein | – | Alternative zu Passwort: Pfad zu einem privaten SSH-Key |
 | `PLESK_SSH_TIMEOUT` | nein | `20` | SSH-Verbindungs-Timeout in Sekunden |
+| `PLESK_SSH_HOST_KEY` | empfohlen | – | Host-Key des Plesk-Servers als `<typ> <base64>` (z.B. `ssh-ed25519 AAAAC3Nza...`). Aktiviert die strikte Host-Key-Prüfung (MITM-Schutz) |
+| `PLESK_SSH_KNOWN_HOSTS` | nein | – | Alternative zu `PLESK_SSH_HOST_KEY`: Pfad zu einer in den Container gemounteten known_hosts-Datei |
 | `PLESK_API_HOST` | nein | `PLESK_SSH_HOST` | Host für die Plesk-REST-API, falls abweichend vom SSH-Host |
 | `PLESK_API_PORT` | nein | `8443` | Port der Plesk-REST-API |
 | `PLESK_API_KEY` | ja, für `plesk_api_get` | – | Secret Key, erzeugt via `plesk bin secret_key --create` |
