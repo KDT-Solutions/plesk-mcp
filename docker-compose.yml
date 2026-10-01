@@ -1,11 +1,10 @@
 services:
   plesk-mcp:
-    # Fertiges Image aus der (privaten) GitHub Container Registry - wird per
-    # GitHub Actions bei jedem Push auf main automatisch gebaut und
-    # veroeffentlicht (.github/workflows/docker-publish.yml). Portainer
-    # braucht dafuer unter "Registries" einen ghcr.io-Eintrag mit einem
-    # GitHub Personal Access Token (Scope "read:packages"), da das Repo/
-    # Package privat ist.
+    # Fertiges Image aus der GitHub Container Registry - wird per GitHub
+    # Actions bei jedem Push auf main automatisch gebaut und veroeffentlicht
+    # (.github/workflows/docker-publish.yml). Ist das GHCR-Package privat,
+    # braucht Portainer unter "Registries" einen ghcr.io-Eintrag mit einem
+    # GitHub Personal Access Token (Scope "read:packages").
     image: ghcr.io/kdt-solutions/plesk-mcp:latest
     # Bei jedem Deploy/Redeploy das Image aus der Registry neu ziehen, statt
     # eine lokal schon vorhandene (evtl. veraltete) :latest-Kopie zu verwenden.
