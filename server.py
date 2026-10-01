@@ -33,7 +33,9 @@ Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven
 Kommandos (Whitelist + Blacklist weiter unten). Ausnahme: write_vhost_file,
 delete_vhost_backup, delete_vhost_log, dns_add_record, dns_delete_record,
 dns_update_record, imunify_ignore_add, imunify_ignore_remove, wp_option_update
-und wp_option_rollback dürfen schreiben - die ersten beiden Dateien innerhalb von
+wp_option_rollback sowie die Datei-Tools upload_begin, fetch_to_vhost,
+move_vhost_file, delete_vhost_file, restore_vhost_trash und empty_vhost_trash
+(siehe README "Datei-Upload"/"Dateiverwaltung") dürfen schreiben - die ersten beiden Dateien innerhalb von
 /var/www/vhosts/<domain>/ anlegen/überschreiben/löschen (Backups),
 delete_vhost_log Logdateien unter /var/www/vhosts/<domain>/logs/ löschen
 (rotierte) bzw. leeren (aktive), die drei dns_*-Tools DNS-Resource-Records der
@@ -42,7 +44,7 @@ dns_update_record kombiniert beides für einen bestehenden Record).
 imunify_ignore_add/imunify_ignore_remove ändern ausschliesslich die
 Imunify360-Malware-Ignore-Liste (nur Pfade unter /var/www/vhosts/),
 wp_option_update/wp_option_rollback einzelne freigegebene WordPress-Optionen
-(per WP-CLI als Subscription-User). Alle zehn erfordern zwingend confirm=true pro Aufruf
+(per WP-CLI als Subscription-User). Alle schreibenden Tools erfordern zwingend confirm=true pro Aufruf
 (keine globale Freischaltung), write_vhost_file legt vor dem Überschreiben
 automatisch ein Backup der alten Version an.
 
@@ -60,14 +62,21 @@ from __future__ import annotations
 
 import base64
 import datetime
+import hashlib
+import hmac
+import ipaddress
 import json
 import logging
 import os
 import posixpath
 import re
 import shlex
+import secrets
 import stat
+import struct
 import sys
+import threading
+import time
 from typing import Any
 
 import paramiko
@@ -103,7 +112,7 @@ if _HTTP_MODE and not _MCP_API_KEY:
 # Dateien (server.py, Dockerfile, requirements.txt, Workflow) geaendert haben.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.9"
+_VERSION_BASE = "0.10"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -553,23 +562,6 @@ def _assert_real_within_vhost(sftp, full: str, domain: str) -> None:
         )
 
 
-def _sftp_makedirs(sftp, remote_dir: str, mode: int = 0o755) -> list[str]:
-    """Legt ein Verzeichnis inkl. Eltern über SFTP an, falls es noch nicht
-    existiert - paramikos SFTPClient hat kein makedirs eingebaut. Gibt die
-    neu angelegten Verzeichnisse zurück (oberstes zuerst)."""
-    if remote_dir in ("", "/", _VHOST_BASE):
-        return []
-    try:
-        sftp.stat(remote_dir)
-        return []
-    except FileNotFoundError:
-        pass
-    created = _sftp_makedirs(sftp, remote_dir.rsplit("/", 1)[0], mode)
-    sftp.mkdir(remote_dir, mode)
-    created.append(remote_dir)
-    return created
-
-
 def _client_exec(
     client: paramiko.SSHClient,
     command: str,
@@ -584,114 +576,6 @@ def _client_exec(
     out = stdout.read().decode("utf-8", errors="replace")
     err = stderr.read().decode("utf-8", errors="replace")
     return out, err, stdout.channel.recv_exit_status()
-
-
-def _primary_gid(client: paramiko.SSHClient, uid: int) -> int:
-    """Primäre Gruppe des Users (getent passwd, Feld 4) - bei Plesk-
-    Subscription-Usern psacln."""
-    out, _, rc = _client_exec(client, f"getent passwd {int(uid)} | cut -d: -f4")
-    gid = out.strip()
-    if rc != 0 or not gid.isdigit():
-        raise ValueError(
-            f"Primäre Gruppe von uid {uid} nicht ermittelbar - es wurde nichts geschrieben."
-        )
-    return int(gid)
-
-
-def _vhost_owner_reference(
-    sftp, client: paramiko.SSHClient, full: str, domain: str
-) -> tuple[int, int]:
-    """uid/gid für neue bzw. von root umzustellende Einträge unter
-    /var/www/vhosts/<domain>/. User: Besitzer des nächsten bereits
-    existierenden übergeordneten Ordners (lstat, Symlinks werden
-    übersprungen); gehört dieser root, der Besitzer von httpdocs, sonst der
-    von /var/www/vhosts/<domain>/ (Subscription-User) - nie root. Gehören
-    alle root, wird abgebrochen. Gruppe: immer die primäre Gruppe dieses
-    Users (psacln). Die psaserv-Gruppe von httpdocs selbst (damit der
-    Webserver hineinkommt) wird bewusst nicht übernommen."""
-    base = f"{_VHOST_BASE}/{_domain_arg(domain)}"
-    probe = full.rsplit("/", 1)[0]
-    ref = None
-    while probe == base or probe.startswith(base + "/"):
-        try:
-            st = sftp.lstat(probe)
-            if stat.S_ISDIR(st.st_mode):
-                ref = st
-                break
-        except FileNotFoundError:
-            pass
-        probe = probe.rsplit("/", 1)[0]
-    uid = ref.st_uid if ref is not None else 0
-    for fallback in (f"{base}/httpdocs", base):
-        if uid != 0:
-            break
-        try:
-            st = sftp.lstat(fallback)
-        except FileNotFoundError:
-            continue
-        if stat.S_ISDIR(st.st_mode):
-            uid = st.st_uid
-    if uid == 0:
-        raise ValueError(
-            f"Referenzordner, {base}/httpdocs und {base} gehören root (oder "
-            "fehlen) - Subscription-User für den Besitzer nicht ermittelbar, "
-            "es wurde nichts geschrieben."
-        )
-    gid = _primary_gid(client, uid)
-    if gid == 0:
-        raise ValueError(
-            f"Primäre Gruppe von uid {uid} ist root - es wurde nichts geschrieben."
-        )
-    return uid, gid
-
-
-def _owner_names(client: paramiko.SSHClient, uid: int, gid: int) -> str:
-    """Liefert "user:group" zu uid/gid (via getent), numerisch als Fallback."""
-    out, _, _ = _client_exec(
-        client,
-        f'echo "$(getent passwd {int(uid)} | cut -d: -f1):$(getent group {int(gid)} | cut -d: -f1)"',
-    )
-    user, _, group = out.strip().partition(":")
-    return f"{user or uid}:{group or gid}"
-
-
-def _chown_nofollow(client: paramiko.SSHClient, path: str, uid: int, gid: int) -> None:
-    """chown -h: ändert nie das Ziel eines Symlinks (SFTP-SETSTAT würde folgen)."""
-    _, err, rc = _client_exec(
-        client, f"chown -h -- {int(uid)}:{int(gid)} {shlex.quote(path)}"
-    )
-    if rc != 0:
-        raise SSHError(f"chown für '{path}' fehlgeschlagen: {err.strip()}")
-
-
-def _fix_root_dirs_in_httpdocs(
-    sftp, client: paramiko.SSHClient, full: str, domain: str, uid: int, gid: int
-) -> list[str]:
-    """Stellt bestehende übergeordnete Ordner von full, die root gehören, auf
-    uid/gid um (z.B. von früheren Versionen angelegte wp-content/mu-plugins).
-    httpdocs selbst bekommt uid:psaserv (Plesk-Standard, damit der Webserver
-    hineinkommt). Nur httpdocs und darunter - ausserhalb (conf/, logs/ ...)
-    sind root-Ordner von Plesk so vorgesehen."""
-    httpdocs = f"{_VHOST_BASE}/{_domain_arg(domain)}/httpdocs"
-    fixed: list[str] = []
-    probe = full.rsplit("/", 1)[0]
-    while probe == httpdocs or probe.startswith(httpdocs + "/"):
-        st = sftp.lstat(probe)
-        if stat.S_ISDIR(st.st_mode) and (st.st_uid == 0 or st.st_gid == 0):
-            dir_gid = gid
-            if probe == httpdocs:
-                out, _, rc = _client_exec(client, "getent group psaserv | cut -d: -f3")
-                if rc != 0 or not out.strip().isdigit():
-                    raise ValueError(
-                        f"{httpdocs} gehört root, Gruppe psaserv nicht gefunden - "
-                        "es wurde nichts geschrieben."
-                    )
-                dir_gid = int(out.strip())
-            _chown_nofollow(client, probe, uid, dir_gid)
-            fixed.append(probe)
-        probe = probe.rsplit("/", 1)[0]
-    fixed.reverse()
-    return fixed
 
 
 # ---------------------------------------------------------------------------
@@ -1467,6 +1351,10 @@ def write_vhost_file(
         raise ValueError("encoding muss 'text' oder 'base64' sein.")
 
     full = _vhost_path(domain, path)
+    base = f"{_VHOST_BASE}/{_domain_arg(domain)}"
+    if full == base:
+        raise ValueError("path muss auf eine Datei zeigen.")
+    parts = full[len(base) + 1:].split("/")
 
     if encoding == "base64":
         try:
@@ -1476,125 +1364,28 @@ def write_vhost_file(
     else:
         data = content.encode("utf-8")
 
-    client = _ssh_connect()
+    # Gemeinsame Schreiblogik mit Upload/Fetch (Helper auf dem Plesk-Server,
+    # siehe _HELPER_SRC): Temp-Datei, Backup, atomarer rename, Besitzer.
     try:
-        sftp = client.open_sftp()
-        try:
-            _assert_real_within_vhost(sftp, full, domain)
-            exists = False
-            backup_note = ""
-            try:
-                lst = sftp.lstat(full)
-                if stat.S_ISLNK(lst.st_mode):
-                    raise ValueError(
-                        f"'{full}' ist ein Symlink - wird aus Sicherheitsgründen "
-                        "nicht überschrieben."
-                    )
-                if not stat.S_ISREG(lst.st_mode):
-                    raise ValueError(f"'{full}' ist keine reguläre Datei.")
-                exists = True
-            except FileNotFoundError:
-                exists = False
+        res = _helper_put(_helper_args(base, parts=parts, max_bytes=len(data)), [data])
+    except _HelperError as e:
+        if e.code == "target_symlink":
+            raise ValueError(f"'{full}' ist ein Symlink - wird aus Sicherheitsgründen nicht überschrieben.")
+        raise ValueError(_helper_message(e))
 
-            httpdocs = f"{_VHOST_BASE}/{_domain_arg(domain)}/httpdocs"
-            in_httpdocs = full.startswith(httpdocs + "/")
-            fix_owner = False
-            if exists:
-                # Bestehende Datei: Besitzer/Gruppe/Rechte der alten Datei.
-                # Gehört sie unter httpdocs root (z.B. von einer früheren
-                # Version dieses Tools angelegt), wird sie auf den
-                # Subscription-User umgestellt.
-                uid, gid = lst.st_uid, lst.st_gid
-                file_mode = stat.S_IMODE(lst.st_mode)
-                if in_httpdocs and (uid == 0 or gid == 0):
-                    uid, gid = _vhost_owner_reference(sftp, client, full, domain)
-                    fix_owner = True
-                elif uid == 0:
-                    # Nie mit root abschliessen. Ausserhalb von httpdocs
-                    # (z.B. conf/) wird eine root-Datei bewusst nicht an den
-                    # Kunden übergeben.
-                    raise ValueError(
-                        f"'{full}' gehört root und liegt ausserhalb von httpdocs - "
-                        "wird nicht überschrieben (Ergebnis wäre root-eigen)."
-                    )
-                with sftp.open(full, "rb") as f:
-                    # fstat des geöffneten Handles muss zum lstat passen -
-                    # sonst wurde die Datei zwischenzeitlich (z.B. gegen einen
-                    # Symlink) ausgetauscht.
-                    fst = f.stat()
-                    if (fst.st_uid, fst.st_gid, fst.st_mode, fst.st_size) != (
-                        lst.st_uid, lst.st_gid, lst.st_mode, lst.st_size
-                    ):
-                        raise ValueError(
-                            f"'{full}' wurde während des Schreibvorgangs verändert - abgebrochen."
-                        )
-                    old_data = f.read()
-                timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-                backup_path = f"{full}.bak-{timestamp}"
-                # "x" = O_EXCL (plus "w" für Schreibzugriff): legt nie etwas durch einen vorhandenen Symlink an;
-                # chown/chmod laufen über das Handle (fchown/fchmod).
-                with sftp.open(backup_path, "wbx") as f:
-                    f.chown(uid, gid)
-                    f.chmod(file_mode)
-                    f.write(old_data)
-                backup_note = f" Backup der alten Version: {backup_path}"
-                created_dirs: list[str] = []
-            else:
-                uid, gid = _vhost_owner_reference(sftp, client, full, domain)
-                file_mode = 0o644
-                created_dirs = _sftp_makedirs(sftp, full.rsplit("/", 1)[0])
-                for d in created_dirs:
-                    dst = sftp.lstat(d)
-                    if not stat.S_ISDIR(dst.st_mode):
-                        raise ValueError(f"'{d}' ist kein Ordner mehr - abgebrochen.")
-                    if stat.S_IMODE(dst.st_mode) != 0o755:
-                        sftp.chmod(d, 0o755)
-                    _chown_nofollow(client, d, uid, gid)
-
-            fixed_dirs = _fix_root_dirs_in_httpdocs(sftp, client, full, domain, uid, gid)
-
-            if exists and not fix_owner:
-                # Überschreiben behält Inode und damit Besitzer/Gruppe/Rechte.
-                with sftp.open(full, "wb") as f:
-                    f.write(data)
-            elif exists:
-                # Besitzerwechsel: neue Datei exklusiv anlegen, per Handle
-                # anpassen und atomar über die alte umbenennen - rename folgt
-                # keinem Symlink am Ziel.
-                tmp_path = f"{full}.tmp-{os.urandom(6).hex()}"
-                with sftp.open(tmp_path, "wbx") as f:
-                    f.chown(uid, gid)
-                    f.chmod(file_mode)
-                    f.write(data)
-                try:
-                    sftp.posix_rename(tmp_path, full)
-                except Exception:
-                    sftp.remove(tmp_path)
-                    raise
-            else:
-                try:
-                    f = sftp.open(full, "wbx")
-                except IOError as e:
-                    raise ValueError(f"'{full}' konnte nicht neu angelegt werden: {e}")
-                with f:
-                    f.chown(uid, gid)
-                    f.chmod(file_mode)
-                    f.write(data)
-            owner = _owner_names(client, uid, gid)
-        finally:
-            sftp.close()
-    finally:
-        client.close()
-
-    verb = "Überschrieben" if exists else "Neu erstellt"
-    dirs_note = f" Neu angelegte Ordner: {', '.join(created_dirs)}." if created_dirs else ""
-    if fix_owner:
-        dirs_note += " Besitzer der Datei von root umgestellt."
-    if fixed_dirs:
-        dirs_note += f" Ordner von root umgestellt: {', '.join(fixed_dirs)}."
+    verb = "Überschrieben" if res["existed"] else "Neu erstellt"
+    note = ""
+    if res["created"]:
+        note += " Neu angelegte Ordner: " + ", ".join(f"{base}/{c}" for c in res["created"]) + "."
+    if res["fix_owner"]:
+        note += " Besitzer der Datei von root umgestellt."
+    if res["fixed"]:
+        note += " Ordner von root umgestellt: " + ", ".join(f"{base}/{c}" for c in res["fixed"]) + "."
+    if res["backup"]:
+        note += f" Backup der alten Version: {base}/{res['backup']}"
     return (
-        f"{verb}: {full} ({len(data)} Bytes). Besitzer: {owner}, "
-        f"Rechte: {file_mode:04o}.{dirs_note}{backup_note}"
+        f"{verb}: {full} ({res['size']} Bytes). Besitzer: {res['owner']}, "
+        f"Rechte: {res['mode']}.{note}"
     )
 
 
@@ -1645,6 +1436,1741 @@ def delete_vhost_backup(domain: str, path: str, confirm: bool = False) -> str:
 # NICHT die aktuell vom Webserver beschriebene Datei ist.
 _ROTATED_LOG_RE = re.compile(r"(\.gz|\.\d+|-\d{8})$")
 _LOG_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+# ---------------------------------------------------------------------------
+# Vhost-Dateien: Helper auf dem Plesk-Server, Upload, Fetch, Verschieben,
+# Löschen/Papierkorb
+# ---------------------------------------------------------------------------
+#
+# Der Container hat keinen direkten Dateisystemzugriff auf den Plesk-Server.
+# Alle Dateioperationen laufen über einen kleinen Python-Helper (_HELPER_SRC),
+# der per SSH auf dem Plesk-Server gestartet wird und dort ausschliesslich mit
+# Verzeichnis-Handles arbeitet (openat/O_NOFOLLOW/renameat2). Dadurch kann
+# zwischen Prüfung und Aktion kein Symlink untergeschoben werden. Datei-Inhalte
+# (write_vhost_file, Upload, Fetch) werden in Frames über die SSH-Verbindung
+# gestreamt - nie komplett im RAM, nie durch den LLM-Kontext.
+
+_HELPER_PYTHON = os.environ.get("PLESK_HELPER_PYTHON", "/usr/libexec/platform-python").strip()
+_HELPER_TIMEOUT = int(os.environ.get("PLESK_HELPER_TIMEOUT", "600"))
+_UPLOAD_MAX_BYTES = int(os.environ.get("UPLOAD_MAX_BYTES", str(25 * 1024 * 1024)))
+_UPLOAD_TOKEN_TTL = 300
+_UPLOAD_RATE_LIMIT = int(os.environ.get("UPLOAD_RATE_LIMIT_PER_MIN", "20"))
+_UPLOAD_MAX_CONCURRENT = int(os.environ.get("UPLOAD_MAX_CONCURRENT", "2"))
+_UPLOAD_MIN_FREE = int(os.environ.get("UPLOAD_MIN_FREE_MB", "256")) * 1024 * 1024
+_UPLOAD_TIMEOUT = int(os.environ.get("UPLOAD_TIMEOUT", "300"))
+_UPLOAD_TRUSTED_PROXIES = {
+    p.strip() for p in os.environ.get("UPLOAD_TRUSTED_PROXIES", "").split(",") if p.strip()
+}
+_PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
+_FETCH_TIMEOUT = int(os.environ.get("FETCH_TIMEOUT", "120"))
+_FETCH_MAX_REDIRECTS = 3
+_TRASH_MAX_BYTES = int(os.environ.get("VHOST_TRASH_MAX_MB", "500")) * 1024 * 1024
+_TRASH_AUTOCLEAN_DAYS = int(os.environ.get("VHOST_TRASH_AUTOCLEAN_DAYS", "0"))
+_DELETE_TOKEN_TTL = 900
+_AUDIT_LOG_FILE = os.environ.get("AUDIT_LOG_FILE", "").strip()
+
+# Ausführbare Dateien: nur mit allow_executable=true UND confirm=true.
+_EXEC_SUFFIXES = [
+    "php", "php3", "php4", "php5", "php7", "php8", "phtml", "pht", "phps", "phar",
+    "cgi", "pl", "py", "sh",
+]
+_EXEC_NAMES = [".htaccess", ".user.ini"]
+
+# Geschützt (immer ablehnen): Unterbäume direkt im Vhost-Root.
+_PROTECTED_TOP = {
+    "conf", "logs", "statistics", ".ssh", ".mcp-trash",
+    "mail", "maildir", "mailnames",
+    # chroot-Skelett der Plesk-Shell (bin -> usr/bin, dev, etc ...)
+    "bin", "dev", "etc", "lib", "lib64", "usr", "var", "tmp",
+}
+_GLOB_CHARS = set("*?[]{}")
+
+_HELPER_SRC = r'''# plesk-mcp vhost helper - läuft per SSH auf dem Plesk-Server (Python >= 3.6).
+# Arbeitet ausschliesslich über Verzeichnis-Handles (openat/O_NOFOLLOW), damit
+# zwischen Prüfung und Aktion kein Symlink untergeschoben werden kann.
+import base64
+import ctypes
+import errno
+import grp
+import hashlib
+import json
+import os
+import pwd
+import re
+import stat
+import struct
+import sys
+import time
+
+O_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+TRASH = ".mcp-trash"
+META = ".mcp-trash-meta.json"
+SCAN_MAX = 200000
+ENTRY_RE = re.compile(r"^\d{14}(-\d+)?$")
+
+
+class HErr(Exception):
+    def __init__(self, code, detail=""):
+        Exception.__init__(self, code)
+        self.code = code
+        self.detail = detail
+
+
+def check_parts(parts, allow_empty=False):
+    if not isinstance(parts, list) or (not parts and not allow_empty):
+        raise HErr("bad_path")
+    for p in parts:
+        if (not isinstance(p, str) or p in ("", ".", "..") or "/" in p or "\0" in p
+                or len(p.encode("utf-8")) > 255):
+            raise HErr("bad_path")
+    return parts
+
+
+def join(parts):
+    return "/".join(parts)
+
+
+def open_abs(path):
+    fd = os.open("/", O_DIR)
+    for comp in [c for c in path.split("/") if c]:
+        try:
+            nfd = os.open(comp, O_DIR, dir_fd=fd)
+        except OSError:
+            os.close(fd)
+            raise HErr("base_unavailable")
+        os.close(fd)
+        fd = nfd
+    return fd
+
+
+def lst(dfd, name):
+    try:
+        return os.stat(name, dir_fd=dfd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def open_dir(dfd, name, rel):
+    try:
+        return os.open(name, O_DIR, dir_fd=dfd)
+    except FileNotFoundError:
+        raise HErr("not_found", rel)
+    except OSError as e:
+        if e.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise HErr("symlink_in_path", rel)
+        raise
+
+
+def psaserv_gid():
+    try:
+        return grp.getgrnam("psaserv").gr_gid
+    except KeyError:
+        raise HErr("psaserv_missing")
+
+
+def walk(base_fd, parts, create=None, fix=None, prefix=()):
+    """Öffnet base/parts Komponente für Komponente ohne Symlinks zu folgen.
+    create: {"uid","gid","mode"} legt fehlende Ordner an. fix: {"uid","gid"}
+    stellt root-eigene Ordner unter httpdocs um (httpdocs selbst auf psaserv)."""
+    fd = os.dup(base_fd)
+    rel = list(prefix)
+    created = []
+    fixed = []
+    try:
+        for comp in parts:
+            rel.append(comp)
+            try:
+                nfd = os.open(comp, O_DIR, dir_fd=fd)
+            except FileNotFoundError:
+                if create is None:
+                    raise HErr("not_found", join(rel))
+                os.mkdir(comp, 0o700, dir_fd=fd)
+                nfd = open_dir(fd, comp, join(rel))
+                os.fchown(nfd, create["uid"], create["gid"])
+                os.fchmod(nfd, create["mode"])
+                created.append(join(rel))
+            except OSError as e:
+                if e.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise HErr("symlink_in_path", join(rel))
+                raise
+            os.close(fd)
+            fd = nfd
+            if fix is not None and rel[0] == "httpdocs":
+                st = os.fstat(fd)
+                if st.st_uid == 0 or st.st_gid == 0:
+                    gid = psaserv_gid() if len(rel) == 1 else fix["gid"]
+                    os.fchown(fd, fix["uid"], gid)
+                    fixed.append(join(rel))
+        return fd, created, fixed
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def ref_owner(base_fd, dparts):
+    """User: nächster existierender Ordner, sonst httpdocs, sonst Vhost-Root -
+    nie root. Gruppe: primäre Gruppe des Users."""
+    fd = os.dup(base_fd)
+    base_uid = os.fstat(fd).st_uid
+    uid = base_uid
+    try:
+        for comp in dparts:
+            try:
+                nfd = os.open(comp, O_DIR, dir_fd=fd)
+            except FileNotFoundError:
+                break
+            except OSError as e:
+                if e.errno in (errno.ELOOP, errno.ENOTDIR):
+                    raise HErr("symlink_in_path", comp)
+                raise
+            os.close(fd)
+            fd = nfd
+            uid = os.fstat(fd).st_uid
+    finally:
+        os.close(fd)
+    if uid == 0:
+        st = lst(base_fd, "httpdocs")
+        if st is not None and stat.S_ISDIR(st.st_mode):
+            uid = st.st_uid
+    if uid == 0:
+        uid = base_uid
+    if uid == 0:
+        raise HErr("owner_root")
+    try:
+        gid = pwd.getpwuid(uid).pw_gid
+    except KeyError:
+        raise HErr("owner_unknown")
+    if gid == 0:
+        raise HErr("owner_root")
+    return uid, gid
+
+
+def names(uid, gid):
+    try:
+        u = pwd.getpwuid(uid).pw_name
+    except KeyError:
+        u = str(uid)
+    try:
+        g = grp.getgrgid(gid).gr_name
+    except KeyError:
+        g = str(gid)
+    return u + ":" + g
+
+
+_renameat2 = None
+
+
+def rename_noreplace(sfd, sname, dfd, dname):
+    """renameat2(RENAME_NOREPLACE): schlägt fehl, wenn das Ziel existiert."""
+    global _renameat2
+    if _renameat2 is None:
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            _renameat2 = getattr(libc, "renameat2")
+        except (OSError, AttributeError):
+            _renameat2 = False
+    if _renameat2:
+        r = _renameat2(sfd, sname.encode("utf-8"), dfd, dname.encode("utf-8"), 1)
+        if r == 0:
+            return
+        e = ctypes.get_errno()
+        if e == errno.EEXIST:
+            raise HErr("exists")
+        if e == errno.EXDEV:
+            raise HErr("cross_device")
+        if e not in (errno.ENOSYS, errno.EINVAL):
+            raise OSError(e, os.strerror(e))
+    if lst(dfd, dname) is not None:
+        raise HErr("exists")
+    rename(sfd, sname, dfd, dname)
+
+
+def rename(sfd, sname, dfd, dname):
+    try:
+        os.rename(sname, dname, src_dir_fd=sfd, dst_dir_fd=dfd)
+    except OSError as e:
+        if e.errno == errno.EXDEV:
+            raise HErr("cross_device")
+        if e.errno == errno.EINVAL:
+            raise HErr("invalid_move")
+        raise
+
+
+def copy_file(dfd, src_name, dst_name, uid, gid, mode, expect_ino):
+    """Kopiert eine reguläre Datei im selben Ordner (Backup), ohne Symlinks."""
+    sfd = os.open(src_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dfd)
+    try:
+        st = os.fstat(sfd)
+        if not stat.S_ISREG(st.st_mode) or st.st_ino != expect_ino:
+            raise HErr("changed")
+        tfd = os.open(dst_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                      0o600, dir_fd=dfd)
+        try:
+            os.fchown(tfd, uid, gid)
+            os.fchmod(tfd, mode)
+            while True:
+                buf = os.read(sfd, 1048576)
+                if not buf:
+                    break
+                while buf:
+                    n = os.write(tfd, buf)
+                    buf = buf[n:]
+            os.fsync(tfd)
+        finally:
+            os.close(tfd)
+    finally:
+        os.close(sfd)
+
+
+def is_exec(name, a):
+    n = name.lower()
+    if n in a.get("exec_names", []):
+        return True
+    segs = n.split(".")[1:]
+    return any(s in a.get("exec_suffixes", []) for s in segs)
+
+
+def scan(pfd, name, rel, a):
+    """Rekursive Auflistung ohne Symlinks zu folgen (für Dry-Run/Token)."""
+    st = lst(pfd, name)
+    if st is None:
+        raise HErr("not_found", rel)
+    entries = []
+    state = {"exec": False, "size": 0}
+
+    def rec(dfd, nm, r, s):
+        if len(entries) >= SCAN_MAX:
+            raise HErr("too_many_entries")
+        if stat.S_ISLNK(s.st_mode):
+            typ = "link"
+        elif stat.S_ISDIR(s.st_mode):
+            typ = "dir"
+        elif stat.S_ISREG(s.st_mode):
+            typ = "file"
+        else:
+            typ = "other"
+        size = 0 if typ == "dir" else s.st_size
+        state["size"] += size
+        entries.append([r, typ, size, s.st_mtime_ns, s.st_ino])
+        if is_exec(nm, a):
+            state["exec"] = True
+        if typ == "dir":
+            fd = open_dir(dfd, nm, r)
+            try:
+                for c in sorted(os.listdir(fd)):
+                    cs = lst(fd, c)
+                    if cs is not None:
+                        rec(fd, c, r + "/" + c, cs)
+            finally:
+                os.close(fd)
+
+    rec(pfd, name, rel, st)
+    digest = hashlib.sha256(json.dumps(entries, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return {
+        "type": entries[0][1],
+        "files": sum(1 for e in entries if e[1] != "dir"),
+        "dirs": sum(1 for e in entries if e[1] == "dir"),
+        "size": state["size"],
+        "has_exec": state["exec"],
+        "digest": digest,
+        "paths": [e[0] for e in entries[:50]],
+        "ino": st.st_ino,
+    }
+
+
+def rm_tree(pfd, name):
+    st = lst(pfd, name)
+    if st is None:
+        return
+    if stat.S_ISDIR(st.st_mode):
+        fd = open_dir(pfd, name, name)
+        try:
+            for c in os.listdir(fd):
+                rm_tree(fd, c)
+        finally:
+            os.close(fd)
+        os.rmdir(name, dir_fd=pfd)
+    else:
+        os.unlink(name, dir_fd=pfd)
+
+
+def read_frames(tfd, max_bytes):
+    h = hashlib.sha256()
+    size = 0
+    inp = sys.stdin.buffer
+    while True:
+        hdr = inp.read(4)
+        if len(hdr) != 4:
+            raise HErr("incomplete")
+        (n,) = struct.unpack(">I", hdr)
+        if n == 0:
+            break
+        size += n
+        if size > max_bytes:
+            raise HErr("too_large")
+        while n:
+            buf = inp.read(min(n, 1048576))
+            if not buf:
+                raise HErr("incomplete")
+            n -= len(buf)
+            h.update(buf)
+            while buf:
+                w = os.write(tfd, buf)
+                buf = buf[w:]
+    try:
+        commit = json.loads(inp.readline().decode("utf-8"))
+    except ValueError:
+        raise HErr("incomplete")
+    return size, h.hexdigest(), commit
+
+
+def plan_put(base_fd, parts):
+    dparts, name = parts[:-1], parts[-1]
+    in_httpdocs = len(parts) >= 2 and parts[0] == "httpdocs"
+    try:
+        pfd, _, _ = walk(base_fd, dparts)
+    except HErr as e:
+        if e.code != "not_found":
+            raise
+        pfd = None
+    try:
+        st = lst(pfd, name) if pfd is not None else None
+    finally:
+        if pfd is not None:
+            os.close(pfd)
+    plan = {"exists": st is not None, "fix_owner": False}
+    if st is not None:
+        if stat.S_ISLNK(st.st_mode):
+            raise HErr("target_symlink", join(parts))
+        if not stat.S_ISREG(st.st_mode):
+            raise HErr("target_not_file", join(parts))
+        uid, gid, mode = st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode)
+        if in_httpdocs and (uid == 0 or gid == 0):
+            uid, gid = ref_owner(base_fd, dparts)
+            plan["fix_owner"] = True
+        elif uid == 0:
+            raise HErr("target_root_outside_httpdocs", join(parts))
+        plan.update(ino=st.st_ino, old_uid=st.st_uid, old_gid=st.st_gid, old_mode=st.st_mode, old_size=st.st_size)
+    else:
+        uid, gid = ref_owner(base_fd, dparts)
+        mode = 0o644
+    plan.update(uid=uid, gid=gid, mode=mode, owner=names(uid, gid))
+    return plan
+
+
+def op_plan(a):
+    base_fd = open_abs(a["base"])
+    try:
+        return plan_put(base_fd, check_parts(a["parts"]))
+    finally:
+        os.close(base_fd)
+
+
+def op_put(a):
+    parts = check_parts(a["parts"])
+    dparts, name = parts[:-1], parts[-1]
+    base_fd = open_abs(a["base"])
+    dfd = None
+    tmp = None
+    try:
+        p = plan_put(base_fd, parts)
+        uid, gid, mode = p["uid"], p["gid"], p["mode"]
+        dfd, created, fixed = walk(base_fd, dparts, create={"uid": uid, "gid": gid, "mode": 0o755},
+                                   fix={"uid": uid, "gid": gid})
+        st = lst(dfd, name)
+        if (st is not None) != p["exists"] or (st is not None and (
+                st.st_ino != p["ino"] or st.st_uid != p["old_uid"] or st.st_gid != p["old_gid"]
+                or st.st_mode != p["old_mode"])):
+            raise HErr("changed", join(parts))
+        vfs = os.fstatvfs(dfd)
+        need = a["max_bytes"] + a.get("reserve", 0) + (p.get("old_size", 0) if p["exists"] else 0)
+        if vfs.f_bavail * vfs.f_frsize < need:
+            raise HErr("no_space")
+        tmp = "." + name[:200] + ".mcp-" + os.urandom(4).hex() + ".tmp"
+        tfd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                      0o600, dir_fd=dfd)
+        try:
+            size, digest, commit = read_frames(tfd, a["max_bytes"])
+            if commit.get("sha256") != digest:
+                raise HErr("transfer_mismatch")
+            if a.get("sha256") and a["sha256"] != digest:
+                raise HErr("sha256_mismatch")
+            os.fchown(tfd, uid, gid)
+            os.fchmod(tfd, mode)
+            os.fsync(tfd)
+        finally:
+            os.close(tfd)
+        backup = None
+        if p["exists"]:
+            backup = name + ".bak-" + time.strftime("%Y%m%d%H%M%S")
+            copy_file(dfd, name, backup, uid, gid, mode, p["ino"])
+            rename(dfd, tmp, dfd, name)
+        else:
+            rename_noreplace(dfd, tmp, dfd, name)
+        tmp = None
+        os.fsync(dfd)
+        return {"size": size, "sha256": digest, "existed": p["exists"], "fix_owner": p["fix_owner"],
+                "owner": p["owner"], "mode": "%04o" % mode, "created": created, "fixed": fixed,
+                "backup": join(dparts + [backup]) if backup else None}
+    finally:
+        if tmp is not None and dfd is not None:
+            try:
+                os.unlink(tmp, dir_fd=dfd)
+            except OSError:
+                pass
+        if dfd is not None:
+            os.close(dfd)
+        os.close(base_fd)
+
+
+def mode_str(m):
+    return stat.filemode(m)
+
+
+def op_list(a):
+    parts = check_parts(a["parts"], allow_empty=True)
+    base_fd = open_abs(a["base"])
+    out = []
+    state = {"truncated": False}
+    limit = a["max_entries"]
+
+    def entry(r, s):
+        if stat.S_ISLNK(s.st_mode):
+            typ = "symlink"
+        elif stat.S_ISDIR(s.st_mode):
+            typ = "dir"
+        elif stat.S_ISREG(s.st_mode):
+            typ = "file"
+        else:
+            typ = "other"
+        out.append({"path": r, "type": typ, "size": s.st_size, "mode": mode_str(s.st_mode),
+                    "owner": names(s.st_uid, s.st_gid),
+                    "mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(s.st_mtime))})
+        return typ
+
+    def rec(fd, r, depth):
+        for c in sorted(os.listdir(fd)):
+            if len(out) >= limit:
+                state["truncated"] = True
+                return
+            s = lst(fd, c)
+            if s is None:
+                continue
+            cr = (r + "/" + c) if r else c
+            if entry(cr, s) == "dir" and depth > 1:
+                cfd = open_dir(fd, c, cr)
+                try:
+                    rec(cfd, cr, depth - 1)
+                finally:
+                    os.close(cfd)
+                if state["truncated"]:
+                    return
+
+    try:
+        if parts:
+            pfd, _, _ = walk(base_fd, parts[:-1])
+            try:
+                s = lst(pfd, parts[-1])
+                if s is None:
+                    raise HErr("not_found", join(parts))
+                if not stat.S_ISDIR(s.st_mode):
+                    entry(join(parts), s)
+                    return {"entries": out, "truncated": False}
+                dfd = open_dir(pfd, parts[-1], join(parts))
+            finally:
+                os.close(pfd)
+        else:
+            dfd = os.dup(base_fd)
+        try:
+            rec(dfd, join(parts), a["depth"])
+        finally:
+            os.close(dfd)
+        return {"entries": out, "truncated": state["truncated"]}
+    finally:
+        os.close(base_fd)
+
+
+def op_scan(a):
+    parts = check_parts(a["parts"])
+    base_fd = open_abs(a["base"])
+    try:
+        pfd, _, _ = walk(base_fd, parts[:-1])
+        try:
+            return scan(pfd, parts[-1], join(parts), a)
+        finally:
+            os.close(pfd)
+    finally:
+        os.close(base_fd)
+
+
+def open_trash(base_fd, owner, create):
+    st = lst(base_fd, TRASH)
+    if st is None:
+        if not create:
+            return None
+        os.mkdir(TRASH, 0o700, dir_fd=base_fd)
+        fd = open_dir(base_fd, TRASH, TRASH)
+        os.fchown(fd, owner["uid"], owner["gid"])
+        os.fchmod(fd, 0o700)
+        return fd
+    return open_dir(base_fd, TRASH, TRASH)
+
+
+def op_delete(a):
+    parts = check_parts(a["parts"])
+    name = parts[-1]
+    base_fd = open_abs(a["base"])
+    try:
+        pfd, _, _ = walk(base_fd, parts[:-1])
+        try:
+            info = scan(pfd, name, join(parts), a)
+            if info["type"] == "dir" and not a.get("digest"):
+                raise HErr("token_required")
+            if a.get("digest") and a["digest"] != info["digest"]:
+                raise HErr("listing_changed")
+            if info["has_exec"] and not a.get("allow_exec"):
+                raise HErr("executable")
+            if a["permanent"]:
+                rm_tree(pfd, name)
+                return {"permanent": True, "files": info["files"], "dirs": info["dirs"], "size": info["size"]}
+            if info["size"] > a["trash_max_bytes"]:
+                raise HErr("trash_too_large")
+            owner = a["owner"]
+            tfd = open_trash(base_fd, owner, True)
+            try:
+                ts = time.strftime("%Y%m%d%H%M%S")
+                entry = ts
+                n = 1
+                while True:
+                    try:
+                        os.mkdir(entry, 0o700, dir_fd=tfd)
+                        break
+                    except FileExistsError:
+                        n += 1
+                        entry = ts + "-" + str(n)
+                efd = open_dir(tfd, entry, entry)
+                try:
+                    os.fchown(efd, owner["uid"], owner["gid"])
+                    edfd, _, _ = walk(efd, parts[:-1], create={"uid": owner["uid"], "gid": owner["gid"], "mode": 0o700})
+                    try:
+                        st = lst(pfd, name)
+                        if st is None or st.st_ino != info["ino"]:
+                            raise HErr("listing_changed")
+                        rename_noreplace(pfd, name, edfd, name)
+                    except BaseException:
+                        os.close(edfd)
+                        rm_tree(tfd, entry)
+                        raise
+                    os.close(edfd)
+                    meta = json.dumps({"original_path": join(parts), "deleted_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                       "type": info["type"], "files": info["files"], "size": info["size"]})
+                    mfd = os.open(META, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                  0o600, dir_fd=efd)
+                    try:
+                        os.fchown(mfd, owner["uid"], owner["gid"])
+                        os.write(mfd, meta.encode("utf-8"))
+                        os.fsync(mfd)
+                    finally:
+                        os.close(mfd)
+                finally:
+                    os.close(efd)
+            finally:
+                os.close(tfd)
+            return {"permanent": False, "trash_entry": entry, "files": info["files"], "dirs": info["dirs"],
+                    "size": info["size"]}
+        finally:
+            os.close(pfd)
+    finally:
+        os.close(base_fd)
+
+
+def op_move(a):
+    src = check_parts(a["src"])
+    dst = check_parts(a["dst"])
+    base_fd = open_abs(a["base"])
+    spfd = dpfd = None
+    try:
+        spfd, _, _ = walk(base_fd, src[:-1])
+        info = scan(spfd, src[-1], join(src), a)
+        if (info["has_exec"] or is_exec(dst[-1], a)) and not a.get("allow_exec"):
+            raise HErr("executable")
+        create = None
+        if a.get("create_parents"):
+            uid, gid = ref_owner(base_fd, dst[:-1])
+            create = {"uid": uid, "gid": gid, "mode": 0o755}
+        dpfd, created, _ = walk(base_fd, dst[:-1], create=create)
+        dst_st = lst(dpfd, dst[-1])
+        backup = None
+        sst = lst(spfd, src[-1])
+        if sst is None or sst.st_ino != info["ino"]:
+            raise HErr("changed", join(src))
+        if dst_st is None:
+            rename_noreplace(spfd, src[-1], dpfd, dst[-1])
+        else:
+            if not a.get("overwrite"):
+                raise HErr("exists", join(dst))
+            if stat.S_ISLNK(dst_st.st_mode):
+                raise HErr("target_symlink", join(dst))
+            if not stat.S_ISREG(dst_st.st_mode) or stat.S_ISDIR(sst.st_mode):
+                raise HErr("target_not_file", join(dst))
+            backup = dst[-1] + ".bak-" + time.strftime("%Y%m%d%H%M%S")
+            copy_file(dpfd, dst[-1], backup, dst_st.st_uid, dst_st.st_gid, stat.S_IMODE(dst_st.st_mode), dst_st.st_ino)
+            rename(spfd, src[-1], dpfd, dst[-1])
+            backup = join(dst[:-1] + [backup])
+        os.fsync(dpfd)
+        return {"created": created, "backup": backup, "type": info["type"], "files": info["files"]}
+    finally:
+        for fd in (spfd, dpfd):
+            if fd is not None:
+                os.close(fd)
+        os.close(base_fd)
+
+
+def read_meta(efd):
+    try:
+        mfd = os.open(META, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=efd)
+    except OSError:
+        raise HErr("trash_meta_missing")
+    try:
+        data = b""
+        while len(data) < 65536:
+            buf = os.read(mfd, 65536)
+            if not buf:
+                break
+            data += buf
+    finally:
+        os.close(mfd)
+    try:
+        meta = json.loads(data.decode("utf-8"))
+        parts = check_parts(meta["original_path"].split("/"))
+    except (ValueError, KeyError, AttributeError, HErr):
+        raise HErr("trash_meta_invalid")
+    return meta, parts
+
+
+def op_trash_info(a):
+    base_fd = open_abs(a["base"])
+    try:
+        tfd = open_trash(base_fd, None, False)
+        if tfd is None:
+            raise HErr("trash_entry_missing")
+        try:
+            efd = open_dir(tfd, a["entry"], a["entry"])
+            try:
+                meta, _ = read_meta(efd)
+                return {"meta": meta}
+            finally:
+                os.close(efd)
+        except HErr as e:
+            if e.code == "not_found":
+                raise HErr("trash_entry_missing")
+            raise
+        finally:
+            os.close(tfd)
+    finally:
+        os.close(base_fd)
+
+
+def op_restore(a):
+    base_fd = open_abs(a["base"])
+    try:
+        tfd = open_trash(base_fd, None, False)
+        if tfd is None:
+            raise HErr("trash_entry_missing")
+        try:
+            try:
+                efd = open_dir(tfd, a["entry"], a["entry"])
+            except HErr:
+                raise HErr("trash_entry_missing")
+            try:
+                meta, parts = read_meta(efd)
+                if join(parts) != a["expect_path"]:
+                    raise HErr("changed")
+                ipfd, _, _ = walk(efd, parts[:-1])
+                try:
+                    info = scan(ipfd, parts[-1], join(parts), a)
+                    if info["has_exec"] and not a.get("allow_exec"):
+                        raise HErr("executable")
+                    tpfd, _, _ = walk(base_fd, parts[:-1])
+                    try:
+                        rename_noreplace(ipfd, parts[-1], tpfd, parts[-1])
+                    finally:
+                        os.close(tpfd)
+                finally:
+                    os.close(ipfd)
+            finally:
+                os.close(efd)
+            rm_tree(tfd, a["entry"])
+            return {"restored": join(parts), "type": info["type"], "files": info["files"]}
+        finally:
+            os.close(tfd)
+    finally:
+        os.close(base_fd)
+
+
+def entry_age_days(name, now):
+    try:
+        t = time.mktime(time.strptime(name[:14], "%Y%m%d%H%M%S"))
+    except ValueError:
+        return None
+    return (now - t) / 86400.0
+
+
+def empty_trash(base_fd, days, dry):
+    tfd = open_trash(base_fd, None, False)
+    if tfd is None:
+        return []
+    removed = []
+    now = time.time()
+    try:
+        for e in sorted(os.listdir(tfd)):
+            if not ENTRY_RE.match(e):
+                continue
+            age = entry_age_days(e, now)
+            if age is None or age < days:
+                continue
+            st = lst(tfd, e)
+            if st is None or not stat.S_ISDIR(st.st_mode):
+                continue
+            meta = None
+            try:
+                efd = open_dir(tfd, e, e)
+                try:
+                    meta, _ = read_meta(efd)
+                finally:
+                    os.close(efd)
+            except HErr:
+                pass
+            if not dry:
+                rm_tree(tfd, e)
+            removed.append({"entry": e, "original_path": (meta or {}).get("original_path"),
+                            "size": (meta or {}).get("size")})
+    finally:
+        os.close(tfd)
+    return removed
+
+
+def op_empty_trash(a):
+    base_fd = open_abs(a["base"])
+    try:
+        return {"removed": empty_trash(base_fd, a["days"], a.get("dry", False))}
+    finally:
+        os.close(base_fd)
+
+
+def op_empty_trash_all(a):
+    root_fd = open_abs(a["root"])
+    result = {}
+    try:
+        for d in sorted(os.listdir(root_fd)):
+            st = lst(root_fd, d)
+            if st is None or not stat.S_ISDIR(st.st_mode):
+                continue
+            try:
+                dfd = os.open(d, O_DIR, dir_fd=root_fd)
+            except OSError:
+                continue
+            try:
+                removed = empty_trash(dfd, a["days"], False)
+            except (HErr, OSError):
+                removed = []
+            finally:
+                os.close(dfd)
+            if removed:
+                result[d] = removed
+        return {"domains": result}
+    finally:
+        os.close(root_fd)
+
+
+OPS = {"plan": op_plan, "put": op_put, "list": op_list, "scan": op_scan, "delete": op_delete,
+       "move": op_move, "trash_info": op_trash_info, "restore": op_restore,
+       "empty_trash": op_empty_trash, "empty_trash_all": op_empty_trash_all}
+
+
+def main():
+    os.umask(0o077)
+    try:
+        op = OPS[sys.argv[1]]
+        args = json.loads(base64.b64decode(sys.argv[2]).decode("utf-8"))
+    except (IndexError, KeyError, ValueError):
+        res = {"ok": False, "error": "bad_request", "detail": ""}
+    else:
+        try:
+            res = op(args)
+            res["ok"] = True
+        except HErr as e:
+            res = {"ok": False, "error": e.code, "detail": e.detail}
+        except OSError as e:
+            res = {"ok": False, "error": "os_error", "detail": errno.errorcode.get(e.errno, "") if e.errno else ""}
+        except Exception as e:
+            res = {"ok": False, "error": "internal", "detail": type(e).__name__}
+    sys.stdout.write(json.dumps(res) + "\n")
+    sys.stdout.flush()
+
+
+main()
+'''
+
+
+class _HelperError(RuntimeError):
+    def __init__(self, code: str, detail: str = ""):
+        super().__init__(code)
+        self.code = code
+        self.detail = detail
+
+
+_HELPER_MESSAGES = {
+    "bad_path": "Ungültiger Pfad.",
+    "base_unavailable": "Vhost-Verzeichnis nicht gefunden oder kein regulärer Ordner.",
+    "not_found": "Nicht gefunden: {detail}",
+    "symlink_in_path": "Symlink oder kein Ordner im Pfad ({detail}) - aus Sicherheitsgründen abgelehnt.",
+    "target_symlink": "Ziel '{detail}' ist ein Symlink - wird nicht überschrieben.",
+    "target_not_file": "Ziel '{detail}' ist keine reguläre Datei.",
+    "target_root_outside_httpdocs": "'{detail}' gehört root und liegt ausserhalb von httpdocs - wird nicht überschrieben (Ergebnis wäre root-eigen).",
+    "owner_root": "Referenzordner, httpdocs und Vhost-Root gehören root - Subscription-User für den Besitzer nicht ermittelbar, es wurde nichts geschrieben.",
+    "owner_unknown": "Besitzer des Referenzordners ist kein bekannter System-User.",
+    "psaserv_missing": "Gruppe psaserv nicht gefunden.",
+    "changed": "'{detail}' wurde während der Aktion verändert - abgebrochen.",
+    "no_space": "Zu wenig freier Speicherplatz auf dem Server.",
+    "incomplete": "Übertragung unvollständig - nichts geschrieben.",
+    "too_large": "Grössenlimit überschritten - nichts geschrieben.",
+    "transfer_mismatch": "Prüfsumme nach der Übertragung stimmt nicht - nichts geschrieben.",
+    "sha256_mismatch": "sha256 stimmt nicht mit dem erwarteten Wert überein - Datei nicht ersetzt.",
+    "exists": "Ziel '{detail}' existiert bereits.",
+    "cross_device": "Quelle und Ziel liegen auf verschiedenen Dateisystemen - kein atomares Verschieben möglich.",
+    "invalid_move": "Ungültiges Verschieben (z.B. Ordner in sich selbst).",
+    "token_required": "Ordner nur zweistufig: zuerst dry_run=true, dann mit delete_token löschen.",
+    "listing_changed": "Inhalt hat sich seit dem Dry-Run geändert - abgebrochen. Neuen Dry-Run ausführen.",
+    "executable": "Enthält ausführbare Dateien (.php, .htaccess, ...) - nur mit allow_executable=true.",
+    "trash_too_large": "Zu gross für den Papierkorb - für endgültiges Löschen permanent=true verwenden.",
+    "too_many_entries": "Zu viele Einträge für eine einzelne Aktion.",
+    "trash_entry_missing": "Papierkorb-Eintrag nicht gefunden.",
+    "trash_meta_missing": "Metadaten des Papierkorb-Eintrags fehlen.",
+    "trash_meta_invalid": "Metadaten des Papierkorb-Eintrags sind ungültig.",
+    "bad_request": "Interner Fehler im Datei-Helper.",
+    "os_error": "Dateisystemfehler ({detail}).",
+    "internal": "Interner Fehler im Datei-Helper.",
+}
+
+
+def _helper_message(e: _HelperError) -> str:
+    return _HELPER_MESSAGES.get(e.code, "Fehler im Datei-Helper.").format(detail=e.detail)
+
+
+class _SSHHelperSession:
+    """Startet den Helper per SSH auf dem Plesk-Server."""
+
+    def __init__(self, op: str, args: dict[str, Any]):
+        payload = base64.b64encode(json.dumps(args).encode("utf-8")).decode("ascii")
+        cmd = (
+            f"{shlex.quote(_HELPER_PYTHON)} -I -c {shlex.quote(_HELPER_SRC)} "
+            f"{shlex.quote(op)} {payload}"
+        )
+        self.client = _ssh_connect()
+        try:
+            self.chan = self.client.get_transport().open_session()
+            self.chan.settimeout(_HELPER_TIMEOUT)
+            self.chan.exec_command(cmd)
+        except Exception:
+            self.client.close()
+            raise
+
+    def send(self, data: bytes) -> None:
+        self.chan.sendall(data)
+
+    def finish(self) -> bytes:
+        try:
+            self.chan.shutdown_write()
+            out = b""
+            while True:
+                buf = self.chan.recv(65536)
+                if not buf:
+                    break
+                out += buf
+            self.chan.recv_exit_status()
+            return out
+        finally:
+            self.client.close()
+
+    def abort(self) -> None:
+        self.client.close()
+
+
+# In Tests durch eine lokale Variante ersetzbar.
+_helper_session_factory = _SSHHelperSession
+
+
+def _helper_result(raw: bytes) -> dict[str, Any]:
+    for line in reversed(raw.decode("utf-8", errors="replace").strip().splitlines()):
+        try:
+            res = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(res, dict) and "ok" in res:
+            if not res["ok"]:
+                raise _HelperError(res.get("error", "internal"), res.get("detail", ""))
+            return res
+    raise _HelperError("internal")
+
+
+def _helper_args(base: str, **kw: Any) -> dict[str, Any]:
+    return {"base": base, "exec_suffixes": _EXEC_SUFFIXES, "exec_names": _EXEC_NAMES, **kw}
+
+
+def _helper(op: str, args: dict[str, Any]) -> dict[str, Any]:
+    session = _helper_session_factory(op, args)
+    return _helper_result(session.finish())
+
+
+def _frame(data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + data
+
+
+def _helper_put(args: dict[str, Any], chunks) -> dict[str, Any]:
+    """Streamt chunks (Iterable[bytes]) an den Helper (op put). Bricht bei
+    Überschreitung von max_bytes ab, ohne etwas zu schreiben."""
+    session = _helper_session_factory("put", args)
+    h = hashlib.sha256()
+    size = 0
+    try:
+        for chunk in chunks:
+            if not chunk:
+                continue
+            size += len(chunk)
+            if size > args["max_bytes"]:
+                raise _HelperError("too_large")
+            h.update(chunk)
+            for i in range(0, len(chunk), 1048576):
+                session.send(_frame(chunk[i:i + 1048576]))
+        session.send(_frame(b"") + json.dumps({"sha256": h.hexdigest()}).encode() + b"\n")
+    except BaseException:
+        session.abort()
+        raise
+    return _helper_result(session.finish())
+
+
+def _audit(action: str, **fields: Any) -> None:
+    """Audit-Log pro Aktion - nie Tokens, Passwörter oder Dateiinhalte."""
+    entry = {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+             "action": action, **fields}
+    line = json.dumps(entry, ensure_ascii=False)
+    print(f"AUDIT {line}", file=sys.stderr, flush=True)
+    if _AUDIT_LOG_FILE:
+        try:
+            with open(_AUDIT_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+
+def _strict_parts(path: str, allow_root: bool = False) -> list[str]:
+    """Relativer Pfad ohne "..", ".", absolute Pfade oder Wildcards."""
+    p = (path or "").strip()
+    if p in ("", ".") and allow_root:
+        return []
+    if not p or p.startswith("/") or "\\" in p or "\0" in p or len(p) > 4096:
+        raise ValueError(f"Ungültiger Pfad {path!r}: nur relative Pfade (z.B. httpdocs/bild.jpg).")
+    if _GLOB_CHARS & set(p):
+        raise ValueError(f"Ungültiger Pfad {path!r}: Wildcards/Globs sind nicht erlaubt.")
+    parts = p.rstrip("/").split("/")
+    for c in parts:
+        if c in ("", ".", ".."):
+            raise ValueError(f"Ungültiger Pfad {path!r}: '..', '.' und leere Teile sind nicht erlaubt.")
+        if len(c.encode("utf-8")) > 255:
+            raise ValueError(f"Ungültiger Pfad {path!r}: Name zu lang.")
+    return parts
+
+
+def _is_executable_name(name: str) -> bool:
+    n = name.lower()
+    return n in _EXEC_NAMES or any(s in _EXEC_SUFFIXES for s in n.split(".")[1:])
+
+
+def _protected_reason(parts: list[str], docroots: list[list[str]]) -> str | None:
+    """Grund, warum ein Pfad (relativ zum Vhost-Root) geschützt ist, sonst None."""
+    if not parts:
+        return "das Vhost-Root"
+    if parts in docroots:
+        return "ein Docroot"
+    top = parts[0]
+    if top.lower() in _PROTECTED_TOP:
+        return f"im geschützten Bereich '{top}'"
+    if top.startswith("."):
+        return "eine Dotfile/ein Dot-Ordner im Vhost-Root"
+    if parts[-1] == "cgi-bin" and (len(parts) == 1 or parts[:-1] in docroots):
+        return "cgi-bin"
+    return None
+
+
+def _check_not_protected(parts: list[str], ctx: dict[str, Any], what: str) -> None:
+    reason = _protected_reason(parts, ctx["docroots"])
+    if reason:
+        raise ValueError(f"{what} '{'/'.join(parts) or '.'}' ist {reason} und geschützt - abgelehnt.")
+
+
+def _vhost_ctx(domain: str) -> dict[str, Any]:
+    """Subscription-Daten aus der Plesk-DB: Vhost-Root, System-User und alle
+    Docroots der Subscription (relativ zum Vhost-Root)."""
+    d = _wp_domain(domain)
+    base = f"{_VHOST_BASE}/{d}"
+    client = _ssh_connect()
+    try:
+        sql = (
+            "SELECT d.id, d.webspace_id, s.login, s.home FROM domains d "
+            "JOIN hosting h ON h.dom_id = d.id JOIN sys_users s ON s.id = h.sys_user_id "
+            f"WHERE d.name = {_sql_quote(d)}"
+        )
+        out, _, rc = _client_exec(client, f"plesk db -Ne {shlex.quote(sql)}")
+        rows = [r.split("\t") for r in out.strip().splitlines() if r.strip()]
+        if rc != 0 or len(rows) != 1 or len(rows[0]) != 4:
+            raise ValueError(f"Domain '{d}' ist in Plesk nicht als Hosting vorhanden.")
+        dom_id, webspace_id, login, home = (c.strip() for c in rows[0])
+        if not dom_id.isdigit() or home != base or webspace_id not in ("0", "", "NULL"):
+            raise ValueError(
+                f"'{d}' ist keine Subscription mit eigenem Vhost-Verzeichnis - die "
+                "Hauptdomain der Subscription angeben."
+            )
+        if not _WP_SYSUSER_RE.match(login):
+            raise ValueError(f"Unerwarteter System-User für '{d}'.")
+        sql = (
+            "SELECT h.www_root FROM domains d JOIN hosting h ON h.dom_id = d.id "
+            f"WHERE d.id = {int(dom_id)} OR d.webspace_id = {int(dom_id)}"
+        )
+        out, _, rc = _client_exec(client, f"plesk db -Ne {shlex.quote(sql)}")
+        docroots = []
+        for r in out.strip().splitlines():
+            r = posixpath.normpath(r.strip())
+            if r.startswith(base + "/"):
+                docroots.append(r[len(base) + 1:].split("/"))
+        out, _, rc = _client_exec(client, f"id -u {shlex.quote(login)} && id -g {shlex.quote(login)}")
+        ids = out.split()
+        if rc != 0 or len(ids) != 2 or not all(i.isdigit() for i in ids) or "0" in ids:
+            raise ValueError(f"System-User von '{d}' nicht ermittelbar oder root.")
+    finally:
+        client.close()
+    if not docroots:
+        raise ValueError(f"Kein Docroot für '{d}' gefunden.")
+    return {"domain": d, "base": base, "login": login, "uid": int(ids[0]), "gid": int(ids[1]),
+            "docroots": docroots}
+
+
+def _docroot_of(parts: list[str], docroots: list[list[str]]) -> list[str] | None:
+    """Längstes Docroot, unter dem parts (echt) liegt."""
+    best = None
+    for dr in docroots:
+        if len(parts) > len(dr) and parts[:len(dr)] == dr and (best is None or len(dr) > len(best)):
+            best = dr
+    return best
+
+
+def _check_executable(parts: list[str], allow_executable: bool) -> None:
+    if _is_executable_name(parts[-1]) and not allow_executable:
+        raise ValueError(
+            f"'{parts[-1]}' ist ausführbar (.php, .htaccess, ...) - nur mit allow_executable=true."
+        )
+
+
+def _call(op: str, args: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return _helper(op, args)
+    except _HelperError as e:
+        raise ValueError(_helper_message(e))
+
+
+# --- Upload (Token + HTTP-Endpunkt) -----------------------------------------
+
+_uploads: dict[str, dict[str, Any]] = {}
+_uploads_lock = threading.Lock()
+_upload_active = 0
+_upload_rate: dict[str, list[float]] = {}
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_UPLOAD_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+
+
+def _upload_gc(now: float) -> None:
+    for uid, rec in list(_uploads.items()):
+        if rec["status"] == "pending" and now > rec["expires"]:
+            rec["status"] = "expired"
+        if now - rec["created"] > 86400:
+            del _uploads[uid]
+
+
+def _check_sha(sha256: str | None) -> str | None:
+    if sha256 is None or sha256 == "":
+        return None
+    s = sha256.strip().lower()
+    if not _SHA256_RE.match(s):
+        raise ValueError("sha256 muss 64 Hex-Zeichen sein.")
+    return s
+
+
+def _limit_bytes(max_bytes: int | None) -> int:
+    if max_bytes is None:
+        return _UPLOAD_MAX_BYTES
+    if not isinstance(max_bytes, int) or max_bytes < 1 or max_bytes > _UPLOAD_MAX_BYTES:
+        raise ValueError(f"max_bytes muss zwischen 1 und {_UPLOAD_MAX_BYTES} liegen.")
+    return max_bytes
+
+
+def _prepare_write(domain: str, path: str, allow_executable: bool) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
+    ctx = _vhost_ctx(domain)
+    parts = _strict_parts(path)
+    _check_not_protected(parts, ctx, "Ziel")
+    _check_executable(parts, allow_executable)
+    plan = _call("plan", _helper_args(ctx["base"], parts=parts))
+    return ctx, parts, plan
+
+
+@mcp.tool()
+def upload_begin(
+    domain: str,
+    path: str,
+    max_bytes: int | None = None,
+    sha256: str | None = None,
+    allow_executable: bool = False,
+    confirm: bool = False,
+) -> str:
+    """Bereitet einen Datei-Upload direkt in das Vhost-Verzeichnis vor - für
+    Binärdateien (Bilder, Schriften, ZIPs), ohne dass der Inhalt durch den
+    Chat läuft. Gibt upload_id, Upload-URL und ein einmaliges Token (5 Minuten
+    gültig) zurück; danach lädt der Client direkt hoch:
+    curl -X PUT -H "Authorization: Bearer <token>" --data-binary @datei <url>
+
+    path relativ zu /var/www/vhosts/<domain>/ (z.B. "httpdocs/img/logo.png").
+    max_bytes verkleinert das Server-Limit, sha256 (optional) wird nach dem
+    Upload geprüft - bei Abweichung wird nichts ersetzt. Ausführbare Dateien
+    (.php, .htaccess, ...) nur mit allow_executable=true. Bestehende Dateien
+    werden als <path>.bak-<Zeitstempel> gesichert. Erfordert confirm=true.
+    Status danach mit upload_status(upload_id) prüfen.
+    """
+    if not confirm:
+        raise ValueError("confirm=true erforderlich - der Upload schreibt auf dem Produktivserver.")
+    if not _HTTP_MODE or not _PUBLIC_BASE_URL:
+        raise ValueError("Upload nur im HTTP-Modus mit gesetzter PUBLIC_BASE_URL verfügbar.")
+    limit = _limit_bytes(max_bytes)
+    sha = _check_sha(sha256)
+    ctx, parts, plan = _prepare_write(domain, path, allow_executable)
+    upload_id = secrets.token_urlsafe(16)
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    with _uploads_lock:
+        _upload_gc(now)
+        if sum(1 for r in _uploads.values() if r["status"] == "pending") >= 50:
+            raise ValueError("Zu viele offene Uploads - später erneut versuchen.")
+        _uploads[upload_id] = {
+            "token_hash": hashlib.sha256(token.encode()).hexdigest(),
+            "domain": ctx["domain"], "base": ctx["base"], "parts": parts,
+            "max_bytes": limit, "sha256": sha, "created": now, "expires": now + _UPLOAD_TOKEN_TTL,
+            "status": "pending", "size": None, "sha256_actual": None, "error": None,
+        }
+    url = f"{_PUBLIC_BASE_URL}/upload/{upload_id}"
+    _audit("upload_begin", domain=ctx["domain"], path="/".join(parts), max_bytes=limit,
+           sha256=sha, upload_id=upload_id, result="ok")
+    return _json({
+        "upload_id": upload_id,
+        "upload_url": url,
+        "method": "PUT",
+        "token": token,
+        "expires_at": datetime.datetime.fromtimestamp(now + _UPLOAD_TOKEN_TTL, datetime.timezone.utc).isoformat(timespec="seconds"),
+        "max_bytes": limit,
+        "path": "/".join(parts),
+        "ueberschreibt": plan["exists"],
+        "besitzer": plan["owner"],
+        "curl": f'curl -X PUT -H "Authorization: Bearer {token}" --data-binary @<datei> {url}',
+        "hinweis": "Token ist einmalig und 5 Minuten gültig. Danach upload_status(upload_id) aufrufen.",
+    })
+
+
+@mcp.tool()
+def upload_status(upload_id: str) -> str:
+    """Status eines Uploads: pending/uploading/completed/expired/failed, mit
+    path, size und sha256 - zur Kontrolle nach dem Upload."""
+    with _uploads_lock:
+        _upload_gc(time.time())
+        rec = _uploads.get(upload_id.strip())
+        if rec is None:
+            raise ValueError("Unbekannte upload_id (oder älter als 24 Stunden / Server neu gestartet).")
+        return _json({
+            "upload_id": upload_id.strip(), "status": rec["status"], "domain": rec["domain"],
+            "path": "/".join(rec["parts"]), "size": rec["size"], "sha256": rec["sha256_actual"],
+            "fehler": rec["error"],
+        })
+
+
+def _client_ip(scope: dict[str, Any]) -> str:
+    peer = (scope.get("client") or ("", 0))[0]
+    if peer in _UPLOAD_TRUSTED_PROXIES:
+        for k, v in scope.get("headers", []):
+            if k == b"x-forwarded-for":
+                hops = [h.strip() for h in v.decode("latin-1").split(",") if h.strip()]
+                if hops:
+                    return hops[-1]
+    return peer
+
+
+def _rate_limited(ip: str, now: float) -> bool:
+    with _uploads_lock:
+        hits = [t for t in _upload_rate.get(ip, []) if now - t < 60]
+        hits.append(now)
+        _upload_rate[ip] = hits
+        if len(_upload_rate) > 10000:
+            for k in [k for k, v in _upload_rate.items() if now - v[-1] > 60]:
+                del _upload_rate[k]
+        return len(hits) > _UPLOAD_RATE_LIMIT
+
+
+async def _upload_asgi(scope, receive, send) -> None:
+    """PUT /upload/{upload_id} - eigenes Einmal-Token im Authorization-Header."""
+    import asyncio
+    from starlette.responses import JSONResponse
+
+    async def reply(status: int, body: dict[str, Any]) -> None:
+        await JSONResponse(body, status_code=status)(scope, receive, send)
+
+    now = time.time()
+    if _rate_limited(_client_ip(scope), now):
+        await reply(429, {"error": "too_many_requests"})
+        return
+    if scope["method"] != "PUT":
+        await reply(405, {"error": "method_not_allowed"})
+        return
+    upload_id = scope["path"][len("/upload/"):]
+    headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+    auth = headers.get("authorization", "")
+    token = auth[7:] if auth.startswith("Bearer ") else ""
+    global _upload_active
+    with _uploads_lock:
+        _upload_gc(now)
+        rec = _uploads.get(upload_id) if _UPLOAD_ID_RE.match(upload_id) else None
+        ok = (
+            rec is not None and token
+            and hmac.compare_digest(rec["token_hash"], hashlib.sha256(token.encode()).hexdigest())
+            and rec["status"] == "pending" and now <= rec["expires"]
+        )
+        if ok and _upload_active >= _UPLOAD_MAX_CONCURRENT:
+            busy = True
+        else:
+            busy = False
+            if ok:
+                rec["status"] = "uploading"
+                _upload_active += 1
+    if not ok:
+        await reply(401, {"error": "unauthorized"})
+        return
+    if busy:
+        await reply(429, {"error": "too_many_uploads"})
+        return
+
+    result_status, body = 500, {"error": "upload_failed"}
+    try:
+        length = headers.get("content-length")
+        if length is not None and (not length.isdigit() or int(length) > rec["max_bytes"]):
+            raise _HelperError("too_large")
+        args = _helper_args(rec["base"], parts=rec["parts"], max_bytes=rec["max_bytes"],
+                            sha256=rec["sha256"], reserve=_UPLOAD_MIN_FREE)
+        session = await asyncio.to_thread(_helper_session_factory, "put", args)
+        h = hashlib.sha256()
+        size = 0
+        deadline = time.monotonic() + _UPLOAD_TIMEOUT
+        try:
+            while True:
+                msg = await asyncio.wait_for(receive(), timeout=max(1.0, deadline - time.monotonic()))
+                if msg["type"] == "http.disconnect":
+                    raise _HelperError("incomplete")
+                chunk = msg.get("body", b"")
+                if chunk:
+                    size += len(chunk)
+                    if size > rec["max_bytes"]:
+                        raise _HelperError("too_large")
+                    h.update(chunk)
+                    await asyncio.to_thread(session.send, _frame(chunk))
+                if not msg.get("more_body", False):
+                    break
+            await asyncio.to_thread(
+                session.send, _frame(b"") + json.dumps({"sha256": h.hexdigest()}).encode() + b"\n"
+            )
+        except BaseException:
+            await asyncio.to_thread(session.abort)
+            raise
+        res = _helper_result(await asyncio.to_thread(session.finish))
+        rec.update(status="completed", size=res["size"], sha256_actual=res["sha256"])
+        result_status = 200
+        body = {"domain": rec["domain"], "path": "/".join(rec["parts"]), "size": res["size"],
+                "sha256": res["sha256"], "backup": res.get("backup")}
+    except _HelperError as e:
+        rec.update(status="failed", error=_helper_message(e))
+        result_status = {"too_large": 413, "sha256_mismatch": 422, "transfer_mismatch": 422,
+                         "no_space": 507, "incomplete": 400}.get(e.code, 409)
+        body = {"error": e.code}
+    except asyncio.TimeoutError:
+        rec.update(status="failed", error="Zeitüberschreitung beim Upload.")
+        result_status, body = 408, {"error": "timeout"}
+    except Exception as e:
+        rec.update(status="failed", error="Interner Fehler beim Upload.")
+        print(f"upload {upload_id}: {type(e).__name__}", file=sys.stderr, flush=True)
+    finally:
+        with _uploads_lock:
+            _upload_active -= 1
+    _audit("upload", domain=rec["domain"], path="/".join(rec["parts"]), upload_id=upload_id,
+           size=rec["size"], sha256=rec["sha256_actual"], result=rec["status"], error=rec["error"])
+    await reply(result_status, body)
+
+
+# --- Fetch (Server lädt selbst von einer URL) -------------------------------
+
+
+def _ip_is_public(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return bool(addr.is_global) and not addr.is_multicast
+
+
+def _resolve_host(host: str, port: int) -> list[str]:
+    import socket
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    return sorted({i[4][0] for i in infos})
+
+
+def _resolve_public(host: str, port: int) -> str:
+    """Löst host auf; alle Adressen müssen öffentlich sein (SSRF-Schutz)."""
+    try:
+        ips = _resolve_host(host, port)
+    except OSError:
+        raise ValueError(f"Host '{host}' nicht auflösbar.")
+    if not ips:
+        raise ValueError(f"Host '{host}' nicht auflösbar.")
+    bad = [ip for ip in ips if not _ip_is_public(ip)]
+    if bad:
+        raise ValueError(f"Host '{host}' zeigt auf eine nicht-öffentliche Adresse - abgelehnt (SSRF-Schutz).")
+    return ips[0]
+
+
+def _parse_fetch_url(url: str):
+    from urllib.parse import urlsplit
+    u = urlsplit(url.strip())
+    if u.scheme != "https" or not u.hostname:
+        raise ValueError("Nur https-URLs sind erlaubt.")
+    if u.username or u.password:
+        raise ValueError("Zugangsdaten in der URL sind nicht erlaubt.")
+    return u
+
+
+def _fetch_client():
+    # trust_env=False: keine Proxy-Umgebungsvariablen - die Verbindung geht
+    # immer direkt an die geprüfte, gepinnte IP.
+    return httpx.Client(timeout=httpx.Timeout(_FETCH_TIMEOUT, connect=10.0), follow_redirects=False,
+                        trust_env=False)
+
+
+def _fetch_chunks(url: str, limit: int, state: dict[str, Any]):
+    """Lädt url mit an die geprüfte IP gepinnter Verbindung (gegen DNS-
+    Rebinding), max. 3 Redirects, jede Station erneut geprüft."""
+    from urllib.parse import urljoin
+    current = url
+    deadline = time.monotonic() + _FETCH_TIMEOUT
+    with _fetch_client() as client:
+        for hop in range(_FETCH_MAX_REDIRECTS + 1):
+            u = _parse_fetch_url(current)
+            port = u.port or 443
+            ip = _resolve_public(u.hostname, port)
+            ip_host = f"[{ip}]" if ":" in ip else ip
+            target = f"https://{ip_host}:{port}{u.path or '/'}" + (f"?{u.query}" if u.query else "")
+            host_header = u.hostname if port == 443 else f"{u.hostname}:{port}"
+            req = client.build_request("GET", target, headers={"Host": host_header},
+                                       extensions={"sni_hostname": u.hostname})
+            resp = client.send(req, stream=True)
+            try:
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    loc = resp.headers.get("location")
+                    if not loc:
+                        raise ValueError("Redirect ohne Ziel.")
+                    if hop == _FETCH_MAX_REDIRECTS:
+                        raise ValueError("Zu viele Redirects (max. 3).")
+                    current = urljoin(current, loc)
+                    continue
+                if resp.status_code != 200:
+                    raise ValueError(f"Download fehlgeschlagen: HTTP {resp.status_code}.")
+                cl = resp.headers.get("content-length")
+                if cl and cl.isdigit() and int(cl) > limit:
+                    raise _HelperError("too_large")
+                state["final_url"] = current
+                for chunk in resp.iter_bytes(65536):
+                    if time.monotonic() > deadline:
+                        raise ValueError("Zeitüberschreitung beim Download.")
+                    yield chunk
+                return
+            finally:
+                resp.close()
+    raise ValueError("Zu viele Redirects (max. 3).")
+
+
+@mcp.tool()
+def fetch_to_vhost(
+    domain: str,
+    path: str,
+    url: str,
+    sha256: str | None = None,
+    allow_executable: bool = False,
+    confirm: bool = False,
+) -> str:
+    """Der Server lädt eine Datei selbst von einer https-URL und legt sie im
+    Vhost-Verzeichnis ab (path relativ zu /var/www/vhosts/<domain>/). Max. 3
+    Redirects, Grössenlimit UPLOAD_MAX_BYTES, SSRF-Schutz (nur öffentliche
+    IPs, je Station geprüft und gepinnt). Dieselbe Schreiblogik wie
+    write_vhost_file/Upload: Temp-Datei, optional sha256-Prüfung, atomar,
+    Backup bestehender Dateien, Besitzer der Subscription. Ausführbare
+    Dateien nur mit allow_executable=true. Erfordert confirm=true.
+    """
+    if not confirm:
+        raise ValueError("confirm=true erforderlich - fetch_to_vhost schreibt auf dem Produktivserver.")
+    _parse_fetch_url(url)
+    sha = _check_sha(sha256)
+    ctx, parts, _plan = _prepare_write(domain, path, allow_executable)
+    state: dict[str, Any] = {}
+    args = _helper_args(ctx["base"], parts=parts, max_bytes=_UPLOAD_MAX_BYTES, sha256=sha,
+                        reserve=_UPLOAD_MIN_FREE)
+    try:
+        res = _helper_put(args, _fetch_chunks(url, _UPLOAD_MAX_BYTES, state))
+    except _HelperError as e:
+        _audit("fetch", domain=ctx["domain"], path="/".join(parts), url=url, result="failed", error=e.code)
+        raise ValueError(_helper_message(e))
+    except (ValueError, httpx.HTTPError) as e:
+        msg = str(e) if isinstance(e, ValueError) else f"Download fehlgeschlagen ({type(e).__name__})."
+        _audit("fetch", domain=ctx["domain"], path="/".join(parts), url=url, result="failed", error=msg)
+        raise ValueError(msg)
+    _audit("fetch", domain=ctx["domain"], path="/".join(parts), url=url, size=res["size"],
+           sha256=res["sha256"], result="ok")
+    return _json({"domain": ctx["domain"], "path": "/".join(parts), "size": res["size"],
+                  "sha256": res["sha256"], "besitzer": res["owner"], "rechte": res["mode"],
+                  "backup": res["backup"], "neu_angelegte_ordner": res["created"]})
+
+
+# --- Dateiverwaltung ---------------------------------------------------------
+
+
+@mcp.tool()
+def list_vhost_dir(domain: str, path: str = ".", depth: int = 1) -> str:
+    """Listet ein Verzeichnis unter /var/www/vhosts/<domain>/ (rein lesend):
+    Name, Typ (file/dir/symlink), Grösse, Rechte, Besitzer, Änderungsdatum.
+    depth max. 3, max. 500 Einträge (danach truncated=true). Symlinks werden
+    nicht verfolgt. Der Papierkorb liegt unter ".mcp-trash".
+    """
+    d = _wp_domain(domain)
+    parts = _strict_parts(path, allow_root=True)
+    depth = max(1, min(3, int(depth)))
+    res = _call("list", _helper_args(f"{_VHOST_BASE}/{d}", parts=parts, depth=depth, max_entries=500))
+    out = {"domain": d, "path": "/".join(parts) or ".", "depth": depth, "entries": res["entries"]}
+    if res["truncated"]:
+        out["hinweis"] = "Gekürzt auf 500 Einträge - kleineren Pfad oder geringere Tiefe wählen."
+    return _json(out)
+
+
+@mcp.tool()
+def move_vhost_file(
+    domain: str,
+    src: str,
+    dst: str,
+    overwrite: bool = False,
+    create_parents: bool = False,
+    allow_executable: bool = False,
+    confirm: bool = False,
+) -> str:
+    """Verschiebt/benennt eine Datei oder einen Ordner atomar (rename) um -
+    nur innerhalb desselben Docroots derselben Domain (src/dst relativ zu
+    /var/www/vhosts/<domain>/, z.B. "httpdocs/alt.jpg"). Existiert dst, wird
+    abgebrochen, ausser overwrite=true (nur für Dateien; dst wird vorher als
+    .bak-<Zeitstempel> gesichert). create_parents legt fehlende Zielordner
+    an. Ausführbare Dateien (.php, .htaccess, ...) nur mit
+    allow_executable=true. Symlinks werden nur selbst verschoben. Erfordert
+    confirm=true.
+    """
+    if not confirm:
+        raise ValueError("confirm=true erforderlich - move_vhost_file ändert Dateien auf dem Produktivserver.")
+    ctx = _vhost_ctx(domain)
+    sp = _strict_parts(src)
+    dp = _strict_parts(dst)
+    for parts, what in ((sp, "Quelle"), (dp, "Ziel")):
+        _check_not_protected(parts, ctx, what)
+    sdr = _docroot_of(sp, ctx["docroots"])
+    if sdr is None or _docroot_of(dp, ctx["docroots"]) != sdr:
+        raise ValueError("Verschieben nur innerhalb desselben Docroots möglich.")
+    if sp == dp or dp[:len(sp)] == sp:
+        raise ValueError("Ziel liegt in der Quelle selbst - abgelehnt.")
+    for parts in (sp, dp):
+        _check_executable(parts, allow_executable)
+    args = _helper_args(ctx["base"], src=sp, dst=dp, overwrite=bool(overwrite),
+                        create_parents=bool(create_parents), allow_exec=bool(allow_executable))
+    try:
+        res = _helper("move", args)
+    except _HelperError as e:
+        _audit("move", domain=ctx["domain"], src="/".join(sp), dst="/".join(dp), result="failed", error=e.code)
+        raise ValueError(_helper_message(e))
+    _audit("move", domain=ctx["domain"], src="/".join(sp), dst="/".join(dp), backup=res["backup"], result="ok")
+    return _json({"domain": ctx["domain"], "verschoben": "/".join(sp), "nach": "/".join(dp),
+                  "typ": res["type"], "backup_ueberschriebenes_ziel": res["backup"],
+                  "neu_angelegte_ordner": res["created"]})
+
+
+_delete_secret = secrets.token_bytes(32)
+
+
+def _delete_token(domain: str, rel: str, permanent: bool, digest: str, ts: int) -> str:
+    msg = f"{domain}\0{rel}\0{int(permanent)}\0{digest}\0{ts}".encode()
+    mac = hmac.new(_delete_secret, msg, hashlib.sha256).hexdigest()
+    return f"{ts}.{digest}.{mac}"
+
+
+def _delete_token_digest(token: str, domain: str, rel: str, permanent: bool) -> str:
+    try:
+        ts_s, digest, _ = token.strip().split(".")
+        ts = int(ts_s)
+    except ValueError:
+        raise ValueError("delete_token ungültig.")
+    if not hmac.compare_digest(_delete_token(domain, rel, permanent, digest, ts), token.strip()):
+        raise ValueError("delete_token ungültig (passt nicht zu Domain/Pfad/permanent).")
+    if time.time() - ts > _DELETE_TOKEN_TTL:
+        raise ValueError("delete_token abgelaufen - neuen Dry-Run ausführen.")
+    return digest
+
+
+@mcp.tool()
+def delete_vhost_file(
+    domain: str,
+    path: str,
+    recursive: bool = False,
+    permanent: bool = False,
+    dry_run: bool = False,
+    delete_token: str | None = None,
+    allow_executable: bool = False,
+    confirm: bool = False,
+) -> str:
+    """Löscht eine Datei/einen Ordner unter /var/www/vhosts/<domain>/ -
+    standardmässig in den Papierkorb (.mcp-trash/<Zeitstempel>/<Pfad>,
+    ausserhalb des Docroots, 0700, wiederherstellbar mit restore_vhost_trash).
+    permanent=true löscht endgültig. Ordner nur mit recursive=true und
+    zweistufig: erst dry_run=true (Anzahl, Grösse, erste 50 Pfade,
+    delete_token), dann mit delete_token + confirm=true - nur wenn sich der
+    Inhalt nicht geändert hat. Keine Wildcards, kein "..". Symlinks werden nur
+    selbst entfernt. Geschützte Pfade (Docroot, Vhost-Root, cgi-bin, conf,
+    logs, statistics, .ssh, Mail, .mcp-trash, Dotfiles im Vhost-Root) werden
+    immer abgelehnt. Ausführbare Dateien nur mit allow_executable=true.
+    """
+    ctx = _vhost_ctx(domain)
+    parts = _strict_parts(path)
+    rel = "/".join(parts)
+    _check_not_protected(parts, ctx, "Pfad")
+    args = _helper_args(ctx["base"], parts=parts)
+    info = _call("scan", args)
+    if info["type"] == "dir" and not recursive:
+        raise ValueError(f"'{rel}' ist ein Ordner - nur mit recursive=true.")
+    if dry_run:
+        out = {"domain": ctx["domain"], "path": rel, "typ": info["type"], "dateien": info["files"],
+               "ordner": info["dirs"], "groesse_bytes": info["size"], "erste_pfade": info["paths"],
+               "enthaelt_ausfuehrbare": info["has_exec"], "permanent": bool(permanent),
+               "delete_token": _delete_token(ctx["domain"], rel, bool(permanent), info["digest"], int(time.time())),
+               "hinweis": "Ausführen mit delete_token und confirm=true (Token 15 Minuten gültig)."}
+        if not permanent and info["size"] > _TRASH_MAX_BYTES:
+            out["warnung"] = "Zu gross für den Papierkorb - nur mit permanent=true löschbar."
+        return _json(out)
+    if not confirm:
+        raise ValueError("confirm=true erforderlich - delete_vhost_file löscht auf dem Produktivserver.")
+    digest = None
+    if info["type"] == "dir":
+        if not delete_token:
+            raise ValueError("Ordner nur zweistufig: zuerst dry_run=true, dann mit delete_token löschen.")
+        digest = _delete_token_digest(delete_token, ctx["domain"], rel, bool(permanent))
+    elif delete_token:
+        digest = _delete_token_digest(delete_token, ctx["domain"], rel, bool(permanent))
+    if info["has_exec"] and not allow_executable:
+        raise ValueError(_HELPER_MESSAGES["executable"])
+    args.update(permanent=bool(permanent), digest=digest, allow_exec=bool(allow_executable),
+                trash_max_bytes=_TRASH_MAX_BYTES, owner={"uid": ctx["uid"], "gid": ctx["gid"]})
+    try:
+        res = _helper("delete", args)
+    except _HelperError as e:
+        _audit("delete", domain=ctx["domain"], path=rel, permanent=bool(permanent), result="failed", error=e.code)
+        raise ValueError(_helper_message(e))
+    _audit("delete", domain=ctx["domain"], path=rel, permanent=bool(permanent), size=res["size"],
+           files=res["files"], trash_entry=res.get("trash_entry"), result="ok")
+    out = {"domain": ctx["domain"], "path": rel, "dateien": res["files"], "groesse_bytes": res["size"]}
+    if res["permanent"]:
+        out["ergebnis"] = "Endgültig gelöscht."
+    else:
+        out["ergebnis"] = "In den Papierkorb verschoben."
+        out["trash_entry"] = res["trash_entry"]
+        out["hinweis"] = f"Wiederherstellen mit restore_vhost_trash(domain, trash_entry=\"{res['trash_entry']}\")."
+    return _json(out)
+
+
+_TRASH_ENTRY_RE = re.compile(r"^\d{14}(-\d+)?$")
+
+
+@mcp.tool()
+def restore_vhost_trash(
+    domain: str, trash_entry: str, allow_executable: bool = False, confirm: bool = False
+) -> str:
+    """Stellt einen Papierkorb-Eintrag (z.B. "20260101120000", siehe
+    list_vhost_dir(domain, ".mcp-trash", 2)) an den ursprünglichen Ort
+    wieder her. Liegt dort inzwischen etwas, wird abgebrochen (nichts wird
+    überschrieben). Ohne confirm=true nur Vorschau. Ausführbare Dateien nur
+    mit allow_executable=true.
+    """
+    entry = trash_entry.strip()
+    if not _TRASH_ENTRY_RE.match(entry):
+        raise ValueError("trash_entry muss die Form JJJJMMTTHHMMSS (ggf. mit -N) haben.")
+    ctx = _vhost_ctx(domain)
+    meta = _call("trash_info", _helper_args(ctx["base"], entry=entry))["meta"]
+    orig = str(meta.get("original_path", ""))
+    parts = _strict_parts(orig)
+    _check_not_protected(parts, ctx, "Ziel")
+    if not confirm:
+        return _json({"domain": ctx["domain"], "trash_entry": entry, "ziel": orig, "meta": meta,
+                      "ergebnis": "Vorschau - nichts geändert. Mit confirm=true wiederherstellen."})
+    _check_executable(parts, allow_executable)
+    try:
+        res = _helper("restore", _helper_args(ctx["base"], entry=entry, expect_path=orig,
+                                              allow_exec=bool(allow_executable)))
+    except _HelperError as e:
+        _audit("restore", domain=ctx["domain"], trash_entry=entry, path=orig, result="failed", error=e.code)
+        raise ValueError(_helper_message(e))
+    _audit("restore", domain=ctx["domain"], trash_entry=entry, path=orig, result="ok")
+    return _json({"domain": ctx["domain"], "wiederhergestellt": res["restored"], "typ": res["type"],
+                  "ergebnis": "Wiederhergestellt."})
+
+
+@mcp.tool()
+def empty_vhost_trash(domain: str, older_than_days: int = 14, confirm: bool = False) -> str:
+    """Löscht Papierkorb-Einträge der Domain endgültig, die älter als
+    older_than_days Tage sind. Ohne confirm=true nur Vorschau.
+    """
+    days = int(older_than_days)
+    if days < 0:
+        raise ValueError("older_than_days darf nicht negativ sein.")
+    ctx = _vhost_ctx(domain)
+    res = _call("empty_trash", _helper_args(ctx["base"], days=days, dry=not confirm))
+    if confirm:
+        _audit("empty_trash", domain=ctx["domain"], older_than_days=days,
+               entries=[r["entry"] for r in res["removed"]], result="ok")
+    return _json({"domain": ctx["domain"], "aelter_als_tage": days,
+                  "eintraege": res["removed"],
+                  "ergebnis": "Endgültig gelöscht." if confirm else "Vorschau - nichts gelöscht. Mit confirm=true ausführen."})
+
+
+def _trash_autoclean() -> None:
+    """Optional beim Serverstart: Papierkorb aller Domains aufräumen."""
+    try:
+        res = _helper("empty_trash_all", _helper_args(_VHOST_BASE, root=_VHOST_BASE, days=_TRASH_AUTOCLEAN_DAYS))
+        for dom, removed in res["domains"].items():
+            _audit("empty_trash", domain=dom, older_than_days=_TRASH_AUTOCLEAN_DAYS,
+                   entries=[r["entry"] for r in removed], result="ok", trigger="startup")
+    except Exception as e:
+        _audit("empty_trash", trigger="startup", result="failed", error=type(e).__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -3195,13 +4721,23 @@ def _build_http_app():
     # Claude.ai) rufen den Endpoint per Cross-Origin-JS-Fetch auf. Preflight-
     # OPTIONS-Requests (ohne Authorization-Header) werden von CORSMiddleware
     # direkt beantwortet, bevor sie die Bearer-Pruefung erreichen.
-    return CORSMiddleware(
+    cors_app = CORSMiddleware(
         secured_app,
         allow_origins=["*"],
         allow_methods=["*"],
         allow_headers=["*"],
         expose_headers=["mcp-session-id"],
     )
+
+    async def app(scope, receive, send):
+        # /upload/{id}: eigenes Einmal-Token statt MCP_API_KEY (siehe upload_begin),
+        # ohne gültiges Token immer 401 - gleich stark wie der MCP-Endpunkt.
+        if scope["type"] == "http" and scope["path"].startswith("/upload/"):
+            await _upload_asgi(scope, receive, send)
+            return
+        await cors_app(scope, receive, send)
+
+    return app
 
 
 async def _run_http_server() -> None:
@@ -3211,6 +4747,8 @@ async def _run_http_server() -> None:
     config = uvicorn.Config(app, host=_HTTP_HOST, port=_HTTP_PORT, log_level="info")
     srv = uvicorn.Server(config)
     print(f"plesk-mcp HTTP server running on {_HTTP_HOST}:{_HTTP_PORT}", flush=True)
+    if _TRASH_AUTOCLEAN_DAYS > 0:
+        threading.Thread(target=_trash_autoclean, daemon=True).start()
     await srv.serve()
 
 
