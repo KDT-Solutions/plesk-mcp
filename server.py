@@ -81,6 +81,7 @@ from typing import Any
 
 import paramiko
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 # Force UTF-8 on Windows where default may be cp1252
 if sys.platform == "win32":
@@ -269,8 +270,9 @@ FORBIDDEN_SUBFLAGS = {
 }
 
 
-class SSHError(RuntimeError):
-    pass
+class SSHError(ToolError, RuntimeError):
+    """Erwarteter SSH-/Validierungsfehler. Als ToolError sieht der Client die
+    Meldung selbst statt nur 'Error executing tool <name>'."""
 
 
 def _configure_host_keys(client: paramiko.SSHClient) -> None:
@@ -287,6 +289,9 @@ def _configure_host_keys(client: paramiko.SSHClient) -> None:
     if _SSH_HOST_KEY:
         import base64 as _b64
         parts = _SSH_HOST_KEY.split()
+        # ssh-keyscan-Format "<host> <typ> <base64>" tolerieren
+        if len(parts) >= 3 and not parts[0].startswith(("ssh-", "ecdsa-", "sk-")):
+            parts = parts[1:]
         if len(parts) < 2:
             raise SSHError(
                 "PLESK_SSH_HOST_KEY muss das Format '<typ> <base64>' haben "
@@ -326,13 +331,30 @@ def _configure_host_keys(client: paramiko.SSHClient) -> None:
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
 
+def _key_fingerprint(key: paramiko.PKey) -> str:
+    """SHA256-Fingerprint wie ssh-keygen -lf (zum Abgleich mit dem Server)."""
+    import base64 as _b64
+    import hashlib
+    return "SHA256:" + _b64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip("=")
+
+
 def _ssh_connect() -> paramiko.SSHClient:
     if not _SSH_HOST or not _SSH_USER:
         raise SSHError(
             "PLESK_SSH_HOST/PLESK_SSH_USER sind nicht gesetzt (Umgebungsvariablen fehlen)."
         )
     client = paramiko.SSHClient()
-    _configure_host_keys(client)
+    try:
+        _configure_host_keys(client)
+    except SSHError:
+        raise
+    except (ValueError, paramiko.SSHException) as e:
+        raise SSHError(
+            "PLESK_SSH_HOST_KEY ist ungueltig - erwartet '<typ> <base64>', z.B. "
+            "'ssh-ed25519 AAAAC3Nza...' (ohne Hostname davor)."
+        ) from e
+    except OSError as e:
+        raise SSHError(f"PLESK_SSH_KNOWN_HOSTS nicht lesbar ({_SSH_KNOWN_HOSTS}): {e.strerror or e}") from e
     connect_kwargs: dict[str, Any] = dict(
         hostname=_SSH_HOST,
         port=_SSH_PORT,
@@ -347,7 +369,23 @@ def _ssh_connect() -> paramiko.SSHClient:
         connect_kwargs["password"] = _SSH_PASSWORD
     else:
         raise SSHError("Weder PLESK_SSH_PASSWORD noch PLESK_SSH_KEY_PATH gesetzt.")
-    client.connect(**connect_kwargs)
+    target = f"{_SSH_HOST}:{_SSH_PORT}"
+    try:
+        client.connect(**connect_kwargs)
+    except paramiko.BadHostKeyException as e:
+        raise SSHError(
+            f"SSH-Host-Key von {target} passt nicht zum hinterlegten Key "
+            f"(Server: {e.key.get_name()} {_key_fingerprint(e.key)}, "
+            f"erwartet: {e.expected_key.get_name()} {_key_fingerprint(e.expected_key)}). "
+            "PLESK_SSH_HOST_KEY bzw. PLESK_SSH_KNOWN_HOSTS pruefen."
+        ) from e
+    except paramiko.AuthenticationException as e:
+        raise SSHError(f"SSH-Anmeldung an {target} als {_SSH_USER} fehlgeschlagen: {e}") from e
+    except paramiko.SSHException as e:
+        # u.a. RejectPolicy: Host-Key fuer diesen Host/Port nicht hinterlegt
+        raise SSHError(f"SSH-Fehler bei {target}: {e}") from e
+    except OSError as e:
+        raise SSHError(f"SSH-Verbindung zu {target} fehlgeschlagen: {e.strerror or e}") from e
     return client
 
 
