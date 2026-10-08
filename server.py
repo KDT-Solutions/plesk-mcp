@@ -31,7 +31,7 @@ Read-only MCP-Server für Diagnose auf einem Plesk-Server. Drei Datenquellen:
 Gedacht für Fehleranalyse bei Support-Anfragen (z.B. "Website nicht erreichbar").
 Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven
 Kommandos (Whitelist + Blacklist weiter unten). Ausnahme: write_vhost_file,
-delete_vhost_backup, delete_vhost_log, dns_add_record, dns_delete_record,
+replace_in_vhost_file, replace_in_vhost_files, delete_vhost_backup, delete_vhost_log, dns_add_record, dns_delete_record,
 dns_update_record, imunify_ignore_add, imunify_ignore_remove, wp_option_update
 wp_option_rollback sowie die Datei-Tools upload_begin, fetch_to_vhost,
 move_vhost_file, delete_vhost_file, restore_vhost_trash und empty_vhost_trash
@@ -45,8 +45,8 @@ imunify_ignore_add/imunify_ignore_remove ändern ausschliesslich die
 Imunify360-Malware-Ignore-Liste (nur Pfade unter /var/www/vhosts/),
 wp_option_update/wp_option_rollback einzelne freigegebene WordPress-Optionen
 (per WP-CLI als Subscription-User). Alle schreibenden Tools erfordern zwingend confirm=true pro Aufruf
-(keine globale Freischaltung), write_vhost_file legt vor dem Überschreiben
-automatisch ein Backup der alten Version an.
+(keine globale Freischaltung), write_vhost_file und die replace_*-Tools legen
+vor dem Überschreiben automatisch ein Backup der alten Version an.
 
 Transport wird über die Umgebungsvariable MCP_TRANSPORT gesteuert:
 - "stdio" (Standard) - für die lokale Nutzung via uv/Claude Desktop.
@@ -113,7 +113,7 @@ if _HTTP_MODE and not _MCP_API_KEY:
 # Dateien (server.py, Dockerfile, requirements.txt, Workflow) geaendert haben.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.10"
+_VERSION_BASE = "0.11"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -1429,6 +1429,194 @@ def write_vhost_file(
     )
 
 
+_REPLACE_MAX_BYTES = int(os.environ.get("REPLACE_MAX_BYTES", str(5 * 1024 * 1024)))
+_REPLACE_MAX_FILES = 50
+_REPLACE_MAX_CONTEXT = 50
+
+
+def _replace_parts(domain: str, path: str) -> list[str]:
+    """Pfadprüfung wie write_vhost_file (_vhost_path), zusätzlich ohne "..",
+    absolute Pfade oder Wildcards (_strict_parts)."""
+    full = _vhost_path(domain, path)
+    if full == f"{_VHOST_BASE}/{_domain_arg(domain)}":
+        raise ValueError("path muss auf eine Datei zeigen.")
+    return _strict_parts(path)
+
+
+def _replace_run(domain: str, old_str: str, new_str: str, replace_all: bool,
+                 paths: list[list[str]] | None = None, glob: str | None = None) -> dict[str, Any]:
+    if not isinstance(old_str, str) or old_str == "":
+        raise ValueError("old_str darf nicht leer sein.")
+    if not isinstance(new_str, str):
+        raise ValueError("new_str muss ein String sein (leer = Textstelle löschen).")
+    if old_str == new_str:
+        raise ValueError("old_str und new_str sind identisch - nichts zu ersetzen.")
+    base = f"{_VHOST_BASE}/{_domain_arg(domain)}"
+    payload = json.dumps({"old": old_str, "new": new_str}).encode("utf-8")
+    args = _helper_args(base, paths=paths or [], glob=glob or "", replace_all=bool(replace_all),
+                        max_bytes=_REPLACE_MAX_BYTES, max_files=_REPLACE_MAX_FILES,
+                        max_ctx=_REPLACE_MAX_CONTEXT, max_payload=len(payload),
+                        reserve=_UPLOAD_MIN_FREE)
+    # old_str/new_str über stdin statt Kommandozeile: nicht in der Prozessliste
+    # des Servers sichtbar und ohne argv-Längenlimit.
+    session = _helper_session_factory("replace", args)
+    try:
+        session.send(payload)
+    except BaseException:
+        session.abort()
+        raise
+    try:
+        res = _helper_result(session.finish())
+    except _HelperError as e:
+        _audit("replace", domain=_domain_arg(domain), paths=["/".join(p) for p in paths or []],
+               glob=glob or None, result="failed", error=e.code)
+        if e.code == "ambiguous":
+            rel, _, cnt = e.detail.rpartition("|")
+            raise ValueError(
+                f"old_str kommt in '{rel}' {cnt}-mal vor - nichts geändert. Suchtext mit mehr "
+                "Kontext eindeutig machen oder replace_all=true setzen."
+            )
+        raise ValueError(_helper_message(e))
+    _audit("replace", domain=_domain_arg(domain),
+           files=[{"path": f["path"], "replacements": f["replacements"]} for f in res["files"]],
+           skipped=len(res["skipped"]), result="ok")
+    return res
+
+
+def _replace_file_view(base: str, f: dict[str, Any]) -> dict[str, Any]:
+    out = {
+        "datei": f"{base}/{f['path']}",
+        "ersetzungen": f["replacements"],
+        "backup": f"{base}/{f['backup']}",
+        "groesse_neu": f["size"],
+        "groesse_alt": f["old_size"],
+        "besitzer": f["owner"],
+        "rechte": f["mode"],
+        "kontext": f["context"],
+    }
+    if f["replacements"] > len(f["context"]):
+        out["kontext_hinweis"] = f"Nur die ersten {len(f['context'])} von {f['replacements']} Treffern gezeigt."
+    if f["crlf"]:
+        out["zeilenenden"] = "CRLF (beibehalten)"
+    if f["fix_owner"]:
+        out["hinweis"] = "Besitzer der Datei von root umgestellt (wie write_vhost_file)."
+    return out
+
+
+@mcp.tool()
+def replace_in_vhost_file(
+    domain: str,
+    path: str,
+    old_str: str,
+    new_str: str,
+    replace_all: bool = False,
+    confirm: bool = False,
+) -> str:
+    """Ersetzt eine Textstelle in einer Datei im Vhost-Verzeichnis der Domain
+    (/var/www/vhosts/<domain>/<path>, path relativ, z.B.
+    "httpdocs/wp-config.php"), ohne die ganze Datei neu senden zu müssen.
+    old_str muss exakt (inkl. Leerzeichen/Einrückung) vorkommen; new_str darf
+    leer sein (= Textstelle löschen). Kommt old_str mehrfach vor, wird ohne
+    replace_all=true abgebrochen und die Trefferzahl genannt - nichts wird
+    geändert. Kein Treffer ist ebenfalls ein Fehler.
+
+    Nur UTF-8-Textdateien bis 5 MB; Binärdateien (Nullbytes) oder nicht
+    dekodierbare Dateien werden abgelehnt. Zeilenenden bleiben erhalten (in
+    reinen CRLF-Dateien wird "\\n" in old_str/new_str automatisch als "\\r\\n"
+    behandelt).
+
+    ACHTUNG - schreibt auf einem Produktivserver: erfordert confirm=true als
+    bewusste Bestätigung PRO Aufruf. Vor dem Schreiben wird automatisch ein
+    Backup "<path>.bak-<YYYYMMDDHHMMSS>" angelegt (siehe delete_vhost_backup),
+    danach wird atomar ersetzt (Temp-Datei + rename). Sicherheitsregeln wie
+    write_vhost_file: kein "..", keine absoluten Pfade, Abbruch bei Symlinks
+    (Datei oder Ordner im Pfad), keine root-eigenen Dateien ausserhalb von
+    httpdocs; Besitzer, Gruppe und Rechte bleiben erhalten (root-eigene
+    Dateien unter httpdocs werden wie bei write_vhost_file auf den
+    Subscription-User umgestellt).
+
+    Rückgabe: Anzahl Ersetzungen, Backup-Pfad, neue Dateigrösse und je Treffer
+    eine Kontextzeile vorher/nachher (max. 120 Zeichen, max. 50 Treffer).
+    """
+    if not confirm:
+        raise ValueError(
+            "confirm=true erforderlich - dieses Tool schreibt auf einem "
+            "Produktivserver und braucht eine explizite Bestätigung pro Aufruf."
+        )
+    parts = _replace_parts(domain, path)
+    res = _replace_run(domain, old_str, new_str, replace_all, paths=[parts])
+    if not res["files"]:
+        raise ValueError(
+            f"old_str kommt in '{'/'.join(parts)}' nicht vor - nichts geändert. Exakten Text "
+            "inkl. Leerzeichen/Einrückung prüfen (z.B. mit read_vhost_file)."
+        )
+    base = f"{_VHOST_BASE}/{_domain_arg(domain)}"
+    return _json(_replace_file_view(base, res["files"][0]))
+
+
+@mcp.tool()
+def replace_in_vhost_files(
+    domain: str,
+    old_str: str,
+    new_str: str,
+    paths: list[str] | None = None,
+    glob: str = "",
+    replace_all: bool = False,
+    confirm: bool = False,
+) -> str:
+    """Wie replace_in_vhost_file, aber für mehrere Dateien in einem Aufruf.
+    Entweder paths (Liste relativer Pfade, max. 50) ODER glob angeben. glob
+    ist relativ zu /var/www/vhosts/<domain>/ und muss mit "httpdocs/"
+    beginnen (z.B. "httpdocs/wp-content/themes/mein-theme/**/*.php"; "*", "?",
+    "[...]" pro Ordnerebene, "**" für beliebig viele Ebenen; max. 50 Treffer).
+    Beim glob werden Symlinks nicht verfolgt (nur aufgelistet), Backups
+    (.bak-*) und der Papierkorb ignoriert.
+
+    Pro Datei dieselben Prüfungen und Backups wie replace_in_vhost_file.
+    Dateien ohne Treffer werden übersprungen und im Ergebnis aufgelistet.
+    Alles-oder-nichts: Zuerst werden alle Dateien gelesen und geprüft (UTF-8,
+    Grösse, Symlinks, Mehrfachtreffer ohne replace_all, ...), dann alle
+    Temp-Dateien und Backups geschrieben und erst danach umbenannt - ein
+    Fehler in einer Datei lässt alle Dateien unverändert.
+    Erfordert confirm=true pro Aufruf.
+    """
+    if not confirm:
+        raise ValueError(
+            "confirm=true erforderlich - dieses Tool schreibt auf einem "
+            "Produktivserver und braucht eine explizite Bestätigung pro Aufruf."
+        )
+    g = (glob or "").strip()
+    if bool(paths) == bool(g):
+        raise ValueError("Entweder paths oder glob angeben (genau eines davon).")
+    plist = None
+    if paths:
+        if len(paths) > _REPLACE_MAX_FILES:
+            raise ValueError(f"Maximal {_REPLACE_MAX_FILES} Dateien pro Aufruf.")
+        plist = [_replace_parts(domain, p) for p in paths]
+        if len({"/".join(p) for p in plist}) != len(plist):
+            raise ValueError("paths enthält doppelte Einträge.")
+    else:
+        gparts = g.split("/")
+        if (g.startswith("/") or "\\" in g or "\0" in g or len(g) > 4096 or len(gparts) < 2
+                or gparts[0] != "httpdocs" or any(c in ("", ".", "..") for c in gparts)):
+            raise ValueError(
+                f"Ungültiges glob {glob!r}: relativ, muss mit 'httpdocs/' beginnen, ohne '..', '.' "
+                "und leere Teile."
+            )
+    res = _replace_run(domain, old_str, new_str, replace_all, paths=plist, glob=g or None)
+    base = f"{_VHOST_BASE}/{_domain_arg(domain)}"
+    out: dict[str, Any] = {
+        "geaendert": [_replace_file_view(base, f) for f in res["files"]],
+        "ersetzungen_gesamt": sum(f["replacements"] for f in res["files"]),
+        "ohne_treffer": res["skipped"],
+    }
+    if res["symlinks"]:
+        out["symlinks_uebersprungen"] = res["symlinks"]
+    if not res["files"]:
+        out["hinweis"] = "old_str kommt in keiner Datei vor - nichts geändert."
+    return _json(out)
+
+
 @mcp.tool()
 def delete_vhost_backup(domain: str, path: str, confirm: bool = False) -> str:
     """Löscht eine von write_vhost_file angelegte Backup-Datei
@@ -1532,6 +1720,7 @@ _HELPER_SRC = r'''# plesk-mcp vhost helper - läuft per SSH auf dem Plesk-Server
 import base64
 import ctypes
 import errno
+import fnmatch
 import grp
 import hashlib
 import json
@@ -2324,9 +2513,273 @@ def op_empty_trash_all(a):
         os.close(root_fd)
 
 
+BAK_RE = re.compile(r"\.bak-\d{14}$")
+CTX_MAX = 120
+
+
+def glob_seg_match(pats, names_):
+    """Segmentweiser Glob-Abgleich, "**" = beliebig viele Ordnerebenen."""
+    if not pats:
+        return not names_
+    if pats[0] == "**":
+        return any(glob_seg_match(pats[1:], names_[i:]) for i in range(len(names_) + 1))
+    return bool(names_) and fnmatch.fnmatchcase(names_[0], pats[0]) and glob_seg_match(pats[1:], names_[1:])
+
+
+def glob_files(base_fd, pattern, limit):
+    """Reguläre Dateien unter httpdocs, deren Pfad (relativ zum Vhost-Root) auf
+    pattern passt. Symlinks werden weder verfolgt noch geliefert."""
+    pats = pattern.split("/")
+    out = []
+    links = []
+    count = [0]
+
+    def rec(fd, rel):
+        for c in sorted(os.listdir(fd)):
+            count[0] += 1
+            if count[0] > SCAN_MAX:
+                raise HErr("too_many_entries")
+            s = lst(fd, c)
+            if s is None:
+                continue
+            r = rel + [c]
+            if stat.S_ISLNK(s.st_mode):
+                if glob_seg_match(pats, r):
+                    links.append(join(r))
+            elif stat.S_ISDIR(s.st_mode):
+                if c == TRASH:
+                    continue
+                cfd = open_dir(fd, c, join(r))
+                try:
+                    rec(cfd, r)
+                finally:
+                    os.close(cfd)
+            elif stat.S_ISREG(s.st_mode) and not BAK_RE.search(c) and ".mcp-" not in c:
+                if glob_seg_match(pats, r):
+                    out.append(r)
+                    if len(out) > limit:
+                        raise HErr("glob_too_many", str(limit))
+
+    hfd = open_dir(base_fd, "httpdocs", "httpdocs")
+    try:
+        rec(hfd, ["httpdocs"])
+    finally:
+        os.close(hfd)
+    return out, links
+
+
+def read_payload(max_bytes):
+    data = sys.stdin.buffer.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise HErr("too_large")
+    try:
+        return json.loads(data.decode("utf-8"))
+    except ValueError:
+        raise HErr("incomplete")
+
+
+def ctx_line(text, start, length):
+    """Zeile(n) um text[start:start+length], gekürzt auf CTX_MAX Zeichen."""
+    ls = text.rfind("\n", 0, start) + 1
+    le = text.find("\n", start + length)
+    if le < 0:
+        le = len(text)
+    line = text[ls:le].rstrip("\r")
+    s = start - ls
+    if len(line) > CTX_MAX:
+        lo = max(0, min(s - (CTX_MAX - length) // 2, len(line) - CTX_MAX))
+        line = ("..." if lo > 0 else "") + line[lo:lo + CTX_MAX] + ("..." if lo + CTX_MAX < len(line) else "")
+    return line.replace("\r", "\\r").replace("\n", "\\n").replace("\t", " ")
+
+
+def prepare_replace(base_fd, parts, old, new, replace_all, max_bytes, max_ctx):
+    """Phase 1: lesen und prüfen, nichts schreiben."""
+    rel = join(parts)
+    p = plan_put(base_fd, parts)
+    if not p["exists"]:
+        raise HErr("not_found", rel)
+    dfd, _, _ = walk(base_fd, parts[:-1])
+    try:
+        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dfd)
+    except OSError as e:
+        os.close(dfd)
+        if e.errno == errno.ELOOP:
+            raise HErr("target_symlink", rel)
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_ino != p["ino"]:
+            raise HErr("changed", rel)
+        if st.st_size > max_bytes:
+            raise HErr("file_too_large", rel)
+        chunks = []
+        size = 0
+        while True:
+            buf = os.read(fd, 1048576)
+            if not buf:
+                break
+            size += len(buf)
+            if size > max_bytes:
+                raise HErr("file_too_large", rel)
+            chunks.append(buf)
+        data = b"".join(chunks)
+    finally:
+        os.close(fd)
+        os.close(dfd)
+    if b"\0" in data:
+        raise HErr("binary", rel)
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HErr("not_utf8", rel)
+    o, n = old, new
+    # Zeilenenden beibehalten: reine CRLF-Datei, Suchtext mit "\n" -> "\r\n"
+    crlf = "\r\n" in text and text.count("\n") == text.count("\r\n")
+    if crlf and "\r" not in o and "\n" in o:
+        o = o.replace("\n", "\r\n")
+        if "\r" not in n:
+            n = n.replace("\n", "\r\n")
+    count = text.count(o)
+    res = {"path": rel, "parts": parts, "count": count}
+    if count == 0:
+        return res
+    if count > 1 and not replace_all:
+        raise HErr("ambiguous", "%s|%d" % (rel, count))
+    starts = []
+    i = text.find(o)
+    while i >= 0:
+        starts.append(i)
+        i = text.find(o, i + len(o))
+    new_text = text.replace(o, n) if replace_all else text.replace(o, n, 1)
+    out = new_text.encode("utf-8")
+    if len(out) > max_bytes:
+        raise HErr("file_too_large", rel)
+    ctx = []
+    delta = len(n) - len(o)
+    for k, s in enumerate(starts[:max_ctx]):
+        ctx.append({"vorher": ctx_line(text, s, len(o)), "nachher": ctx_line(new_text, s + k * delta, len(n))})
+    res.update(plan=p, st=st, data=data, out=out, ctx=ctx, crlf=crlf)
+    return res
+
+
+def write_tmp(dfd, name, data, uid, gid, mode):
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+    try:
+        os.fchown(fd, uid, gid)
+        os.fchmod(fd, mode)
+        while data:
+            w = os.write(fd, data)
+            data = data[w:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def op_replace(a):
+    """Ersetzt old durch new in einer oder mehreren Textdateien. Zuerst werden
+    alle Dateien gelesen und geprüft, dann alle Temp-Dateien und Backups
+    geschrieben, erst danach wird umbenannt - ein Fehler vor dem Umbenennen
+    lässt alle Dateien unverändert."""
+    pay = read_payload(a["max_payload"])
+    old, new = pay.get("old"), pay.get("new")
+    if not isinstance(old, str) or not old or not isinstance(new, str):
+        raise HErr("bad_request")
+    base_fd = open_abs(a["base"])
+    try:
+        links = []
+        if a.get("glob"):
+            targets, links = glob_files(base_fd, a["glob"], a["max_files"])
+        else:
+            targets = [check_parts(p) for p in a["paths"]]
+        if not targets:
+            raise HErr("glob_empty")
+        if len(set(join(p) for p in targets)) != len(targets):
+            raise HErr("duplicate_path")
+        items = [prepare_replace(base_fd, p, old, new, bool(a["replace_all"]), a["max_bytes"], a["max_ctx"])
+                 for p in targets]
+        todo = [it for it in items if it["count"]]
+        skipped = [it["path"] for it in items if not it["count"]]
+        if not todo:
+            return {"files": [], "skipped": skipped, "symlinks": links}
+        need = sum(len(it["out"]) + len(it["data"]) for it in todo)
+        now = time.time()
+        created = []
+        try:
+            for it in todo:
+                parts = it["parts"]
+                p = it["plan"]
+                dfd, _, _ = walk(base_fd, parts[:-1])
+                it["dfd"] = dfd
+                vfs = os.fstatvfs(dfd)
+                if vfs.f_bavail * vfs.f_frsize < need + a.get("reserve", 0):
+                    raise HErr("no_space")
+                name = parts[-1]
+                it["tmp"] = "." + name[:200] + ".mcp-" + os.urandom(4).hex() + ".tmp"
+                write_tmp(dfd, it["tmp"], it["out"], p["uid"], p["gid"], p["mode"])
+                created.append((dfd, it["tmp"]))
+                # Mehrere Ersetzungen in derselben Sekunde: nächsten freien
+                # Zeitstempel nehmen, damit kein Zwischenstand verloren geht.
+                for k in range(10):
+                    it["backup"] = name + ".bak-" + time.strftime("%Y%m%d%H%M%S", time.localtime(now + k))
+                    try:
+                        write_tmp(dfd, it["backup"], it["data"], p["uid"], p["gid"], p["mode"])
+                        break
+                    except OSError as e:
+                        if e.errno != errno.EEXIST:
+                            raise
+                else:
+                    raise HErr("exists", join(parts[:-1] + [it["backup"]]))
+                created.append((dfd, it["backup"]))
+            for it in todo:
+                st = lst(it["dfd"], it["parts"][-1])
+                o = it["st"]
+                if st is None or (st.st_ino, st.st_size, st.st_mtime_ns, st.st_uid, st.st_gid, st.st_mode) != (
+                        o.st_ino, o.st_size, o.st_mtime_ns, o.st_uid, o.st_gid, o.st_mode):
+                    raise HErr("changed", it["path"])
+        except BaseException:
+            for dfd, nm in created:
+                try:
+                    os.unlink(nm, dir_fd=dfd)
+                except OSError:
+                    pass
+            for it in todo:
+                if "dfd" in it:
+                    os.close(it.pop("dfd"))
+            raise
+        done = []
+        try:
+            for it in todo:
+                rename(it["dfd"], it["tmp"], it["dfd"], it["parts"][-1])
+                os.fsync(it["dfd"])
+                done.append(it)
+        except BaseException:
+            for it in todo:
+                if it not in done:
+                    try:
+                        os.unlink(it["tmp"], dir_fd=it["dfd"])
+                    except OSError:
+                        pass
+            if done:
+                raise HErr("partial", ", ".join(it["path"] for it in done))
+            raise
+        finally:
+            for it in todo:
+                os.close(it["dfd"])
+        files = []
+        for it in todo:
+            p = it["plan"]
+            files.append({"path": it["path"], "replacements": it["count"], "size": len(it["out"]),
+                          "old_size": len(it["data"]), "backup": join(it["parts"][:-1] + [it["backup"]]),
+                          "owner": p["owner"], "mode": "%04o" % p["mode"], "fix_owner": p["fix_owner"],
+                          "crlf": it["crlf"], "context": it["ctx"]})
+        return {"files": files, "skipped": skipped, "symlinks": links}
+    finally:
+        os.close(base_fd)
+
+
 OPS = {"plan": op_plan, "put": op_put, "list": op_list, "scan": op_scan, "delete": op_delete,
        "move": op_move, "trash_info": op_trash_info, "restore": op_restore,
-       "empty_trash": op_empty_trash, "empty_trash_all": op_empty_trash_all}
+       "empty_trash": op_empty_trash, "empty_trash_all": op_empty_trash_all, "replace": op_replace}
 
 
 def main():
@@ -2392,6 +2845,13 @@ _HELPER_MESSAGES = {
     "bad_request": "Interner Fehler im Datei-Helper.",
     "os_error": "Dateisystemfehler ({detail}).",
     "internal": "Interner Fehler im Datei-Helper.",
+    "file_too_large": "'{detail}' ist grösser als das Limit für Textersetzungen - nichts geändert.",
+    "binary": "'{detail}' enthält Nullbytes (Binärdatei) - nichts geändert.",
+    "not_utf8": "'{detail}' ist nicht UTF-8-dekodierbar - nichts geändert.",
+    "glob_too_many": "glob passt auf mehr als {detail} Dateien - Muster einschränken, nichts geändert.",
+    "glob_empty": "glob passt auf keine Datei - nichts geändert.",
+    "duplicate_path": "Doppelte Datei in der Liste - nichts geändert.",
+    "partial": "Fehler beim Umbenennen - bereits ersetzt (Backups vorhanden): {detail}. Übrige Dateien unverändert.",
 }
 
 
