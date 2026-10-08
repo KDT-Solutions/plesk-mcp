@@ -9,7 +9,7 @@ Drei Datenquellen: SSH/SFTP (für alles, was nur auf Betriebssystem-Ebene existi
 
 Alle Zugangsdaten (SSH, Plesk-API-Key, Auth-Token) werden ausschliesslich über Umgebungsvariablen konfiguriert - im Code stehen keine Secrets. Dieses Repo ist **öffentlich**: Code, README, Tests und Beispiele enthalten keine echten Hostnamen, IPs, Domains, Tokens oder Kundennamen - nur Platzhalter wie `example.com`, `plesk-mcp.example.com` oder `upload.example.com`. Echte Werte gehören ausschliesslich in die Umgebungsvariablen (z.B. in Portainer), nie ins Repo.
 
-Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven Kommandos (Whitelist + Blacklist in `server.py`), und das `plesk_api_get`-Tool kann nur GET-Requests stellen. Ausnahme: `write_vhost_file`, `delete_vhost_backup`, `delete_vhost_log`, `dns_add_record`, `dns_delete_record` und `dns_update_record` sowie `imunify_ignore_add`/`imunify_ignore_remove`, `wp_option_update`/`wp_option_rollback` und die Datei-Tools `upload_begin`, `fetch_to_vhost`, `move_vhost_file`, `delete_vhost_file`, `restore_vhost_trash`, `empty_vhost_trash` dürfen schreiben - die ersten beiden Dateien innerhalb von `/var/www/vhosts/<domain>/` anlegen/überschreiben/löschen (Backups), `delete_vhost_log` Logdateien unter `/var/www/vhosts/<domain>/logs/` löschen (rotierte) bzw. auf 0 Bytes leeren (aktive), die drei `dns_*`-Tools DNS-Resource-Records der Domain-Zone anlegen/entfernen/ändern (`dns_update_record` kombiniert Löschen+Neuanlegen für einen bestehenden Record in einem Aufruf), die beiden Imunify-Tools ausschliesslich die Imunify360-Malware-Ignore-Liste, die beiden `wp_option_*`-Tools einzelne freigegebene WordPress-Optionen, die Datei-Tools Dateien unter `/var/www/vhosts/<domain>/` hochladen, verschieben, in den Papierkorb legen oder endgültig löschen (siehe "Datei-Upload" und "Dateiverwaltung"). Alle schreibenden Tools erfordern zwingend `confirm=true` pro Aufruf (keine globale Freischaltung), `write_vhost_file` legt vor dem Überschreiben automatisch ein Backup der alten Version an. Details siehe Abschnitt "Sicherheit" unten.
+Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven Kommandos (Whitelist + Blacklist in `server.py`), und das `plesk_api_get`-Tool kann nur GET-Requests stellen. Ausnahme: `write_vhost_file`, `replace_in_vhost_file`/`replace_in_vhost_files`, `delete_vhost_backup`, `delete_vhost_log`, `dns_add_record`, `dns_delete_record` und `dns_update_record` sowie `imunify_ignore_add`/`imunify_ignore_remove`, `wp_option_update`/`wp_option_rollback` und die Datei-Tools `upload_begin`, `fetch_to_vhost`, `move_vhost_file`, `delete_vhost_file`, `restore_vhost_trash`, `empty_vhost_trash` dürfen schreiben - `write_vhost_file`, die beiden `replace_*`-Tools und `delete_vhost_backup` Dateien innerhalb von `/var/www/vhosts/<domain>/` anlegen/überschreiben/ändern/löschen (Backups), `delete_vhost_log` Logdateien unter `/var/www/vhosts/<domain>/logs/` löschen (rotierte) bzw. auf 0 Bytes leeren (aktive), die drei `dns_*`-Tools DNS-Resource-Records der Domain-Zone anlegen/entfernen/ändern (`dns_update_record` kombiniert Löschen+Neuanlegen für einen bestehenden Record in einem Aufruf), die beiden Imunify-Tools ausschliesslich die Imunify360-Malware-Ignore-Liste, die beiden `wp_option_*`-Tools einzelne freigegebene WordPress-Optionen, die Datei-Tools Dateien unter `/var/www/vhosts/<domain>/` hochladen, verschieben, in den Papierkorb legen oder endgültig löschen (siehe "Datei-Upload" und "Dateiverwaltung"). Alle schreibenden Tools erfordern zwingend `confirm=true` pro Aufruf (keine globale Freischaltung), `write_vhost_file` und die `replace_*`-Tools legen vor dem Überschreiben automatisch ein Backup der alten Version an. Details siehe Abschnitt "Sicherheit" unten.
 
 ## Lokale Installation (stdio)
 
@@ -70,6 +70,7 @@ Ohne gesetztes `MCP_TRANSPORT` (oder mit `MCP_TRANSPORT=stdio`) verhält sich de
 | `VHOST_TRASH_AUTOCLEAN_DAYS` | nein | `0` (aus) | > 0: beim Containerstart Papierkorb-Einträge aller Domains löschen, die älter sind |
 | `PLESK_HELPER_PYTHON` | nein | `/usr/libexec/platform-python` | Python (>= 3.3) auf dem Plesk-Server für den Datei-Helper |
 | `PLESK_HELPER_TIMEOUT` | nein | `600` | Timeout in Sekunden pro Helper-Aufruf |
+| `REPLACE_MAX_BYTES` | nein | `5242880` | Maximale Dateigrösse in Bytes für `replace_in_vhost_file(s)` (Standard 5 MB) |
 | `AUDIT_LOG_FILE` | nein | – | Optionaler Pfad im Container für das Audit-Log (zusätzlich zu stderr) |
 | `MCP_TRANSPORT` | nein | `stdio` | `stdio` = lokal (Standard) / `http` = Cloud-Modus (Streamable HTTP) |
 | `MCP_API_KEY` | ja, nur im HTTP-Modus | – | Statisches Bearer-Token zum Schutz des öffentlichen Endpoints. Ohne dieses Token startet der HTTP-Modus nicht (fail-safe) |
@@ -147,6 +148,8 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8422` auf dem Docker-Hos
 | `disk_usage` | Speichernutzung des Vhost-Verzeichnisses |
 | `read_vhost_file` | Liest eine Datei aus dem Vhost-Verzeichnis (Text oder Base64) |
 | `write_vhost_file` | Schreibt/überschreibt eine Datei im Vhost-Verzeichnis - **erfordert `confirm=true`**, legt vorher automatisch ein Backup an, setzt Besitzer/Rechte passend zur Subscription (nie root) |
+| `replace_in_vhost_file` | Ersetzt eine exakte Textstelle in einer Vhost-Datei, ohne die ganze Datei neu zu senden - **erfordert `confirm=true`**, Backup vorher, atomar, Besitzer/Rechte bleiben (siehe "Textstellen ersetzen") |
+| `replace_in_vhost_files` | Wie `replace_in_vhost_file` für bis zu 50 Dateien (`paths` oder `glob` unter `httpdocs/`), alles-oder-nichts - **erfordert `confirm=true`** |
 | `upload_begin` | Startet einen Datei-Upload (Upload-URL + Einmal-Token) - **erfordert `confirm=true`**, siehe "Datei-Upload" |
 | `upload_status` | Status eines Uploads (pending/uploading/completed/expired/failed) mit path, size, sha256 |
 | `fetch_to_vhost` | Server lädt eine Datei selbst von einer https-URL (SSRF-geschützt) - **erfordert `confirm=true`** |
@@ -155,7 +158,7 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8422` auf dem Docker-Hos
 | `delete_vhost_file` | Löscht in den Papierkorb (oder `permanent=true`), Ordner zweistufig mit Dry-Run und `delete_token` - **erfordert `confirm=true`** |
 | `restore_vhost_trash` | Stellt einen Papierkorb-Eintrag wieder her (überschreibt nie) - **erfordert `confirm=true`** |
 | `empty_vhost_trash` | Leert Papierkorb-Einträge, die älter als N Tage sind - **erfordert `confirm=true`** |
-| `delete_vhost_backup` | Löscht eine von `write_vhost_file` angelegte `.bak-*`-Datei - **erfordert `confirm=true`** |
+| `delete_vhost_backup` | Löscht eine von `write_vhost_file`/`replace_in_vhost_file(s)` angelegte `.bak-*`-Datei - **erfordert `confirm=true`** |
 | `wp_option_update` | Ändert eine WordPress-Option (Allowlist) per WP-CLI als Subscription-User - Teilschlüssel (`keys`) oder ganzer Wert (`value`); ohne `confirm=true` nur Vorschau, mit `confirm=true` vorher JSON-Backup, Rückgabe mit `backup_id` |
 | `wp_option_rollback` | Spielt ein Backup von `wp_option_update` zurück (`backup_id`) - ohne `confirm=true` nur Vorschau |
 | `delete_vhost_log` | Löscht rotierte Logs bzw. leert aktive Logs unter `/var/www/vhosts/<domain>/logs/` (einzeln oder `all_rotated=true`) - **erfordert `confirm=true`** |
@@ -226,6 +229,33 @@ location /upload/ {
 
 `PUBLIC_BASE_URL` muss die öffentliche Basis-URL dieses Proxys sein (z.B. `https://plesk-mcp.example.com`). Damit das Rate-Limit die echte Client-IP sieht, die Adresse des Proxys, wie der Container sie sieht (z.B. das Docker-Gateway), in `UPLOAD_TRUSTED_PROXIES` eintragen - nur dann wird `X-Forwarded-For` ausgewertet (letzter Eintrag).
 
+## Textstellen ersetzen
+
+`replace_in_vhost_file(domain, path, old_str, new_str, replace_all=false, confirm=true)` ersetzt eine Textstelle in einer Datei unter `/var/www/vhosts/<domain>/`, ohne dass die ganze Datei neu gesendet werden muss (z.B. eine Zeile in `wp-config.php`).
+
+- `old_str` muss exakt vorkommen (inkl. Leerzeichen und Einrückung), `new_str` darf leer sein (= Textstelle löschen).
+- Kein Treffer: Fehler mit Hinweis. Mehr als ein Treffer ohne `replace_all=true`: Fehler mit Trefferzahl, nichts wird geändert.
+- Nur UTF-8-Textdateien bis 5 MB (`REPLACE_MAX_BYTES`). Dateien mit Nullbytes oder nicht dekodierbare Dateien werden abgelehnt.
+- Encoding und Zeilenenden bleiben erhalten. In reinen CRLF-Dateien wird ein `\n` in `old_str`/`new_str` automatisch als `\r\n` behandelt.
+- Pfade und Sicherheitsregeln wie `write_vhost_file`: relativ, kein `..`, keine absoluten Pfade, Abbruch bei Symlinks (Datei oder Ordner im Pfad), keine root-eigenen Dateien ausserhalb von `httpdocs`. Besitzer, Gruppe und Rechte der Datei bleiben erhalten (eine root-eigene Datei unter `httpdocs` wird wie bei `write_vhost_file` auf den Subscription-User umgestellt).
+- Vor dem Schreiben wird ein Backup `<path>.bak-<YYYYMMDDHHMMSS>` mit dem bisherigen Inhalt angelegt (aufräumen mit `delete_vhost_backup`). Bei mehreren Änderungen in derselben Sekunde erhält jedes Backup den nächsten freien Zeitstempel, damit kein Zwischenstand verloren geht. Danach wird atomar ersetzt (Temp-Datei im selben Ordner, `rename`), unmittelbar davor wird geprüft, dass die Datei seit dem Lesen nicht verändert wurde.
+- `old_str`/`new_str` gehen per stdin an den Helper, nicht über die Kommandozeile (nicht in der Prozessliste des Servers sichtbar).
+- Rückgabe (JSON): Anzahl Ersetzungen, Backup-Pfad, neue und alte Grösse, Besitzer/Rechte und je Treffer eine Kontextzeile vorher/nachher (max. 120 Zeichen, max. 50 Treffer).
+
+`replace_in_vhost_files(domain, old_str, new_str, paths=[...] | glob="...", replace_all=false, confirm=true)` macht dasselbe für mehrere Dateien:
+
+- Entweder `paths` (max. 50 relative Pfade) oder `glob`. `glob` ist relativ zu `/var/www/vhosts/<domain>/`, muss mit `httpdocs/` beginnen und darf höchstens 50 Dateien treffen (`*`, `?`, `[...]` pro Ordnerebene, `**` für beliebig viele Ebenen, z.B. `httpdocs/wp-content/themes/mein-theme/**/*.php`). Symlinks werden dabei nicht verfolgt (nur im Ergebnis aufgelistet), `.bak-*`-Backups und der Papierkorb werden ignoriert.
+- Dateien ohne Treffer werden übersprungen und unter `ohne_treffer` aufgelistet.
+- Alles-oder-nichts: Zuerst werden alle Dateien gelesen und geprüft, dann alle Temp-Dateien und Backups geschrieben und erst danach umbenannt. Ein Fehler in einer Datei (z.B. Binärdatei, Mehrfachtreffer ohne `replace_all`, Symlink) lässt alle Dateien unverändert.
+
+Beispiel:
+
+```text
+replace_in_vhost_file(domain="example.com", path="httpdocs/wp-config.php",
+                      old_str="define( 'WP_DEBUG', false );",
+                      new_str="define( 'WP_DEBUG', true );", confirm=true)
+```
+
 ## Dateiverwaltung (Verschieben, Löschen, Papierkorb)
 
 | Tool | Zweck |
@@ -254,7 +284,7 @@ location /upload/ {
 
 **Technik**: Der Container hat keinen direkten Dateisystemzugriff auf den Plesk-Server. Alle Datei-Aktionen (auch `write_vhost_file`) laufen über einen kleinen Python-Helper, der pro Aktion per SSH mit `PLESK_HELPER_PYTHON` gestartet wird (Python >= 3.3, Standard `/usr/libexec/platform-python`, auf EL8/CloudLinux 8 immer vorhanden). Er arbeitet nur mit Verzeichnis-Handles (`openat` mit `O_NOFOLLOW`, `renameat2` mit `RENAME_NOREPLACE`, `fchown`/`fchmod`), damit zwischen Prüfung und Aktion kein Symlink untergeschoben werden kann, und prüft unmittelbar vor der Aktion erneut, dass sich Ziel bzw. Auflistung nicht geändert haben.
 
-**Audit-Log**: Jede Aktion (Upload-Start, Upload, Fetch, Move, Delete, Restore, Papierkorb leeren) schreibt eine JSON-Zeile mit Zeitpunkt, Domain, Pfaden, Grösse, sha256 (wo vorhanden) und Ergebnis nach stderr (`docker logs`, Präfix `AUDIT`) und optional in `AUDIT_LOG_FILE`. Keine Tokens, Passwörter oder Dateiinhalte.
+**Audit-Log**: Jede Aktion (Upload-Start, Upload, Fetch, Move, Delete, Restore, Papierkorb leeren, Textersetzung) schreibt eine JSON-Zeile mit Zeitpunkt, Domain, Pfaden, Grösse, sha256 (wo vorhanden) und Ergebnis nach stderr (`docker logs`, Präfix `AUDIT`) und optional in `AUDIT_LOG_FILE`. Keine Tokens, Passwörter oder Dateiinhalte.
 
 ## Beispiel: WordPress-Option gezielt ändern
 
@@ -274,7 +304,7 @@ Imunify360 meldet gelegentlich "Malware" in rotierten Logdateien, weil dort prot
 
 ## Tests
 
-Die Pfadvalidierung der Imunify-Tools, URL-Validierung und Auswertung von `pagespeed_insights`, die Validierung von `wp_option_update` sowie Upload, Fetch (SSRF) und Dateiverwaltung sind ohne Plesk-Server testbar. `tests/test_vhost_files.py` startet den Datei-Helper lokal gegen ein temporäres Verzeichnis und braucht dafür Linux und root (`chown`), sonst werden diese Tests übersprungen:
+Die Pfadvalidierung der Imunify-Tools, URL-Validierung und Auswertung von `pagespeed_insights`, die Validierung von `wp_option_update` sowie Upload, Fetch (SSRF), Dateiverwaltung und Textersetzung sind ohne Plesk-Server testbar. `tests/test_vhost_files.py` und `tests/test_replace.py` starten den Datei-Helper lokal gegen ein temporäres Verzeichnis und brauchen dafür Linux und root (`chown`), sonst werden diese Tests übersprungen:
 
 ```bash
 pip install -r requirements.txt pytest
