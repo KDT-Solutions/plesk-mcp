@@ -9,7 +9,7 @@ Drei Datenquellen: SSH/SFTP (für alles, was nur auf Betriebssystem-Ebene existi
 
 Alle Zugangsdaten (SSH, Plesk-API-Key, Auth-Token) werden ausschliesslich über Umgebungsvariablen konfiguriert - im Code stehen keine Secrets. Dieses Repo ist **öffentlich**: Code, README, Tests und Beispiele enthalten keine echten Hostnamen, IPs, Domains, Tokens oder Kundennamen - nur Platzhalter wie `example.com`, `plesk-mcp.example.com` oder `upload.example.com`. Echte Werte gehören ausschliesslich in die Umgebungsvariablen (z.B. in Portainer), nie ins Repo.
 
-Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven Kommandos (Whitelist + Blacklist in `server.py`), und das `plesk_api_get`-Tool kann nur GET-Requests stellen. Ausnahme: `write_vhost_file`, `replace_in_vhost_file`/`replace_in_vhost_files`, `delete_vhost_backup`, `delete_vhost_log`, `dns_add_record`, `dns_delete_record` und `dns_update_record` sowie `imunify_ignore_add`/`imunify_ignore_remove`, `wp_option_update`/`wp_option_rollback` und die Datei-Tools `upload_begin`, `fetch_to_vhost`, `move_vhost_file`, `delete_vhost_file`, `restore_vhost_trash`, `empty_vhost_trash` dürfen schreiben - `write_vhost_file`, die beiden `replace_*`-Tools und `delete_vhost_backup` Dateien innerhalb von `/var/www/vhosts/<domain>/` anlegen/überschreiben/ändern/löschen (Backups), `delete_vhost_log` Logdateien unter `/var/www/vhosts/<domain>/logs/` löschen (rotierte) bzw. auf 0 Bytes leeren (aktive), die drei `dns_*`-Tools DNS-Resource-Records der Domain-Zone anlegen/entfernen/ändern (`dns_update_record` kombiniert Löschen+Neuanlegen für einen bestehenden Record in einem Aufruf), die beiden Imunify-Tools ausschliesslich die Imunify360-Malware-Ignore-Liste, die beiden `wp_option_*`-Tools einzelne freigegebene WordPress-Optionen, die Datei-Tools Dateien unter `/var/www/vhosts/<domain>/` hochladen, verschieben, in den Papierkorb legen oder endgültig löschen (siehe "Datei-Upload" und "Dateiverwaltung"). Alle schreibenden Tools erfordern zwingend `confirm=true` pro Aufruf (keine globale Freischaltung), `write_vhost_file` und die `replace_*`-Tools legen vor dem Überschreiben automatisch ein Backup der alten Version an. Details siehe Abschnitt "Sicherheit" unten.
+Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven Kommandos (Whitelist + Blacklist in `server.py`), und das `plesk_api_get`-Tool kann nur GET-Requests stellen. Ausnahme: `write_vhost_file`, `replace_in_vhost_file`/`replace_in_vhost_files`, `set_php_handler`, `delete_vhost_backup`, `delete_vhost_log`, `dns_add_record`, `dns_delete_record` und `dns_update_record` sowie `imunify_ignore_add`/`imunify_ignore_remove`, `wp_option_update`/`wp_option_rollback` und die Datei-Tools `upload_begin`, `fetch_to_vhost`, `move_vhost_file`, `delete_vhost_file`, `restore_vhost_trash`, `empty_vhost_trash` dürfen schreiben - `write_vhost_file`, die beiden `replace_*`-Tools und `delete_vhost_backup` Dateien innerhalb von `/var/www/vhosts/<domain>/` anlegen/überschreiben/ändern/löschen (Backups), `delete_vhost_log` Logdateien unter `/var/www/vhosts/<domain>/logs/` löschen (rotierte) bzw. auf 0 Bytes leeren (aktive), die drei `dns_*`-Tools DNS-Resource-Records der Domain-Zone anlegen/entfernen/ändern (`dns_update_record` kombiniert Löschen+Neuanlegen für einen bestehenden Record in einem Aufruf), die beiden Imunify-Tools ausschliesslich die Imunify360-Malware-Ignore-Liste, die beiden `wp_option_*`-Tools einzelne freigegebene WordPress-Optionen, `set_php_handler` den PHP-Handler einer Domain (nur auf einen auf dem Server aktivierten Handler), die Datei-Tools Dateien unter `/var/www/vhosts/<domain>/` hochladen, verschieben, in den Papierkorb legen oder endgültig löschen (siehe "Datei-Upload" und "Dateiverwaltung"). Alle schreibenden Tools erfordern zwingend `confirm=true` pro Aufruf (keine globale Freischaltung), `write_vhost_file` und die `replace_*`-Tools legen vor dem Überschreiben automatisch ein Backup der alten Version an. Details siehe Abschnitt "Sicherheit" unten.
 
 ## Lokale Installation (stdio)
 
@@ -70,6 +70,7 @@ Ohne gesetztes `MCP_TRANSPORT` (oder mit `MCP_TRANSPORT=stdio`) verhält sich de
 | `VHOST_TRASH_AUTOCLEAN_DAYS` | nein | `0` (aus) | > 0: beim Containerstart Papierkorb-Einträge aller Domains löschen, die älter sind |
 | `PLESK_HELPER_PYTHON` | nein | `/usr/libexec/platform-python` | Python (>= 3.3) auf dem Plesk-Server für den Datei-Helper |
 | `PLESK_HELPER_TIMEOUT` | nein | `600` | Timeout in Sekunden pro Helper-Aufruf |
+| `PLESK_HOSTING_TIMEOUT` | nein | `180` | Timeout in Sekunden für `plesk bin site`-Aufrufe von `hosting_settings`/`set_php_handler` |
 | `REPLACE_MAX_BYTES` | nein | `5242880` | Maximale Dateigrösse in Bytes für `replace_in_vhost_file(s)` (Standard 5 MB) |
 | `AUDIT_LOG_FILE` | nein | – | Optionaler Pfad im Container für das Audit-Log (zusätzlich zu stderr) |
 | `MCP_TRANSPORT` | nein | `stdio` | `stdio` = lokal (Standard) / `http` = Cloud-Modus (Streamable HTTP) |
@@ -161,6 +162,8 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8422` auf dem Docker-Hos
 | `delete_vhost_backup` | Löscht eine von `write_vhost_file`/`replace_in_vhost_file(s)` angelegte `.bak-*`-Datei - **erfordert `confirm=true`** |
 | `wp_option_update` | Ändert eine WordPress-Option (Allowlist) per WP-CLI als Subscription-User - Teilschlüssel (`keys`) oder ganzer Wert (`value`); ohne `confirm=true` nur Vorschau, mit `confirm=true` vorher JSON-Backup, Rückgabe mit `backup_id` |
 | `wp_option_rollback` | Spielt ein Backup von `wp_option_update` zurück (`backup_id`) - ohne `confirm=true` nur Vorschau |
+| `hosting_settings` | Zeigt PHP-Handler (Version, Typ), PHP-Einstellungen (`memory_limit`, Upload-Limits, PHP-FPM-Werte ...), Hosting-Angaben aus `plesk bin site --info` (SSL, HTTPS-Redirect, Docroot) und alle aktivierten PHP-Handler - read-only |
+| `set_php_handler` | Stellt den PHP-Handler einer Domain um (`plesk bin site --update -php_handler_id`), nur aktivierte Handler - ohne `confirm=true` nur Vorschau, danach Kontrolle in der Plesk-DB |
 | `delete_vhost_log` | Löscht rotierte Logs bzw. leert aktive Logs unter `/var/www/vhosts/<domain>/logs/` (einzeln oder `all_rotated=true`) - **erfordert `confirm=true`** |
 | `imunify_malware_list` | Aktuelle Imunify360-Malware-Treffer (Pfad, Zeitpunkt, Signatur, Status) als JSON, optional gefiltert nach Domain, Pfad oder Status |
 | `imunify_ignore_list` | Einträge der Imunify360-Malware-Ignore-Liste als JSON (optional Suche nach Pfad) |
@@ -286,6 +289,14 @@ replace_in_vhost_file(domain="example.com", path="httpdocs/wp-config.php",
 
 **Audit-Log**: Jede Aktion (Upload-Start, Upload, Fetch, Move, Delete, Restore, Papierkorb leeren, Textersetzung) schreibt eine JSON-Zeile mit Zeitpunkt, Domain, Pfaden, Grösse, sha256 (wo vorhanden) und Ergebnis nach stderr (`docker logs`, Präfix `AUDIT`) und optional in `AUDIT_LOG_FILE`. Keine Tokens, Passwörter oder Dateiinhalte.
 
+## Beispiel: PHP-Version einer Domain umstellen
+
+1. `hosting_settings(domain="example.com")` zeigt den aktuellen Handler (z.B. `plesk-php82-fpm-dedicated`, PHP 8.2, Typ `fpm`) und die Liste der auf dem Server aktivierten Handler.
+2. `set_php_handler(domain="example.com", handler_id="plesk-php83-fpm-dedicated")` ohne `confirm` liefert nur eine Vorschau: alter und neuer Handler, ob sich PHP-Version und/oder Typ (fpm/fastcgi/cgi) ändern.
+3. Mit `confirm=true` wird `plesk bin site --update example.com -php_handler_id plesk-php83-fpm-dedicated` ausgeführt und anschliessend der Handler in der Plesk-Datenbank kontrolliert. Die Rückgabe nennt den alten Handler zum Zurücksetzen.
+
+Nicht aktivierte oder unbekannte Handler werden abgelehnt (mit Liste der aktivierten). Die Umstellung gilt nur für die angegebene Domain, nicht für weitere Domains derselben Subscription. Timeout über `PLESK_HOSTING_TIMEOUT` (Standard 180 Sekunden). Jede Umstellung landet im Audit-Log.
+
 ## Beispiel: WordPress-Option gezielt ändern
 
 1. Vorschau: `wp_option_update(domain="example.com", wp_path="httpdocs", option_name="wp_rocket_settings", keys={"minify_css": 1, "defer_all_js": 1})` - zeigt alt/neu je Schlüssel, schreibt nichts
@@ -304,7 +315,7 @@ Imunify360 meldet gelegentlich "Malware" in rotierten Logdateien, weil dort prot
 
 ## Tests
 
-Die Pfadvalidierung der Imunify-Tools, URL-Validierung und Auswertung von `pagespeed_insights`, die Validierung von `wp_option_update` sowie Upload, Fetch (SSRF), Dateiverwaltung und Textersetzung sind ohne Plesk-Server testbar. `tests/test_vhost_files.py` und `tests/test_replace.py` starten den Datei-Helper lokal gegen ein temporäres Verzeichnis und brauchen dafür Linux und root (`chown`), sonst werden diese Tests übersprungen:
+Die Pfadvalidierung der Imunify-Tools, URL-Validierung und Auswertung von `pagespeed_insights`, die Validierung von `wp_option_update` sowie Upload, Fetch (SSRF), Dateiverwaltung, Textersetzung und die PHP-Handler-Tools (mit simuliertem SSH) sind ohne Plesk-Server testbar. `tests/test_vhost_files.py` und `tests/test_replace.py` starten den Datei-Helper lokal gegen ein temporäres Verzeichnis und brauchen dafür Linux und root (`chown`), sonst werden diese Tests übersprungen:
 
 ```bash
 pip install -r requirements.txt pytest
