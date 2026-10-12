@@ -31,7 +31,7 @@ Read-only MCP-Server für Diagnose auf einem Plesk-Server. Drei Datenquellen:
 Gedacht für Fehleranalyse bei Support-Anfragen (z.B. "Website nicht erreichbar").
 Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven
 Kommandos (Whitelist + Blacklist weiter unten). Ausnahme: write_vhost_file,
-replace_in_vhost_file, replace_in_vhost_files, delete_vhost_backup, delete_vhost_log, dns_add_record, dns_delete_record,
+replace_in_vhost_file, replace_in_vhost_files, set_php_handler, delete_vhost_backup, delete_vhost_log, dns_add_record, dns_delete_record,
 dns_update_record, imunify_ignore_add, imunify_ignore_remove, wp_option_update
 wp_option_rollback sowie die Datei-Tools upload_begin, fetch_to_vhost,
 move_vhost_file, delete_vhost_file, restore_vhost_trash und empty_vhost_trash
@@ -113,7 +113,7 @@ if _HTTP_MODE and not _MCP_API_KEY:
 # Dateien (server.py, Dockerfile, requirements.txt, Workflow) geaendert haben.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.11"
+_VERSION_BASE = "0.12"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -4180,6 +4180,241 @@ def delete_vhost_log(
             sftp.close()
     finally:
         client.close()
+
+
+# ---------------------------------------------------------------------------
+# Hosting-Einstellungen (PHP-Handler)
+# ---------------------------------------------------------------------------
+#
+# Lesen: PHP-Handler aus der Plesk-DB, PHP-Einstellungen per
+# `plesk bin site --show-php-settings`, Hosting-Block aus `plesk bin site --info`.
+# Schreiben: nur der PHP-Handler per `plesk bin site --update <domain>
+# -php_handler_id <id>` - nur auf einen auf dem Server aktivierten Handler,
+# ohne confirm=true nur Vorschau, danach Kontrolle in der Plesk-DB.
+
+_HOSTING_TIMEOUT = int(os.environ.get("PLESK_HOSTING_TIMEOUT", "180"))
+_PHP_HANDLER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_PHP_SETTING_LINE_RE = re.compile(r"^([A-Za-z0-9_.]+) = ?(.*)$")
+
+
+def _php_handlers(client: paramiko.SSHClient) -> list[dict[str, Any]]:
+    out, err, rc = _client_exec(client, "plesk bin php_handler --list -json true")
+    try:
+        handlers = json.loads(out)
+    except ValueError:
+        handlers = None
+    if rc != 0 or not isinstance(handlers, list):
+        raise SSHError(f"PHP-Handler-Liste nicht lesbar: {(err.strip() or out.strip())[:300]}")
+    return [h for h in handlers if isinstance(h, dict) and isinstance(h.get("id"), str)]
+
+
+def _php_handler_view(h: dict[str, Any] | None, handler_id: str) -> dict[str, Any]:
+    if h is None:
+        return {"id": handler_id, "hinweis": "Handler nicht in der Handler-Liste des Servers."}
+    return {"id": h["id"], "version": h.get("fullVersion") or h.get("version"),
+            "typ": h.get("type"), "status": h.get("status")}
+
+
+def _hosting_handler_id(client: paramiko.SSHClient, domain: str) -> str:
+    """Aktueller PHP-Handler der Domain (hosting.php_handler_id)."""
+    sql = (
+        "SELECT h.php_handler_id FROM domains d JOIN hosting h ON h.dom_id = d.id "
+        f"WHERE d.name = {_sql_quote(domain)}"
+    )
+    out, err, rc = _client_exec(client, f"plesk db -Ne {shlex.quote(sql)}")
+    rows = [r.strip() for r in out.strip().splitlines() if r.strip()]
+    if rc != 0 or len(rows) != 1:
+        raise ValueError(
+            f"Domain '{domain}' nicht mit Webhosting in Plesk gefunden"
+            + (f": {err.strip()}" if err.strip() else ".")
+        )
+    return rows[0]
+
+
+def _parse_php_settings(text: str) -> dict[str, dict[str, str]]:
+    """Ausgabe von `plesk bin site --show-php-settings` nach Abschnitten."""
+    sections: dict[str, dict[str, str]] = {}
+    current = None
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        if line.endswith(":") and " = " not in line:
+            current = sections.setdefault(line[:-1].strip(), {})
+            continue
+        m = _PHP_SETTING_LINE_RE.match(line)
+        if m and current is not None:
+            current[m.group(1)] = m.group(2)
+    return sections
+
+
+def _parse_site_hosting(text: str) -> dict[str, str]:
+    """Hosting-Block aus `plesk bin site --info` (ohne FTP-Zugangsdaten)."""
+    out: dict[str, str] = {}
+    block = None
+    for line in text.splitlines():
+        if line.startswith("====="):
+            continue
+        if line and not line.startswith(" ") and ":" not in line:
+            block = line.strip()
+            continue
+        if line.startswith("--WWW-Root--:"):
+            out["WWW-Root"] = line.split(":", 1)[1].strip()
+            continue
+        if block != "Hosting" or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        key = key.strip()
+        if key.lower().startswith("ftp "):
+            continue
+        out[key] = value.strip()
+    return out
+
+
+@mcp.tool()
+def hosting_settings(domain: str) -> str:
+    """Zeigt die Hosting-Einstellungen einer Domain: aktueller PHP-Handler
+    (ID, PHP-Version, Typ fpm/fastcgi/cgi), PHP-Einstellungen (memory_limit,
+    max_execution_time, upload_max_filesize, PHP-FPM-Werte usw.), die
+    Hosting-Angaben aus `plesk bin site --info` (SSL, HTTPS-Redirect,
+    PHP-/CGI-Support, Docroot) und alle auf dem Server aktivierten
+    PHP-Handler, die mit set_php_handler gesetzt werden können.
+    Rein lesend - kein confirm nötig.
+    """
+    d = _hosting_domain(domain)
+    client = _ssh_connect()
+    try:
+        handler_id = _hosting_handler_id(client, d)
+        handlers = _php_handlers(client)
+        out, err, rc = _client_exec(client, f"plesk bin site --show-php-settings {shlex.quote(d)}",
+                                    timeout=_HOSTING_TIMEOUT)
+        php_settings = _parse_php_settings(out) if rc == 0 else {"fehler": (err.strip() or out.strip())[:300]}
+        out, err, rc = _client_exec(client, f"plesk bin site --info {shlex.quote(d)}", timeout=_HOSTING_TIMEOUT)
+        hosting = _parse_site_hosting(out) if rc == 0 else {"fehler": (err.strip() or out.strip())[:300]}
+    finally:
+        client.close()
+    current = next((h for h in handlers if h["id"] == handler_id), None)
+    return _json({
+        "domain": d,
+        "php_handler": _php_handler_view(current, handler_id),
+        "php_einstellungen": php_settings,
+        "hosting": hosting,
+        "verfuegbare_php_handler": [_php_handler_view(h, h["id"]) for h in handlers
+                                    if h.get("status") == "enabled"],
+    })
+
+
+_PHP_HANDLER_MAX_DOMAINS = 50
+
+
+def _hosting_domain(domain: str) -> str:
+    """Domainname wie bei den anderen Tools; IDN in Unicode (z.B.
+    "küche.example") wird in Punycode umgewandelt."""
+    d = (domain or "").strip().lower().rstrip(".")
+    if d and not d.isascii():
+        try:
+            d = d.encode("idna").decode("ascii")
+        except UnicodeError:
+            raise ValueError(f"Ungültiger Domainname: {domain!r}")
+    return _wp_domain(d)
+
+
+@mcp.tool()
+def set_php_handler(
+    handler_id: str,
+    domain: str = "",
+    domains: list[str] | None = None,
+    confirm: bool = False,
+) -> str:
+    """Stellt den PHP-Handler (PHP-Version und Ausführungsart) einer oder
+    mehrerer Domains um, z.B. handler_id="plesk-php84-fpm-dedicated".
+    Entspricht pro Domain `plesk bin site --update <domain> -php_handler_id
+    <id>`. Entweder domain (eine Domain) oder domains (Liste, max. 50)
+    angeben. IDN-Domains in Punycode (xn--...) oder Unicode. Gültig sind nur
+    Handler, die auf dem Server aktiviert sind (Liste siehe hosting_settings
+    bzw. die Fehlermeldung). Gilt nur für die angegebenen Domains (Haupt-,
+    Sub- oder Zusatzdomain), nicht für weitere Domains der Subscription.
+
+    Ohne confirm=true nur Vorschau (je Domain aktueller und neuer Handler,
+    ob sich Version oder Typ ändern) - es wird nichts geändert.
+    ACHTUNG - mit confirm=true wird die Webserver-/PHP-Konfiguration der
+    Domains auf dem Produktivserver neu geschrieben (kurze Unterbrechung
+    möglich, Plugins/Code müssen zur PHP-Version passen). Vorher werden alle
+    Domains geprüft - ist eine unbekannt, wird nichts geändert. Danach wird
+    der Handler je Domain in der Plesk-Datenbank kontrolliert; schlägt eine
+    Domain fehl, werden die übrigen trotzdem umgestellt und der Fehler im
+    Ergebnis gemeldet. Rücksetzen: set_php_handler mit dem je Domain
+    genannten alten Handler.
+    """
+    hid = (handler_id or "").strip()
+    if not _PHP_HANDLER_ID_RE.match(hid):
+        raise ValueError(f"Ungültige handler_id {handler_id!r}.")
+    raw = ([domain] if (domain or "").strip() else []) + list(domains or [])
+    if not raw:
+        raise ValueError("domain oder domains angeben.")
+    if len(raw) > _PHP_HANDLER_MAX_DOMAINS:
+        raise ValueError(f"Maximal {_PHP_HANDLER_MAX_DOMAINS} Domains pro Aufruf.")
+    names = []
+    for r in raw:
+        d = _hosting_domain(r)
+        if d not in names:
+            names.append(d)
+
+    client = _ssh_connect()
+    try:
+        handlers = _php_handlers(client)
+        by_id = {h["id"]: h for h in handlers}
+        target = by_id.get(hid)
+        if target is None or target.get("status") != "enabled":
+            enabled = sorted(h["id"] for h in handlers if h.get("status") == "enabled")
+            raise ValueError(
+                f"PHP-Handler {hid!r} ist auf dem Server "
+                + ("nicht aktiviert" if target is not None else "nicht vorhanden")
+                + ". Aktivierte Handler: " + ", ".join(enabled)
+            )
+        # Zuerst alle Domains prüfen - unbekannte Domain: nichts ändern.
+        current = {d: _hosting_handler_id(client, d) for d in names}
+        results = []
+        for d in names:
+            old_id = current[d]
+            old = by_id.get(old_id)
+            item: dict[str, Any] = {"domain": d, "alt": _php_handler_view(old, old_id)}
+            if old is not None:
+                item["versionswechsel"] = old.get("version") != target.get("version")
+                item["typwechsel"] = old.get("type") != target.get("type")
+            if old_id == hid:
+                item["ergebnis"] = "unverändert (nutzt diesen Handler bereits)"
+            elif not confirm:
+                item["ergebnis"] = "Vorschau - würde umgestellt"
+            else:
+                out, err, rc = _client_exec(
+                    client,
+                    f"plesk bin site --update {shlex.quote(d)} -php_handler_id {shlex.quote(hid)}",
+                    timeout=_HOSTING_TIMEOUT,
+                )
+                msg = (err.strip() or out.strip())[-500:]
+                try:
+                    now_id = _hosting_handler_id(client, d)
+                except ValueError as e:
+                    now_id = f"nicht lesbar: {e}"
+                ok = rc == 0 and now_id == hid
+                _audit("set_php_handler", domain=d, old=old_id, new=hid,
+                       result="ok" if ok else "failed", exit_code=rc, now=now_id)
+                if ok:
+                    item["ergebnis"] = "umgestellt"
+                else:
+                    item["ergebnis"] = "FEHLER - nicht umgestellt"
+                    item["fehler"] = f"Exit-Code {rc}, aktuell in Plesk: {now_id!r}: {msg}"
+            results.append(item)
+    finally:
+        client.close()
+
+    out_: dict[str, Any] = {"neu": _php_handler_view(target, hid), "domains": results}
+    if not confirm and any(r["ergebnis"].startswith("Vorschau") for r in results):
+        out_["hinweis"] = "Vorschau - nichts geändert. Zum Umstellen confirm=true setzen."
+    failed = [r["domain"] for r in results if r["ergebnis"].startswith("FEHLER")]
+    if failed:
+        out_["fehlgeschlagen"] = failed
+    return _json(out_)
 
 
 # ---------------------------------------------------------------------------
