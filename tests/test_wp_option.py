@@ -13,23 +13,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import server  # noqa: E402
 
 
-def test_allowlist_default():
-    assert server._wp_check_option("wp_rocket_settings") == "wp_rocket_settings"
-    assert server._wp_check_option("elementor_font_display") == "elementor_font_display"
+@pytest.mark.parametrize("name", ["wp_rocket_settings", "imagify_settings", "blog_public", "siteurl", "my-option"])
+def test_any_valid_option_allowed(name):
+    assert server._wp_check_option(f" {name} ") == name
 
 
-@pytest.mark.parametrize("name", ["siteurl", "home", "admin_email", "active_plugins", "", "a b", "x;rm"])
-def test_allowlist_rejects(name):
-    with pytest.raises(ValueError):
+@pytest.mark.parametrize("name", ["", "a b", "x;rm", "a/b", "x" * 192, "$(id)"])
+def test_invalid_option_name_rejected(name):
+    with pytest.raises(ValueError, match="Ungültiger Optionsname"):
         server._wp_check_option(name)
-
-
-def test_allowlist_env(monkeypatch):
-    monkeypatch.setenv("WP_OPTION_ALLOWLIST", "blog_public, bad name ,my_option")
-    assert server._wp_check_option("my_option") == "my_option"
-    assert server._wp_check_option("blog_public") == "blog_public"
-    with pytest.raises(ValueError):
-        server._wp_check_option("bad name")
 
 
 @pytest.mark.parametrize(
