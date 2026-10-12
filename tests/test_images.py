@@ -374,14 +374,261 @@ def test_stale_work_dirs_removed(vhost):
     assert not old.exists()
 
 
-def test_tool_error_message_has_exit_code(vhost, monkeypatch, tmp_path):
-    bad = tmp_path / "bad"
-    bad.write_text("#!/bin/sh\nexit 3\n")
-    bad.chmod(0o755)
-    monkeypatch.setattr(server, "_IMG_JPEGOPTIM", str(bad))
+def _tool(tmp_path, name, body):
+    f = tmp_path / name
+    f.write_text("#!/bin/sh\n" + body)
+    f.chmod(0o755)
+    return str(f)
+
+
+def _inject(monkeypatch, code):
+    """Code im Worker vor main() ausführen (z.B. os-Funktionen ersetzen)."""
+    src = server._IMG_WORKER_SRC
+    assert src.endswith("\nmain()\n")
+    monkeypatch.setattr(server, "_IMG_WORKER_SRC", src[:-len("main()\n")] + code + "\nmain()\n")
+
+
+def _worker_ns():
+    ns = {}
+    exec(compile(server._IMG_WORKER_SRC.replace("\nmain()\n", "\n"), "w", "exec"), ns)
+    return ns
+
+
+def _snapshot(root):
+    """Alle Einträge unter root mit Typ, Grösse und mtime (inkl. Ordner)."""
+    out = {}
+    for r, ds, fs in os.walk(root):
+        for n in ds + fs:
+            st = os.lstat(os.path.join(r, n))
+            out[os.path.relpath(os.path.join(r, n), root)] = (st.st_mode, st.st_size, st.st_mtime_ns)
+    st = os.lstat(root)
+    out["."] = (st.st_mode, st.st_size, st.st_mtime_ns)
+    return out
+
+
+# --- Punkt 1: Werkzeug lehnt Datei ab / leere Fehlermeldung ---------------
+
+def test_tool_rejection_is_skipped_with_message(vhost, monkeypatch, tmp_path):
+    # 0.18: optipng -quiet / jpegoptim -q schreiben bei Ablehnung nichts -> "werkzeug: "
+    monkeypatch.setattr(server, "_IMG_JPEGOPTIM", _tool(tmp_path, "jpegoptim", "exit 1\n"))
     make_jpeg(vhost / "httpdocs/uploads/a.jpg")
     res = opt()
-    assert res["fehler"][0]["fehler"] == "bad Exit-Code 3: keine Ausgabe"
-    bad.write_text("#!/bin/sh\necho 'Not a JPEG file' >&2\nexit 2\n")
+    assert "fehler" not in res and res["uebersprungen"]["werkzeug_abgelehnt"] == 1
+    assert res["uebersprungen_details"] == [{"datei": "httpdocs/uploads/a.jpg", "grund": "werkzeug_abgelehnt",
+                                             "meldung": "jpegoptim Exit-Code 1: keine Ausgabe"}]
+    monkeypatch.setattr(server, "_IMG_JPEGOPTIM", _tool(
+        tmp_path, "jpegoptim", "echo '** Processing: x' >&2\necho 'Error: IHDR: CRC error' >&2\nexit 2\n"))
     res = opt()
-    assert res["fehler"][0]["fehler"] == "bad Exit-Code 2: Not a JPEG file"
+    assert res["uebersprungen_details"][0]["meldung"] == "jpegoptim Exit-Code 2: Error: IHDR: CRC error"
+
+
+def test_tools_called_without_quiet(vhost, monkeypatch, tmp_path):
+    log = tmp_path / "args.log"
+    for name in ("jpegoptim", "optipng"):
+        monkeypatch.setattr(server, "_IMG_" + name.upper(), _tool(tmp_path, name, f'echo "$@" >> {log}\n'))
+    make_jpeg(vhost / "httpdocs/uploads/a.jpg")
+    make_png(vhost / "httpdocs/uploads/b.png")
+    opt()
+    args = log.read_text().split()
+    assert "-q" not in args and "-quiet" not in args and "-p" in args and "-preserve" in args
+
+
+def test_wrong_extension_is_skipped_not_error(vhost):
+    up = vhost / "httpdocs/uploads"
+    make_png(up / "logo.png")
+    os.rename(up / "logo.png", up / "png-als.jpg")
+    make_jpeg(up / "jpeg-als.png")
+    (up / "icon.png").write_bytes(b"\x00\x00\x01\x00\x06\x00" + b"\x00" * 60)  # ICO
+    (up / "leer.png").write_bytes(b"")
+    res = opt()
+    assert "fehler" not in res and res["uebersprungen"]["format_passt_nicht_zur_endung"] == 4
+    meld = {d["datei"].rsplit("/", 1)[-1]: d["meldung"] for d in res["uebersprungen_details"]}
+    assert meld == {"icon.png": "Inhalt ist ico, Endung .png",
+                    "jpeg-als.png": "Inhalt ist jpeg, Endung .png",
+                    "leer.png": "Inhalt ist kein bekanntes Bildformat, Endung .png",
+                    "png-als.jpg": "Inhalt ist png, Endung .jpg"}
+
+
+def test_exception_message_has_type_and_text(vhost, monkeypatch, tmp_path):
+    # Werkzeug löscht seine Eingabe -> FileNotFoundError im Worker
+    monkeypatch.setattr(server, "_IMG_JPEGOPTIM", _tool(tmp_path, "jpegoptim", 'for a; do f="$a"; done; rm "$f"\n'))
+    make_jpeg(vhost / "httpdocs/uploads/a.jpg")
+    err = opt()["fehler"][0]["fehler"]
+    assert err.startswith("FileNotFoundError: ") and len(err) > len("FileNotFoundError: ")
+    ns = _worker_ns()
+    assert ns["exc_text"](OSError()) == "OSError: OSError()"
+    assert ns["exc_text"](ns["Bad"]("")) == "unbekannter Fehler"
+
+
+@pytest.mark.skipif(not (os.path.exists("/usr/bin/optipng") and os.path.exists("/usr/bin/jpegoptim")),
+                    reason="echte jpegoptim/optipng nicht installiert")
+def test_real_tools_reject_like_on_server(vhost, monkeypatch):
+    """Nachgestellte Fälle vom Server mit den echten Werkzeugen."""
+    import struct
+    import zlib
+
+    monkeypatch.setattr(server, "_IMG_JPEGOPTIM", "/usr/bin/jpegoptim")
+    monkeypatch.setattr(server, "_IMG_OPTIPNG", "/usr/bin/optipng")
+
+    def chunk(t, b):
+        return struct.pack(">I", len(b)) + t + b + struct.pack(">I", zlib.crc32(t + b) & 0xFFFFFFFF)
+
+    ihdr = chunk(b"IHDR", struct.pack(">IIBBBBB", 20, 12, 8, 6, 0, 0, 0))
+    idat = chunk(b"IDAT", zlib.compress(b"".join(b"\x00" + bytes(range(80)) for _ in range(12))))
+    up = vhost / "httpdocs/uploads"
+    # bKGD mit 1 Byte bei RGBA: optipng bricht ohne -fix ab
+    (up / "EH.png").write_bytes(b"\x89PNG\r\n\x1a\n" + ihdr + chunk(b"bKGD", b"\x0d") + idat + chunk(b"IEND", b""))
+    # abgeschnittenes PNG: kein IEND
+    make_png(up / "full.png")
+    data = (up / "full.png").read_bytes()
+    (up / "full.png").unlink()
+    (up / "cut-1920x1920.png").write_bytes(data[:len(data) // 2])
+    res = opt()
+    assert "fehler" not in res and res["uebersprungen"]["werkzeug_abgelehnt"] == 2
+    for d in res["uebersprungen_details"]:
+        assert d["meldung"].startswith("optipng Exit-Code 1: ") and "Error" in d["meldung"]
+
+
+# --- Punkt 2: nichts im Webroot ---------------------------------------------
+
+# wie das echte optipng: legt beim Bearbeiten "<datei>.bak" neben die Eingabe
+FAKE_OPTIPNG_BAK = FAKE_OPTIPNG + "\n".join([
+    "import os, time",
+    "open(p + '.bak', 'wb').write(d)",
+    "if b'slow' in d:",
+    "    time.sleep(5)",
+    "os.unlink(p + '.bak')",
+    "",
+])
+
+
+def test_dry_run_creates_nothing_in_webroot(vhost, monkeypatch, tmp_path):
+    f = tmp_path / "optipng"
+    f.write_text(FAKE_OPTIPNG_BAK.replace("{py}", sys.executable))
+    f.chmod(0o755)
+    monkeypatch.setattr(server, "_IMG_OPTIPNG", str(f))
+    monkeypatch.setattr(server, "_IMG_TOOL_TIMEOUT", 1)
+    up = vhost / "httpdocs/uploads"
+    sub = up / "ast-shipping-providers"
+    sub.mkdir()
+    make_png(sub / "a.png")
+    make_jpeg(sub / "b.png")  # falsche Endung
+    from PIL import PngImagePlugin
+    info = PngImagePlugin.PngInfo()
+    info.add_text("x", "slow")
+    Image.new("RGB", (8, 8)).save(sub / "slow.png", "PNG", pnginfo=info)  # läuft in den Timeout
+    make_jpeg(up / "c.jpg")
+    old = up / ".alt.png.mcp-deadbeef.png.bak"
+    old.write_bytes(b"x")
+    os.utime(old, (0, 0))
+    for d in (sub, up, vhost / "httpdocs"):
+        os.utime(d, ns=(1_000_000_000, 1_000_000_000))
+    before = _snapshot(vhost / "httpdocs")
+    res = opt()
+    assert res["uebersprungen"]["timeout"] == 1 and res["bilder_optimiert"] == 2
+    assert _snapshot(vhost / "httpdocs") == before
+    assert res["verwaiste_temp_dateien"][0]["aktion"] == "wird im echten Lauf gelöscht"
+
+
+EXDEV_PRELUDE = r"""
+_orig_replace = os.replace
+def _replace(src, dst):
+    if "/.plesk-mcp/tmp/" in src:
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+    if ".mcp-" in src and FAIL_LOCAL:
+        raise OSError(errno.EIO, "simulierter Fehler")
+    return _orig_replace(src, dst)
+os.replace = _replace
+"""
+
+
+def test_exdev_copy_in_target_dir_removed_on_failure(vhost, monkeypatch):
+    # Arbeitskopie auf anderem Dateisystem: Kopie im Zielordner, Ersetzen schlägt fehl
+    _inject(monkeypatch, "FAIL_LOCAL = True\n" + EXDEV_PRELUDE)
+    f = vhost / "httpdocs/uploads/a.jpg"
+    make_jpeg(f)
+    before = f.read_bytes()
+    res = opt(dry_run=False, confirm=True)
+    assert res["fehler"][0]["fehler"].startswith("OSError: ") and f.read_bytes() == before
+    assert sorted(p.name for p in f.parent.iterdir()) == ["a.jpg"]
+
+
+def test_exdev_replace_still_works(vhost, monkeypatch):
+    _inject(monkeypatch, "FAIL_LOCAL = False\n" + EXDEV_PRELUDE)
+    f = vhost / "httpdocs/uploads/a.jpg"
+    make_jpeg(f)
+    px = pixels(f)
+    res = opt(dry_run=False, confirm=True)
+    assert res["bilder_optimiert"] == 1 and "fehler" not in res and pixels(f) == px
+    assert sorted(p.name for p in f.parent.iterdir()) == ["a.jpg"]
+
+
+def test_orphaned_temp_files(vhost):
+    up = vhost / "httpdocs/uploads"
+    make_jpeg(up / "a.jpg")
+    names = {
+        "alt": ".IMG-1.png.mcp-c5aabcb5.png.bak",       # optipng-Sicherung aus 0.18, alt
+        "alt_jpg": ".foto.JPG.mcp-0123abcd.JPG",        # Arbeitskopie aus 0.18, alt
+        "jung": ".neu.png.mcp-1a87d294.png",            # jünger als 1 Stunde
+        "fremd": ".index.php.mcp-1a2b3c4d.tmp",         # anderes Tool
+    }
+    for k, n in names.items():
+        (up / n).write_bytes(b"x")
+        if k != "jung":
+            os.utime(up / n, (0, 0))
+    os.utime(up, ns=(1_000_000_000, 1_000_000_000))
+    before = _snapshot(up)
+    res = opt()
+    assert _snapshot(up) == before
+    akt = {e["datei"].rsplit("/", 1)[-1]: e["aktion"] for e in res["verwaiste_temp_dateien"]}
+    assert akt == {names["alt"]: "wird im echten Lauf gelöscht", names["alt_jpg"]: "wird im echten Lauf gelöscht",
+                   names["jung"]: "behalten: jünger als 1 Stunde",
+                   names["fremd"]: "behalten: nicht das Namensschema der Bildoptimierung"}
+    res = opt(dry_run=False, confirm=True)
+    akt = {e["datei"].rsplit("/", 1)[-1]: e["aktion"] for e in res["verwaiste_temp_dateien"]}
+    assert akt[names["alt"]] == akt[names["alt_jpg"]] == "gelöscht"
+    assert sorted(p.name for p in up.iterdir()) == sorted(["a.jpg", names["jung"], names["fremd"]])
+    assert res["bilder_optimiert"] == 1
+
+
+# --- Punkt 3: Ordner ohne Schreibrecht -------------------------------------
+
+def test_no_write_permission_skipped_with_owner(vhost, monkeypatch):
+    import grp
+    import pwd
+
+    up = vhost / "httpdocs/uploads"
+    ig = up / "instagram"
+    ig.mkdir()
+    make_png(ig / "post03_badge_bluetooth.png")
+    make_png(ig / "post04.png")
+    make_jpeg(up / "a.jpg")
+    st = os.lstat(ig)
+    owner = f"{pwd.getpwuid(st.st_uid).pw_name}:{grp.getgrgid(st.st_gid).gr_name}"
+    # Tests laufen evtl. als root: fehlendes Schreibrecht im Worker simulieren
+    _inject(monkeypatch, r"""
+_orig_access = os.access
+os.access = lambda p, m: False if p.endswith("/instagram") and m & os.W_OK else _orig_access(p, m)
+""")
+    for kw in ({}, {"dry_run": False, "confirm": True}):
+        before = _snapshot(ig)
+        res = opt(**kw)
+        assert "fehler" not in res and res["uebersprungen"]["keine_schreibrechte"] == 2
+        assert res["ohne_schreibrechte"] == [{"ordner": "httpdocs/uploads/instagram", "besitzer": owner,
+                                              "dateien": 2}]
+        assert ("auch im echten Lauf" in res["schreibrechte_hinweis"]) == (not kw)
+        assert res["bilder_optimiert"] == 1 and _snapshot(ig) == before
+
+
+def test_large_png_uses_o1(vhost, monkeypatch, tmp_path):
+    log = tmp_path / "args.log"
+    monkeypatch.setattr(server, "_IMG_OPTIPNG", _tool(tmp_path, "optipng", f'echo "$@" >> {log}\n'))
+    up = vhost / "httpdocs/uploads"
+    make_png(up / "klein.png")
+    big = Image.frombytes("RGB", (700, 700), os.urandom(700 * 700 * 3))
+    big.save(up / "gross.png", "PNG", compress_level=0)
+    assert (up / "gross.png").stat().st_size >= 1024 * 1024
+    opt()
+    lines = log.read_text().splitlines()
+    assert any("-o1" in l and "-o2" not in l for l in lines) and any("-o2" in l for l in lines)
+    assert len(lines) == 2
