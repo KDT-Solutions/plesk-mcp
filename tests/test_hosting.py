@@ -61,13 +61,17 @@ class FakeClient:
 
 @pytest.fixture
 def plesk(monkeypatch):
-    state = {"handler": "plesk-php82-fpm-dedicated", "calls": [], "update_rc": 0}
+    state = {"handlers": {"example.com": "plesk-php82-fpm-dedicated",
+                          "shop.example.com": "plesk-php82-fpm-dedicated",
+                          "xn--kche-0ra.example": "plesk-php83-fpm-dedicated"},
+             "calls": [], "fail": set()}
 
     def exec_(client, cmd, timeout=None, stdin_data=None):
         state["calls"].append(cmd)
         if cmd.startswith("plesk db"):
-            if "'example.com'" in cmd:
-                return state["handler"] + "\n", "", 0
+            for d, h in state["handlers"].items():
+                if f"'{d}'" in cmd:
+                    return h + "\n", "", 0
             return "", "", 0
         if cmd.startswith("plesk bin php_handler --list"):
             return json.dumps(HANDLERS), "", 0
@@ -76,10 +80,11 @@ def plesk(monkeypatch):
         if cmd.startswith("plesk bin site --info"):
             return SITE_INFO, "", 0
         if cmd.startswith("plesk bin site --update"):
-            if state["update_rc"] == 0:
-                state["handler"] = cmd.split()[-1]
-                return "SUCCESS: Update of domain 'example.com' completed.", "", 0
-            return "", "An error occurred", state["update_rc"]
+            d = cmd.split()[4]
+            if d in state["fail"]:
+                return "", "An error occurred", 1
+            state["handlers"][d] = cmd.split()[-1]
+            return f"SUCCESS: Update of domain '{d}' completed.", "", 0
         raise AssertionError(cmd)
 
     monkeypatch.setattr(server, "_ssh_connect", lambda: FakeClient())
@@ -109,50 +114,69 @@ def test_hosting_settings(plesk):
 
 
 def test_preview_without_confirm(plesk):
-    res = json.loads(server.set_php_handler("example.com", "plesk-php83-fpm-dedicated"))
-    assert "Vorschau" in res["ergebnis"] and res["versionswechsel"] and not res["typwechsel"]
-    assert updates(plesk) == [] and plesk["handler"] == "plesk-php82-fpm-dedicated"
+    res = json.loads(server.set_php_handler("plesk-php83-fpm-dedicated", domain="example.com"))
+    item = res["domains"][0]
+    assert item["ergebnis"].startswith("Vorschau") and item["versionswechsel"] and not item["typwechsel"]
+    assert "hinweis" in res and updates(plesk) == []
+    assert plesk["handlers"]["example.com"] == "plesk-php82-fpm-dedicated"
 
 
 def test_change_with_confirm(plesk):
-    res = json.loads(server.set_php_handler("example.com", "plesk-php83-fpm-dedicated", confirm=True))
+    res = json.loads(server.set_php_handler("plesk-php83-fpm-dedicated", domain="example.com", confirm=True))
     assert updates(plesk) == ["plesk bin site --update example.com -php_handler_id plesk-php83-fpm-dedicated"]
-    assert plesk["handler"] == "plesk-php83-fpm-dedicated"
-    assert res["alt"]["id"] == "plesk-php82-fpm-dedicated" and "plesk-php82-fpm-dedicated" in res["ergebnis"]
+    assert plesk["handlers"]["example.com"] == "plesk-php83-fpm-dedicated"
+    assert res["domains"][0]["ergebnis"] == "umgestellt"
+    assert res["domains"][0]["alt"]["id"] == "plesk-php82-fpm-dedicated"
 
 
-def test_same_handler_noop(plesk):
-    res = json.loads(server.set_php_handler("example.com", "plesk-php82-fpm-dedicated", confirm=True))
-    assert "bereits" in res["ergebnis"] and updates(plesk) == []
+def test_multiple_domains_and_idn(plesk):
+    res = json.loads(server.set_php_handler(
+        "plesk-php83-fpm-dedicated", domains=["example.com", "Shop.Example.com", "küche.example"], confirm=True))
+    assert [r["domain"] for r in res["domains"]] == ["example.com", "shop.example.com", "xn--kche-0ra.example"]
+    assert [r["ergebnis"] for r in res["domains"]] == ["umgestellt", "umgestellt",
+                                                      "unverändert (nutzt diesen Handler bereits)"]
+    assert len(updates(plesk)) == 2 and "fehlgeschlagen" not in res
+
+
+def test_unknown_domain_changes_nothing(plesk):
+    with pytest.raises(ValueError, match="nicht mit Webhosting"):
+        server.set_php_handler("plesk-php83-fpm-dedicated", domains=["example.com", "other.example.com"],
+                               confirm=True)
+    assert updates(plesk) == []
+
+
+def test_failure_reported_others_changed(plesk):
+    plesk["fail"].add("example.com")
+    res = json.loads(server.set_php_handler(
+        "plesk-php83-fpm-dedicated", domains=["example.com", "shop.example.com"], confirm=True))
+    assert res["fehlgeschlagen"] == ["example.com"] and "Exit-Code 1" in res["domains"][0]["fehler"]
+    assert plesk["handlers"]["shop.example.com"] == "plesk-php83-fpm-dedicated"
 
 
 @pytest.mark.parametrize("hid", ["plesk-php83-fastcgi", "plesk-php99-fpm"])
 def test_disabled_or_unknown_handler_rejected(plesk, hid):
     with pytest.raises(ValueError, match="Aktivierte Handler"):
-        server.set_php_handler("example.com", hid, confirm=True)
+        server.set_php_handler(hid, domain="example.com", confirm=True)
     assert updates(plesk) == []
 
 
 @pytest.mark.parametrize("hid", ["", "x y", "a;rm -rf /", "-php true", "$(id)"])
 def test_invalid_handler_id(plesk, hid):
     with pytest.raises(ValueError, match="handler_id"):
-        server.set_php_handler("example.com", hid, confirm=True)
+        server.set_php_handler(hid, domain="example.com", confirm=True)
     assert plesk["calls"] == []
 
 
-@pytest.mark.parametrize("domain", ["", "example.com; id", "../x", "Example Com"])
+@pytest.mark.parametrize("domain", ["example.com; id", "../x", "Example Com", "-php_handler_id"])
 def test_invalid_domain(plesk, domain):
     with pytest.raises(ValueError):
-        server.set_php_handler(domain, "plesk-php83-fpm-dedicated", confirm=True)
+        server.set_php_handler("plesk-php83-fpm-dedicated", domain=domain, confirm=True)
     assert plesk["calls"] == []
 
 
-def test_unknown_domain(plesk):
-    with pytest.raises(ValueError, match="nicht mit Webhosting"):
-        server.set_php_handler("other.example.com", "plesk-php83-fpm-dedicated", confirm=True)
-
-
-def test_plesk_error_reported(plesk):
-    plesk["update_rc"] = 1
-    with pytest.raises(server.SSHError, match="nicht umgestellt"):
-        server.set_php_handler("example.com", "plesk-php83-fpm-dedicated", confirm=True)
+def test_domain_required_and_limit(plesk):
+    with pytest.raises(ValueError, match="domain oder domains"):
+        server.set_php_handler("plesk-php83-fpm-dedicated", confirm=True)
+    with pytest.raises(ValueError, match="Maximal"):
+        server.set_php_handler("plesk-php83-fpm-dedicated", domains=[f"d{i}.example.com" for i in range(51)])
+    assert plesk["calls"] == []

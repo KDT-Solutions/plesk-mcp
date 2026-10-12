@@ -163,7 +163,7 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8422` auf dem Docker-Hos
 | `wp_option_update` | Ändert eine WordPress-Option (Allowlist) per WP-CLI als Subscription-User - Teilschlüssel (`keys`) oder ganzer Wert (`value`); ohne `confirm=true` nur Vorschau, mit `confirm=true` vorher JSON-Backup, Rückgabe mit `backup_id` |
 | `wp_option_rollback` | Spielt ein Backup von `wp_option_update` zurück (`backup_id`) - ohne `confirm=true` nur Vorschau |
 | `hosting_settings` | Zeigt PHP-Handler (Version, Typ), PHP-Einstellungen (`memory_limit`, Upload-Limits, PHP-FPM-Werte ...), Hosting-Angaben aus `plesk bin site --info` (SSL, HTTPS-Redirect, Docroot) und alle aktivierten PHP-Handler - read-only |
-| `set_php_handler` | Stellt den PHP-Handler einer Domain um (`plesk bin site --update -php_handler_id`), nur aktivierte Handler - ohne `confirm=true` nur Vorschau, danach Kontrolle in der Plesk-DB |
+| `set_php_handler` | Stellt den PHP-Handler einer oder mehrerer Domains (max. 50, IDN als Punycode oder Unicode) um (`plesk bin site --update -php_handler_id`), nur aktivierte Handler - ohne `confirm=true` nur Vorschau, danach Kontrolle in der Plesk-DB |
 | `delete_vhost_log` | Löscht rotierte Logs bzw. leert aktive Logs unter `/var/www/vhosts/<domain>/logs/` (einzeln oder `all_rotated=true`) - **erfordert `confirm=true`** |
 | `imunify_malware_list` | Aktuelle Imunify360-Malware-Treffer (Pfad, Zeitpunkt, Signatur, Status) als JSON, optional gefiltert nach Domain, Pfad oder Status |
 | `imunify_ignore_list` | Einträge der Imunify360-Malware-Ignore-Liste als JSON (optional Suche nach Pfad) |
@@ -292,8 +292,9 @@ replace_in_vhost_file(domain="example.com", path="httpdocs/wp-config.php",
 ## Beispiel: PHP-Version einer Domain umstellen
 
 1. `hosting_settings(domain="example.com")` zeigt den aktuellen Handler (z.B. `plesk-php82-fpm-dedicated`, PHP 8.2, Typ `fpm`) und die Liste der auf dem Server aktivierten Handler.
-2. `set_php_handler(domain="example.com", handler_id="plesk-php83-fpm-dedicated")` ohne `confirm` liefert nur eine Vorschau: alter und neuer Handler, ob sich PHP-Version und/oder Typ (fpm/fastcgi/cgi) ändern.
+2. `set_php_handler(handler_id="plesk-php83-fpm-dedicated", domain="example.com")` ohne `confirm` liefert nur eine Vorschau: alter und neuer Handler, ob sich PHP-Version und/oder Typ (fpm/fastcgi/cgi) ändern.
 3. Mit `confirm=true` wird `plesk bin site --update example.com -php_handler_id plesk-php83-fpm-dedicated` ausgeführt und anschliessend der Handler in der Plesk-Datenbank kontrolliert. Die Rückgabe nennt den alten Handler zum Zurücksetzen.
+4. Mehrere Domains in einem Aufruf: `set_php_handler(handler_id="plesk-php84-fpm-dedicated", domains=["example.com", "example.org", "xn--kche-0ra.example"], confirm=true)`. Zuerst werden alle Domains geprüft (unbekannte Domain: nichts wird geändert), dann wird jede einzeln umgestellt und kontrolliert. Schlägt eine fehl, werden die übrigen trotzdem umgestellt und die fehlgeschlagenen unter `fehlgeschlagen` gemeldet.
 
 Nicht aktivierte oder unbekannte Handler werden abgelehnt (mit Liste der aktivierten). Die Umstellung gilt nur für die angegebene Domain, nicht für weitere Domains derselben Subscription. Timeout über `PLESK_HOSTING_TIMEOUT` (Standard 180 Sekunden). Jede Umstellung landet im Audit-Log.
 

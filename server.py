@@ -4280,7 +4280,7 @@ def hosting_settings(domain: str) -> str:
     PHP-Handler, die mit set_php_handler gesetzt werden können.
     Rein lesend - kein confirm nötig.
     """
-    d = _wp_domain(domain)
+    d = _hosting_domain(domain)
     client = _ssh_connect()
     try:
         handler_id = _hosting_handler_id(client, d)
@@ -4303,75 +4303,118 @@ def hosting_settings(domain: str) -> str:
     })
 
 
-@mcp.tool()
-def set_php_handler(domain: str, handler_id: str, confirm: bool = False) -> str:
-    """Stellt den PHP-Handler (PHP-Version und Ausführungsart) einer Domain
-    um, z.B. handler_id="plesk-php83-fpm-dedicated". Entspricht
-    `plesk bin site --update <domain> -php_handler_id <id>`. Gültig sind
-    nur Handler, die auf dem Server aktiviert sind (Liste siehe
-    hosting_settings bzw. die Fehlermeldung). Gilt nur für die angegebene
-    Domain (Haupt-, Sub- oder Zusatzdomain), nicht für weitere Domains der
-    Subscription.
+_PHP_HANDLER_MAX_DOMAINS = 50
 
-    Ohne confirm=true nur Vorschau (aktueller und neuer Handler, ob sich
-    Version oder Typ ändern) - es wird nichts geändert.
+
+def _hosting_domain(domain: str) -> str:
+    """Domainname wie bei den anderen Tools; IDN in Unicode (z.B.
+    "küche.example") wird in Punycode umgewandelt."""
+    d = (domain or "").strip().lower().rstrip(".")
+    if d and not d.isascii():
+        try:
+            d = d.encode("idna").decode("ascii")
+        except UnicodeError:
+            raise ValueError(f"Ungültiger Domainname: {domain!r}")
+    return _wp_domain(d)
+
+
+@mcp.tool()
+def set_php_handler(
+    handler_id: str,
+    domain: str = "",
+    domains: list[str] | None = None,
+    confirm: bool = False,
+) -> str:
+    """Stellt den PHP-Handler (PHP-Version und Ausführungsart) einer oder
+    mehrerer Domains um, z.B. handler_id="plesk-php84-fpm-dedicated".
+    Entspricht pro Domain `plesk bin site --update <domain> -php_handler_id
+    <id>`. Entweder domain (eine Domain) oder domains (Liste, max. 50)
+    angeben. IDN-Domains in Punycode (xn--...) oder Unicode. Gültig sind nur
+    Handler, die auf dem Server aktiviert sind (Liste siehe hosting_settings
+    bzw. die Fehlermeldung). Gilt nur für die angegebenen Domains (Haupt-,
+    Sub- oder Zusatzdomain), nicht für weitere Domains der Subscription.
+
+    Ohne confirm=true nur Vorschau (je Domain aktueller und neuer Handler,
+    ob sich Version oder Typ ändern) - es wird nichts geändert.
     ACHTUNG - mit confirm=true wird die Webserver-/PHP-Konfiguration der
-    Domain auf dem Produktivserver neu geschrieben (kurze Unterbrechung
-    möglich, Plugins/Code müssen zur PHP-Version passen). Danach wird der
-    Handler in der Plesk-Datenbank kontrolliert. Rücksetzen: set_php_handler
-    mit dem in der Rückgabe genannten alten Handler.
+    Domains auf dem Produktivserver neu geschrieben (kurze Unterbrechung
+    möglich, Plugins/Code müssen zur PHP-Version passen). Vorher werden alle
+    Domains geprüft - ist eine unbekannt, wird nichts geändert. Danach wird
+    der Handler je Domain in der Plesk-Datenbank kontrolliert; schlägt eine
+    Domain fehl, werden die übrigen trotzdem umgestellt und der Fehler im
+    Ergebnis gemeldet. Rücksetzen: set_php_handler mit dem je Domain
+    genannten alten Handler.
     """
-    d = _wp_domain(domain)
     hid = (handler_id or "").strip()
     if not _PHP_HANDLER_ID_RE.match(hid):
         raise ValueError(f"Ungültige handler_id {handler_id!r}.")
+    raw = ([domain] if (domain or "").strip() else []) + list(domains or [])
+    if not raw:
+        raise ValueError("domain oder domains angeben.")
+    if len(raw) > _PHP_HANDLER_MAX_DOMAINS:
+        raise ValueError(f"Maximal {_PHP_HANDLER_MAX_DOMAINS} Domains pro Aufruf.")
+    names = []
+    for r in raw:
+        d = _hosting_domain(r)
+        if d not in names:
+            names.append(d)
+
     client = _ssh_connect()
     try:
-        old_id = _hosting_handler_id(client, d)
         handlers = _php_handlers(client)
         by_id = {h["id"]: h for h in handlers}
         target = by_id.get(hid)
-        enabled = sorted(h["id"] for h in handlers if h.get("status") == "enabled")
         if target is None or target.get("status") != "enabled":
+            enabled = sorted(h["id"] for h in handlers if h.get("status") == "enabled")
             raise ValueError(
                 f"PHP-Handler {hid!r} ist auf dem Server "
                 + ("nicht aktiviert" if target is not None else "nicht vorhanden")
                 + ". Aktivierte Handler: " + ", ".join(enabled)
             )
-        old = by_id.get(old_id)
-        result: dict[str, Any] = {
-            "domain": d,
-            "alt": _php_handler_view(old, old_id),
-            "neu": _php_handler_view(target, hid),
-        }
-        if old is not None:
-            result["versionswechsel"] = old.get("version") != target.get("version")
-            result["typwechsel"] = old.get("type") != target.get("type")
-        if old_id == hid:
-            result["ergebnis"] = "Domain nutzt diesen PHP-Handler bereits - nichts geändert."
-            return _json(result)
-        if not confirm:
-            result["ergebnis"] = "Vorschau - nichts geändert. Zum Umstellen confirm=true setzen."
-            return _json(result)
-        out, err, rc = _client_exec(
-            client,
-            f"plesk bin site --update {shlex.quote(d)} -php_handler_id {shlex.quote(hid)}",
-            timeout=_HOSTING_TIMEOUT,
-        )
-        msg = (err.strip() or out.strip())[-500:]
-        now_id = _hosting_handler_id(client, d)
+        # Zuerst alle Domains prüfen - unbekannte Domain: nichts ändern.
+        current = {d: _hosting_handler_id(client, d) for d in names}
+        results = []
+        for d in names:
+            old_id = current[d]
+            old = by_id.get(old_id)
+            item: dict[str, Any] = {"domain": d, "alt": _php_handler_view(old, old_id)}
+            if old is not None:
+                item["versionswechsel"] = old.get("version") != target.get("version")
+                item["typwechsel"] = old.get("type") != target.get("type")
+            if old_id == hid:
+                item["ergebnis"] = "unverändert (nutzt diesen Handler bereits)"
+            elif not confirm:
+                item["ergebnis"] = "Vorschau - würde umgestellt"
+            else:
+                out, err, rc = _client_exec(
+                    client,
+                    f"plesk bin site --update {shlex.quote(d)} -php_handler_id {shlex.quote(hid)}",
+                    timeout=_HOSTING_TIMEOUT,
+                )
+                msg = (err.strip() or out.strip())[-500:]
+                try:
+                    now_id = _hosting_handler_id(client, d)
+                except ValueError as e:
+                    now_id = f"nicht lesbar: {e}"
+                ok = rc == 0 and now_id == hid
+                _audit("set_php_handler", domain=d, old=old_id, new=hid,
+                       result="ok" if ok else "failed", exit_code=rc, now=now_id)
+                if ok:
+                    item["ergebnis"] = "umgestellt"
+                else:
+                    item["ergebnis"] = "FEHLER - nicht umgestellt"
+                    item["fehler"] = f"Exit-Code {rc}, aktuell in Plesk: {now_id!r}: {msg}"
+            results.append(item)
     finally:
         client.close()
-    ok = rc == 0 and now_id == hid
-    _audit("set_php_handler", domain=d, old=old_id, new=hid, result="ok" if ok else "failed",
-           exit_code=rc, now=now_id)
-    if not ok:
-        raise SSHError(
-            f"PHP-Handler nicht umgestellt (Exit-Code {rc}, aktuell in Plesk: {now_id!r}): {msg}"
-        )
-    result["ergebnis"] = f"PHP-Handler umgestellt. Rücksetzen: set_php_handler(domain, '{old_id}', confirm=true)."
-    result["plesk_ausgabe"] = msg
-    return _json(result)
+
+    out_: dict[str, Any] = {"neu": _php_handler_view(target, hid), "domains": results}
+    if not confirm and any(r["ergebnis"].startswith("Vorschau") for r in results):
+        out_["hinweis"] = "Vorschau - nichts geändert. Zum Umstellen confirm=true setzen."
+    failed = [r["domain"] for r in results if r["ergebnis"].startswith("FEHLER")]
+    if failed:
+        out_["fehlgeschlagen"] = failed
+    return _json(out_)
 
 
 # ---------------------------------------------------------------------------
