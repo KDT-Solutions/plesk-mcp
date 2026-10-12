@@ -270,9 +270,9 @@ def test_env_allowlist(plesk, monkeypatch):
 
 
 def test_lock_per_domain(plesk):
-    lock = server._phps_lock(DOMAIN)
+    lock = server._phps_lock(DOMAIN, DOMAIN)
     try:
-        with pytest.raises(ValueError, match="läuft bereits"):
+        with pytest.raises(ValueError, match="^Für example.com läuft bereits eine Änderung der PHP-Einstellungen"):
             upd(settings={"memory_limit": "512M"}, confirm=True)
     finally:
         lock.release()

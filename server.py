@@ -116,7 +116,7 @@ if _HTTP_MODE and not _MCP_API_KEY:
 # Dateien (server.py, Dockerfile, requirements.txt, Workflow) geaendert haben.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.17"
+_VERSION_BASE = "0.18"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -3071,15 +3071,19 @@ def _vhost_ctx(domain: str) -> dict[str, Any]:
         if not _WP_SYSUSER_RE.match(login):
             raise ValueError(f"Unerwarteter System-User für '{d}'.")
         sql = (
-            "SELECT h.www_root FROM domains d JOIN hosting h ON h.dom_id = d.id "
+            "SELECT d.id, h.www_root FROM domains d JOIN hosting h ON h.dom_id = d.id "
             f"WHERE d.id = {int(dom_id)} OR d.webspace_id = {int(dom_id)}"
         )
         out, _, rc = _client_exec(client, f"plesk db -Ne {shlex.quote(sql)}")
         docroots = []
-        for r in out.strip().splitlines():
+        main_docroot = None
+        for line in out.strip().splitlines():
+            rid, _, r = line.partition("\t")
             r = posixpath.normpath(r.strip())
             if r.startswith(base + "/"):
                 docroots.append(r[len(base) + 1:].split("/"))
+                if rid.strip() == dom_id:
+                    main_docroot = docroots[-1]
         out, _, rc = _client_exec(client, f"id -u {shlex.quote(login)} && id -g {shlex.quote(login)}")
         ids = out.split()
         if rc != 0 or len(ids) != 2 or not all(i.isdigit() for i in ids) or "0" in ids:
@@ -3089,7 +3093,7 @@ def _vhost_ctx(domain: str) -> dict[str, Any]:
     if not docroots:
         raise ValueError(f"Kein Docroot für '{d}' gefunden.")
     return {"domain": d, "base": base, "login": login, "uid": int(ids[0]), "gid": int(ids[1]),
-            "docroots": docroots}
+            "docroots": docroots, "main_docroot": main_docroot}
 
 
 def _docroot_of(parts: list[str], docroots: list[list[str]]) -> list[str] | None:
@@ -4554,12 +4558,13 @@ def _phps_check_value(key: Any, value: Any) -> tuple[str, str]:
     return k, v
 
 
-def _phps_lock(domain: str) -> threading.Lock:
+def _phps_lock(key: str, domain: str, was: str = "eine Änderung der PHP-Einstellungen") -> threading.Lock:
+    """Sperre pro Domain und Aktionsart (key, z.B. "img:example.com"); die
+    Meldung nennt nur Domain und Aktion, nicht den internen Schlüssel."""
     with _phps_locks_guard:
-        lock = _phps_locks.setdefault(domain, threading.Lock())
+        lock = _phps_locks.setdefault(key, threading.Lock())
     if not lock.acquire(blocking=False):
-        raise ValueError(f"Für '{domain}' läuft bereits eine Änderung der PHP-Einstellungen - "
-                         "bitte warten und erneut versuchen.")
+        raise _UserError(f"Für {domain} läuft bereits {was} - bitte warten und erneut versuchen.")
     return lock
 
 
@@ -4835,7 +4840,7 @@ def _phps_change(domain: str, target_fn, confirm: bool, source: str) -> str:
     """Gemeinsamer Ablauf für Update und Rollback: Stand lesen, Soll berechnen,
     Vorschau bzw. Backup + Schreiben + Prüfungen + automatisches Zurückstellen."""
     d = _hosting_domain(domain)
-    lock = _phps_lock(d)
+    lock = _phps_lock(d, d)
     try:
         client = _ssh_connect()
         try:
@@ -5151,7 +5156,7 @@ def _root_json_read(client: paramiko.SSHClient, bdir: str, backup_id: str, domai
 
 def _web_change(domain: str, targets_fn, confirm: bool, source: str) -> str:
     d = _hosting_domain(domain)
-    lock = _phps_lock(f"web:{d}")
+    lock = _phps_lock(f"web:{d}", d, "eine Änderung der Webserver-Einstellungen")
     try:
         client = _ssh_connect()
         try:
@@ -5559,12 +5564,20 @@ def collect(start, rel, a, skipped):
     return files
 
 
-def run_tool(cmd):
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+class ToolTimeout(Exception):
+    pass
+
+
+def run_tool(cmd, timeout):
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise ToolTimeout()
     return p.returncode, (p.stderr or p.stdout).decode("utf-8", "replace")[-300:]
 
 
 def optimize(a):
+    t0 = time.time()
     base = a["base"]
     start = lpath(base, a["parts"])
     skipped = {}
@@ -5576,7 +5589,7 @@ def optimize(a):
         skipped["limit_max_files"] = len(files) - a["max_files"]
         files = files[:a["max_files"]]
     tools = {"jpeg": a["jpegoptim"], "png": a["optipng"]}
-    deadline = time.time() + a.get("time_budget", 40)
+    deadline = t0 + a.get("time_budget", 30)
     next_after = None
     checked = 0
     done, errors = [], []
@@ -5608,9 +5621,9 @@ def optimize(a):
             with os.fdopen(fd, "wb") as f:
                 f.write(clean)
             if kind == "jpeg":
-                rc, msg = run_tool([tools[kind], "-q", "-p", tmp])
+                rc, msg = run_tool([tools[kind], "-q", "-p", tmp], a.get("tool_timeout", 15))
             else:
-                rc, msg = run_tool([tools[kind], "-quiet", "-o2", "-preserve", tmp])
+                rc, msg = run_tool([tools[kind], "-quiet", "-o2", "-preserve", tmp], a.get("tool_timeout", 15))
             if rc != 0:
                 raise Bad("werkzeug: " + msg.strip())
             new_size = os.path.getsize(tmp)
@@ -5643,6 +5656,12 @@ def optimize(a):
             total_before += st.st_size
             total_after += new_size
             done.append(entry)
+        except ToolTimeout:
+            skipped["timeout"] = skipped.get("timeout", 0) + 1
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         except Exception as e:  # noqa
             errors.append({"datei": rel, "fehler": str(e)[:200]})
             try:
@@ -5740,8 +5759,10 @@ _IMG_JPEGOPTIM = os.environ.get("IMAGE_JPEGOPTIM", "/usr/bin/jpegoptim").strip()
 _IMG_OPTIPNG = os.environ.get("IMAGE_OPTIPNG", "/usr/bin/optipng").strip()
 _IMG_TIMEOUT = int(os.environ.get("IMAGE_OPT_TIMEOUT", "300"))
 _IMG_MAX_FILES = 2000
-# Unter dem Tool-Timeout des MCP-Clients (typisch 60 s) bleiben.
-_IMG_TIME_BUDGET = int(os.environ.get("IMAGE_OPT_TIME_BUDGET", "40"))
+# Unter dem Tool-Timeout des MCP-Clients (60 s) bleiben: Budget + eine
+# laufende Datei (je Werkzeug höchstens _IMG_TOOL_TIMEOUT) + SSH/DB-Overhead.
+_IMG_TIME_BUDGET = int(os.environ.get("IMAGE_OPT_TIME_BUDGET", "30"))
+_IMG_TOOL_TIMEOUT = int(os.environ.get("IMAGE_OPT_TOOL_TIMEOUT", "15"))
 _IMG_MAX_BYTES = 50 * 1024 * 1024
 _IMG_RUN_ID_RE = re.compile(r"^\d{14}-[0-9a-f]{8}$")
 
@@ -5767,18 +5788,26 @@ def _img_run(ctx: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
             continue
         if isinstance(res, dict) and "ok" in res:
             if not res["ok"]:
-                raise ValueError(f"Bildoptimierung abgebrochen: {res.get('error')}")
+                raise _UserError(f"Bildoptimierung abgebrochen: {res.get('error')}")
             return res
     raise SSHError(f"Bildoptimierung: keine Antwort vom Worker (Exit-Code {rc}): {(err.strip() or out.strip())[-300:]}")
 
 
 def _img_ctx_and_parts(domain: str, path: str) -> tuple[dict[str, Any], list[str]]:
+    """Leerer path = Docroot der Hauptdomain; sonst muss path ein Docroot oder
+    darunter sein."""
     ctx = _vhost_ctx(domain)
-    parts = _strict_parts(path)
+    if not (path or "").strip():
+        main = ctx.get("main_docroot") or ctx["docroots"][0]
+        return ctx, list(main)
+    try:
+        parts = _strict_parts(path)
+    except ValueError as e:
+        raise _UserError(str(e))
     if parts not in ctx["docroots"] and _docroot_of(parts, ctx["docroots"]) is None:
-        raise ValueError(
-            f"'{path}' liegt in keinem Docroot der Subscription - nur Bilder in Webordnern "
-            f"(z.B. {'/'.join(ctx['docroots'][0])}) werden optimiert."
+        raise _UserError(
+            f"'{path}' liegt in keinem Docroot der Subscription - nur Bilder in Webordnern werden "
+            f"optimiert. Gültige Docroots: {', '.join('/'.join(d) for d in ctx['docroots'])}."
         )
     return ctx, parts
 
@@ -5786,18 +5815,19 @@ def _img_ctx_and_parts(domain: str, path: str) -> tuple[dict[str, Any], list[str
 @mcp.tool()
 def optimize_images(
     domain: str,
-    path: str = "httpdocs",
+    path: str = "",
     dry_run: bool = True,
     confirm: bool = False,
     max_files: int = 500,
     recursive: bool = True,
     keep_backup: bool = True,
-    start_after: str = "",
+    weiter_ab: str = "",
 ) -> str:
     """Optimiert JPG- und PNG-Bilder einer Domain verlustfrei (gleiche Pixel)
     für weniger Speicher und schnellere Seiten. domain: Hauptdomain der
     Subscription; path: Ordner oder Datei relativ zu /var/www/vhosts/<domain>/,
-    muss in einem Docroot liegen (z.B. "httpdocs/wp-content/uploads").
+    muss in einem Docroot liegen (z.B. "httpdocs/wp-content/uploads"). Leer
+    (Standard) = Docroot der Hauptdomain; die Rückgabe nennt ihn unter "pfad".
 
     Pro Bild: GPS-Daten, Kamera-/Objektiv-Seriennummern, Besitzername und
     Herstellerdaten (MakerNote) aus EXIF/XMP entfernen (Datenschutz);
@@ -5815,24 +5845,31 @@ def optimize_images(
     der Speicher wird erst frei, wenn das Backup mit image_backups gelöscht
     wird. Max. max_files Bilder pro Aufruf (Standard 500, höchstens 2000).
 
-    Ein Aufruf arbeitet höchstens ca. 40 Sekunden (Zeitbudget) und hört dann
-    sauber auf; die Rückgabe nennt in "fortsetzen_ab" den zuletzt bearbeiteten
-    Pfad - mit start_after=<dieser Wert> und sonst gleichen Parametern geht es
-    weiter (Bilder werden in alphabetischer Pfad-Reihenfolge bearbeitet).
+    Auch der Probelauf führt jpegoptim und optipng tatsächlich aus (auf
+    Kopien) und braucht deshalb ähnlich viel Zeit wie ein echter Lauf.
+    Ein Aufruf dauert höchstens etwa 30 Sekunden Bearbeitung (Zeitbudget,
+    IMAGE_OPT_TIME_BUDGET) plus die Datei, die gerade läuft (jpegoptim/optipng
+    je höchstens 15 s, sonst unter uebersprungen.timeout). Ist danach noch
+    nicht alles bearbeitet, enthält die Rückgabe "unvollstaendig": true und
+    "weiter_ab" - mit weiter_ab=<dieser Wert> und sonst gleichen Parametern
+    erneut aufrufen, bis "unvollstaendig": false. Bilder werden in fester,
+    alphabetischer Pfad-Reihenfolge bearbeitet, jedes genau einmal; echte
+    Teilläufe bekommen je eine eigene backup_run_id.
     """
     if not dry_run and not confirm:
-        raise ValueError("Zum Ausführen dry_run=false UND confirm=true setzen - ändert Dateien auf dem "
+        raise _UserError("Zum Ausführen dry_run=false UND confirm=true setzen - ändert Dateien auf dem "
                          "Produktivserver.")
     if not isinstance(max_files, int) or not 1 <= max_files <= _IMG_MAX_FILES:
-        raise ValueError(f"max_files muss zwischen 1 und {_IMG_MAX_FILES} liegen.")
+        raise _UserError(f"max_files muss zwischen 1 und {_IMG_MAX_FILES} liegen.")
     ctx, parts = _img_ctx_and_parts(domain, path)
     run_id = f"{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}-{os.urandom(4).hex()}"
-    lock = _phps_lock(f"img:{ctx['domain']}")
+    lock = _phps_lock(f"img:{ctx['domain']}", ctx["domain"], "eine Bildoptimierung")
     try:
         res = _img_run(ctx, {"op": "optimize", "parts": parts, "dry_run": bool(dry_run),
                              "recursive": bool(recursive), "keep_backup": bool(keep_backup),
                              "max_files": max_files, "max_bytes": _IMG_MAX_BYTES, "run_id": run_id,
-                             "start_after": (start_after or "").strip(), "time_budget": _IMG_TIME_BUDGET,
+                             "start_after": (weiter_ab or "").strip(), "time_budget": _IMG_TIME_BUDGET,
+                             "tool_timeout": _IMG_TOOL_TIMEOUT,
                              "jpegoptim": _IMG_JPEGOPTIM, "optipng": _IMG_OPTIPNG})
     finally:
         lock.release()
@@ -5855,10 +5892,13 @@ def optimize_images(
         out["backup_run_id"] = run_id
         out["backup_hinweis"] = ("Originale unter " + res["backup"] + " - Speicher wird erst frei, wenn das "
                                  "Backup mit image_backups(action=\"delete\") gelöscht ist.")
+    out["unvollstaendig"] = bool(res.get("fortsetzen_ab") or res["uebersprungen"].get("zeitbudget_rest")
+                                 or res["uebersprungen"].get("limit_max_files"))
     if res.get("fortsetzen_ab"):
-        out["fortsetzen_ab"] = res["fortsetzen_ab"]
-        out["hinweis"] = ("Noch nicht alle Bilder bearbeitet (Zeitbudget oder max_files) - mit start_after=\""
-                          + res["fortsetzen_ab"] + "\" und sonst gleichen Parametern fortsetzen.")
+        out["weiter_ab"] = res["fortsetzen_ab"]
+        grund = "Zeitbudget" if res["uebersprungen"].get("zeitbudget_rest") else "max_files"
+        out["hinweis"] = (f"{grund} erreicht - mit weiter_ab=\"{res['fortsetzen_ab']}\" und sonst gleichen "
+                          "Parametern erneut aufrufen.")
     elif res["uebersprungen"].get("zeitbudget_rest"):
         out["hinweis"] = ("Zeitbudget schon beim Einlesen aufgebraucht (sehr viele Dateien) - einen "
                           "Unterordner angeben, z.B. einen Jahresordner unter wp-content/uploads.")
@@ -5878,14 +5918,14 @@ def image_backups(domain: str, action: str = "list", run_id: str = "", confirm: 
     confirm=true nur Vorschau.
     """
     if action not in ("list", "restore", "delete"):
-        raise ValueError("action muss 'list', 'restore' oder 'delete' sein.")
+        raise _UserError("action muss 'list', 'restore' oder 'delete' sein.")
     ctx = _vhost_ctx(domain)
     if action == "list":
         return _json({"domain": ctx["domain"], **{k: v for k, v in _img_run(ctx, {"op": "list"}).items()
                                                   if k != "ok"}})
     if not _IMG_RUN_ID_RE.match((run_id or "").strip()):
-        raise ValueError(f"Ungültige run_id {run_id!r} (siehe action=\"list\").")
-    lock = _phps_lock(f"img:{ctx['domain']}")
+        raise _UserError(f"Ungültige run_id {run_id!r} (siehe action=\"list\").")
+    lock = _phps_lock(f"img:{ctx['domain']}", ctx["domain"], "eine Bildoptimierung")
     try:
         res = _img_run(ctx, {"op": action, "run_id": run_id.strip(), "dry_run": not confirm})
     finally:

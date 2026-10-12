@@ -204,10 +204,28 @@ def test_max_files_limit_and_continue(vhost):
         make_jpeg(vhost / f"httpdocs/uploads/{i}.jpg")
     res = opt(max_files=2, dry_run=False, confirm=True)
     assert res["bilder_geprueft"] == 2 and res["uebersprungen"]["limit_max_files"] == 1
-    assert res["fortsetzen_ab"] == "httpdocs/uploads/1.jpg" and "start_after" in res["hinweis"]
-    res = opt(max_files=2, dry_run=False, confirm=True, start_after=res["fortsetzen_ab"])
+    assert res["unvollstaendig"] is True and res["weiter_ab"] == "httpdocs/uploads/1.jpg"
+    assert "weiter_ab=" in res["hinweis"]
+    run1 = res["backup_run_id"]
+    res = opt(max_files=2, dry_run=False, confirm=True, weiter_ab=res["weiter_ab"])
     assert res["bilder_geprueft"] == 1 and res["groesste_ersparnisse"][0]["datei"] == "httpdocs/uploads/2.jpg"
-    assert "fortsetzen_ab" not in res
+    assert res["unvollstaendig"] is False and "weiter_ab" not in res and res["backup_run_id"] != run1
+
+
+def test_continuation_covers_every_image_exactly_once(vhost):
+    names = [f"httpdocs/uploads/{d}/{i}.jpg" for d in ("a", "b") for i in range(4)]
+    for n in names:
+        (vhost / n).parent.mkdir(parents=True, exist_ok=True)
+        make_jpeg(vhost / n)
+    seen, weiter, calls = [], "", 0
+    while True:
+        res = opt(max_files=3, weiter_ab=weiter)
+        seen += sorted(e["datei"] for e in res["groesste_ersparnisse"])
+        calls += 1
+        if not res["unvollstaendig"]:
+            break
+        weiter = res["weiter_ab"]
+    assert calls == 3 and sorted(seen) == sorted(names) and len(seen) == len(set(seen))
 
 
 def test_time_budget(vhost, monkeypatch):
@@ -216,6 +234,54 @@ def test_time_budget(vhost, monkeypatch):
     monkeypatch.setattr(server, "_IMG_TIME_BUDGET", -1)
     res = opt()
     assert res["bilder_geprueft"] == 0 and res["uebersprungen"]["zeitbudget_rest"] == 3 and "Unterordner" in res["hinweis"]
+    assert res["unvollstaendig"] is True
+
+
+def test_tool_timeout_counts_as_skipped(vhost, monkeypatch, tmp_path):
+    slow = tmp_path / "slow"
+    slow.write_text("#!/bin/sh\nsleep 5\n")
+    slow.chmod(0o755)
+    monkeypatch.setattr(server, "_IMG_JPEGOPTIM", str(slow))
+    monkeypatch.setattr(server, "_IMG_TOOL_TIMEOUT", 1)
+    f = vhost / "httpdocs/uploads/a.jpg"
+    make_jpeg(f)
+    before = f.read_bytes()
+    res = opt(dry_run=False, confirm=True)
+    assert res["uebersprungen"]["timeout"] == 1 and f.read_bytes() == before
+    assert [p.name for p in f.parent.iterdir()] == ["a.jpg"]
+
+
+def test_empty_path_uses_main_docroot(vhost, monkeypatch):
+    make_jpeg(vhost / "httpdocs/uploads/a.jpg")
+    (vhost / "sub.example.com").mkdir()
+    make_jpeg(vhost / "sub.example.com/b.jpg")
+    res = opt()
+    assert res["pfad"] == "httpdocs" and res["bilder_geprueft"] == 1
+    ctx = server._vhost_ctx(DOMAIN)
+    monkeypatch.setattr(server, "_vhost_ctx", lambda d: {**ctx, "main_docroot": ["sub.example.com"]})
+    res = opt()
+    assert res["pfad"] == "sub.example.com" and res["bilder_geprueft"] == 1
+
+
+def test_invalid_path_lists_all_docroots(vhost):
+    with pytest.raises(ValueError, match="Gültige Docroots: httpdocs, sub.example.com"):
+        opt(path="conf")
+
+
+def test_errors_reach_client_and_lock_text(vhost):
+    import asyncio
+    from mcp.server.mcpserver.exceptions import ToolError
+    with pytest.raises(ToolError, match="liegt in keinem Docroot"):
+        asyncio.run(server.mcp.call_tool("optimize_images", {"domain": DOMAIN, "path": "conf"}))
+    lock = server._phps_lock(f"img:{DOMAIN}", DOMAIN, "eine Bildoptimierung")
+    try:
+        with pytest.raises(ToolError, match="Für example.com läuft bereits eine Bildoptimierung - bitte warten"):
+            asyncio.run(server.mcp.call_tool("optimize_images", {"domain": DOMAIN}))
+        with pytest.raises(ToolError, match="läuft bereits eine Bildoptimierung"):
+            asyncio.run(server.mcp.call_tool("image_backups", {"domain": DOMAIN, "action": "delete",
+                                                                "run_id": "20260101120000-1a2b3c4d"}))
+    finally:
+        lock.release()
 
 
 def test_backups_list_restore_delete(vhost):
@@ -258,3 +324,25 @@ def test_xmp_scrub_unit():
     new, changed = ns["scrub_xmp"](b'<a exif:GPSAltitude="5" b="1"/><exif:GPSTimeStamp>x</exif:GPSTimeStamp>'
                                    b'<exifEX:BodySerialNumber/>')
     assert changed and new == b'<a b="1"/>'
+
+
+def test_vhost_ctx_main_docroot(monkeypatch):
+    class C:
+        def close(self):
+            pass
+
+    def exec_(client, cmd, timeout=None, stdin_data=None):
+        if "SELECT d.id, d.webspace_id" in cmd:
+            return f"42\t0\tkunde\t{server._VHOST_BASE}/example.com\n", "", 0
+        if "SELECT d.id, h.www_root" in cmd:
+            return (f"77\t{server._VHOST_BASE}/example.com/sub.example.com\n"
+                    f"42\t{server._VHOST_BASE}/example.com/example.com\n"), "", 0
+        if cmd.startswith("id -u"):
+            return "1001\n1002\n", "", 0
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(server, "_ssh_connect", lambda: C())
+    monkeypatch.setattr(server, "_client_exec", exec_)
+    ctx = server._vhost_ctx("example.com")
+    assert ctx["main_docroot"] == ["example.com"]
+    assert ctx["docroots"] == [["sub.example.com"], ["example.com"]]
