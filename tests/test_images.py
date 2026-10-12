@@ -632,3 +632,390 @@ def test_large_png_uses_o1(vhost, monkeypatch, tmp_path):
     lines = log.read_text().splitlines()
     assert any("-o1" in l and "-o2" not in l for l in lines) and any("-o2" in l for l in lines)
     assert len(lines) == 2
+
+
+# --- Hintergrundmodus (optimize_images hintergrund=true, image_job) -------
+
+def run_local_bg(c, args, job):
+    """Wie server._img_run_bg, aber lokal: Worker per Pipe, stdin bleibt als
+    Abbruchkanal offen, stdout wird zeilenweise konsumiert."""
+    p = subprocess.Popen([sys.executable, "-I", "-c", server._IMG_WORKER_SRC], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p.stdin.write(json.dumps({**args, "base": c["base"]}).encode() + b"\n")
+    p.stdin.flush()
+
+    def cancel():
+        try:
+            p.stdin.write(b"cancel\n")
+            p.stdin.flush()
+        except OSError:
+            pass
+
+    job["_cancel"] = cancel
+    if job["_cancel_requested"]:
+        cancel()
+    res = server._img_consume(job, p.stdout)
+    p.wait(timeout=30)
+    if res is None:
+        raise server.SSHError("keine Antwort: " + p.stderr.read().decode()[-300:])
+    if not res["ok"]:
+        raise ValueError(f"Bildoptimierung abgebrochen: {res.get('error')}")
+    return res
+
+
+@pytest.fixture
+def bg(vhost, monkeypatch):
+    audit = []
+    monkeypatch.setattr(server, "_img_run_bg", run_local_bg)
+    monkeypatch.setattr(server, "_HTTP_MODE", True)
+    monkeypatch.setattr(server, "_audit", lambda action, **f: audit.append((action, f)))
+    server._img_jobs.clear()
+    yield audit
+    for j in list(server._img_jobs.values()):
+        if j["_cancel_requested"] is False and j["ended"] is None:
+            j["_cancel_requested"] = True
+            if j["_cancel"]:
+                j["_cancel"]()
+        j["_done"].wait(40)
+    server._img_jobs.clear()
+
+
+def start(**kw):
+    return json.loads(server.optimize_images(DOMAIN, hintergrund=True, **kw))
+
+
+def status(job_id, **kw):
+    return json.loads(server.image_job(DOMAIN, "status", job_id, **kw))
+
+
+def wait_job(job_id, timeout=40):
+    import time
+    end = time.time() + timeout
+    while time.time() < end:
+        s = status(job_id)
+        if s["status"] != "laeuft":
+            return s
+        time.sleep(0.1)
+    raise AssertionError("Job nicht fertig: " + json.dumps(s))
+
+
+def wait_for_file(job_id, name, timeout=20):
+    import time
+    end = time.time() + timeout
+    while time.time() < end:
+        s = status(job_id)
+        if s["status"] == "laeuft" and (s["fortschritt"].get("aktuelle_datei") or "").endswith(name):
+            return s
+        time.sleep(0.05)
+    raise AssertionError("Datei nicht erreicht: " + json.dumps(s))
+
+
+def test_bg_start_status_finish(vhost, bg):
+    up = vhost / "httpdocs/uploads"
+    for n in ("a.jpg", "b.jpg", "c.png"):
+        (make_png if n.endswith("png") else make_jpeg)(up / n)
+    res = start(dry_run=False, confirm=True)
+    assert server._IMG_RUN_ID_RE.match(res["job_id"]) and res["status"] == "laeuft" and res["pfad"] == "httpdocs"
+    assert "image_job" in res["hinweis"] and "backup_run_id = job_id" in res["hinweis"]
+    s = wait_job(res["job_id"])
+    assert s["status"] == "fertig" and s["job_id"] == res["job_id"] and s["modus"] == "ausgeführt"
+    assert s["bilder_geprueft"] == 3 and s["bilder_optimiert"] == 3 and s["unvollstaendig"] is False
+    assert s["backup_run_id"] == res["job_id"] and (vhost / ".plesk-mcp/image-backups" / res["job_id"] / "httpdocs/uploads/a.jpg").exists()
+    assert s["listen_gesamt"] == {"groesste_ersparnisse": 3, "uebersprungen_details": 0, "fehler": 0}
+    assert s["gekuerzt"] is False and "weiter_ab" not in s and "timeout_hinweis" not in s
+    assert s["prioritaet"]["nice"] == 10 and isinstance(s["prioritaet"]["ionice"], bool)
+    assert s["laufzeit_s"] >= 0 and s["gestartet"]
+    assert not any((vhost / ".plesk-mcp/tmp").iterdir())
+    assert sorted(p.name for p in up.iterdir()) == ["a.jpg", "b.jpg", "c.png"]
+    acts = [a for a, _ in bg]
+    assert acts == ["image_job_start", "image_job_done"]
+    assert bg[1][1]["status"] == "fertig" and bg[1][1]["optimized"] == 3 and bg[1][1]["job_id"] == res["job_id"]
+    # Sperre wieder frei
+    assert opt()["bilder_geprueft"] == 3
+
+
+def test_bg_dry_run_changes_nothing(vhost, bg):
+    f = vhost / "httpdocs/uploads/a.jpg"
+    make_jpeg(f)
+    before = f.read_bytes()
+    res = start()
+    assert res["modus"].startswith("Hintergrund - Probelauf")
+    s = wait_job(res["job_id"])
+    assert s["status"] == "fertig" and s["modus"].startswith("Probelauf") and f.read_bytes() == before
+    assert "backup_run_id" not in s and not (vhost / ".plesk-mcp/image-backups").exists()
+    assert [a for a, _ in bg] == ["image_job_start"]  # Probelauf: kein done-Eintrag im Audit
+
+
+def test_bg_progress_during_run(vhost, bg, monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "_IMG_JPEGOPTIM", _tool(tmp_path, "jpegoptim", "sleep 1\n"))
+    make_jpeg(vhost / "httpdocs/uploads/a.jpg")
+    make_jpeg(vhost / "httpdocs/uploads/b.jpg")
+    res = start()
+    s = wait_for_file(res["job_id"], "b.jpg")
+    assert s["fortschritt"]["gesamt"] == 2 and s["fortschritt"]["bearbeitet"] == 1
+    assert s["fortschritt"]["aktuelle_datei"] == "httpdocs/uploads/b.jpg" and s["laufzeit_s"] >= 1
+    s = wait_job(res["job_id"])
+    assert s["status"] == "fertig" and s["bilder_geprueft"] == 2
+
+
+def test_bg_cancel_leaves_nothing_behind(vhost, bg, monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "_IMG_OPTIPNG", _tool(tmp_path, "optipng", "exec sleep 30\n"))
+    monkeypatch.setattr(server, "_IMG_BG_TOOL_TIMEOUT", 120)
+    up = vhost / "httpdocs/uploads"
+    make_jpeg(up / "a.jpg")
+    make_png(up / "b.png")
+    make_png(up / "c.png")
+    orig_a, orig_b, orig_c = (up / "a.jpg").read_bytes(), (up / "b.png").read_bytes(), (up / "c.png").read_bytes()
+    res = start(dry_run=False, confirm=True)
+    jid = res["job_id"]
+    wait_for_file(jid, "b.png")
+    assert list((vhost / ".plesk-mcp/tmp" / jid).iterdir())  # Arbeitskopie liegt an
+    prev = json.loads(server.image_job(DOMAIN, "cancel", jid))
+    assert prev["modus"] == "Vorschau - Job läuft weiter" and prev["status"] == "laeuft" and "confirm=true" in prev["hinweis"]
+    assert status(jid)["status"] == "laeuft"
+    out = json.loads(server.image_job(DOMAIN, "cancel", jid, confirm=True))
+    assert out["modus"] == "Abbruch ausgeführt" and out["status"] == "abgebrochen" and out["abgebrochen"] == "cancel"
+    assert out["bilder_geprueft"] == 1 and out["bilder_optimiert"] == 1 and out["unvollstaendig"] is True
+    assert out["uebersprungen"]["abgebrochen_rest"] == 2 and "2 Dateien nicht mehr bearbeitet" in out["hinweis"]
+    assert out["backup_run_id"] == jid
+    assert (up / "a.jpg").read_bytes() != orig_a  # fertig ersetzt
+    assert (up / "b.png").read_bytes() == orig_b and (up / "c.png").read_bytes() == orig_c
+    assert sorted(p.name for p in up.iterdir()) == ["a.jpg", "b.png", "c.png"]
+    assert not (vhost / ".plesk-mcp/tmp" / jid).exists()
+    assert [a for a, _ in bg] == ["image_job_start", "image_job_cancel", "image_job_done"]
+    assert bg[2][1]["status"] == "abgebrochen" and bg[2][1]["aborted"] == "cancel"
+    with pytest.raises(ValueError, match="läuft nicht mehr"):
+        server.image_job(DOMAIN, "cancel", jid, confirm=True)
+    assert status(jid)["status"] == "abgebrochen"
+    assert opt()["bilder_geprueft"] == 3  # Sperre frei
+
+
+def test_bg_lock_blocks_other_runs(vhost, bg, monkeypatch, tmp_path):
+    import asyncio
+    from mcp.server.mcpserver.exceptions import ToolError
+    monkeypatch.setattr(server, "_IMG_JPEGOPTIM", _tool(tmp_path, "jpegoptim", "exec sleep 30\n"))
+    monkeypatch.setattr(server, "_IMG_BG_TOOL_TIMEOUT", 120)
+    make_jpeg(vhost / "httpdocs/uploads/a.jpg")
+    jid = start()["job_id"]
+    wait_for_file(jid, "a.jpg")
+    msg = "Für example.com läuft bereits eine Bildoptimierung - bitte warten"
+    with pytest.raises(ToolError, match=msg):
+        asyncio.run(server.mcp.call_tool("optimize_images", {"domain": DOMAIN}))
+    with pytest.raises(ToolError, match=msg):
+        asyncio.run(server.mcp.call_tool("optimize_images", {"domain": DOMAIN, "hintergrund": True}))
+    with pytest.raises(ToolError, match=msg):
+        asyncio.run(server.mcp.call_tool("image_backups", {"domain": DOMAIN, "action": "delete",
+                                                            "run_id": "20260101120000-1a2b3c4d", "confirm": True}))
+    assert len(server._img_jobs) == 1
+    out = json.loads(server.image_job(DOMAIN, "cancel", jid, confirm=True))
+    assert out["status"] == "abgebrochen"
+    assert opt()["bilder_geprueft"] == 1
+
+
+def test_bg_max_jobs(vhost, bg, monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "_IMG_JPEGOPTIM", _tool(tmp_path, "jpegoptim", "exec sleep 30\n"))
+    monkeypatch.setattr(server, "_IMG_BG_TOOL_TIMEOUT", 120)
+    monkeypatch.setattr(server, "_IMG_MAX_JOBS", 1)
+    ctx = server._vhost_ctx(DOMAIN)
+    monkeypatch.setattr(server, "_vhost_ctx", lambda d: {**ctx, "domain": d})
+    make_jpeg(vhost / "httpdocs/uploads/a.jpg")
+    jid = start()["job_id"]
+    with pytest.raises(ValueError, match="laufen bereits 1 Hintergrundjobs"):
+        server.optimize_images("other.example.com", hintergrund=True)
+    json.loads(server.image_job(DOMAIN, "cancel", jid, confirm=True))
+
+
+def test_bg_rejected_in_stdio(vhost, bg, monkeypatch):
+    monkeypatch.setattr(server, "_HTTP_MODE", False)
+    make_jpeg(vhost / "httpdocs/uploads/a.jpg")
+    with pytest.raises(ValueError, match="nur im HTTP-Modus"):
+        start()
+    assert not server._img_jobs
+
+
+def test_bg_rejects_weiter_ab(vhost, bg):
+    with pytest.raises(ValueError, match="weiter_ab gilt nur im Vordergrund"):
+        start(weiter_ab="httpdocs/x.jpg")
+
+
+def test_bg_unknown_job(vhost, bg, monkeypatch):
+    make_jpeg(vhost / "httpdocs/uploads/a.jpg")
+    jid = start()["job_id"]
+    wait_job(jid)
+    ctx = server._vhost_ctx(DOMAIN)
+    monkeypatch.setattr(server, "_vhost_ctx", lambda d: {**ctx, "domain": d})
+    with pytest.raises(ValueError, match="Unbekannte job_id .* für other.example.com"):
+        server.image_job("other.example.com", "status", jid)  # Job gehört einer anderen Domain
+    assert status(jid)["status"] == "fertig"
+    server._img_jobs.clear()  # Neustart des MCP-Servers
+    with pytest.raises(ValueError, match="neu gestartet.*image_backups"):
+        status(jid)
+    for bad in ("", "x", "../x", "20260101120000-1a2b3c4d; rm -rf /"):
+        with pytest.raises(ValueError, match="Ungültige job_id"):
+            server.image_job(DOMAIN, "status", bad)
+    with pytest.raises(ValueError, match="action muss"):
+        server.image_job(DOMAIN, "restart", "20260101120000-1a2b3c4d")
+
+
+def test_bg_worker_error_becomes_status(vhost, bg):
+    res = start(path="httpdocs/fehlt")
+    s = wait_job(res["job_id"])
+    assert s["status"] == "fehler" and "Bildoptimierung abgebrochen" in s["fehler_meldung"]
+    assert "image_backups" in s["hinweis"]
+    assert [a for a, _ in bg] == ["image_job_start", "image_job_failed"]
+    assert opt()["bilder_geprueft"] == 0  # Sperre frei
+
+
+def test_bg_paging(vhost, bg, monkeypatch):
+    monkeypatch.setattr(server, "_IMG_JOB_PAGE", 3)
+    up = vhost / "httpdocs/uploads"
+    for i in range(7):
+        make_jpeg(up / f"{i}.jpg")
+    jid = start()["job_id"]
+    s = wait_job(jid)
+    assert s["gekuerzt"] is True and len(s["groesste_ersparnisse"]) == 3
+    assert s["listen_gesamt"]["groesste_ersparnisse"] == 7 and "groesste_ersparnisse: 7" in s["gekuerzt_hinweis"]
+    assert len(server._img_jobs[jid]["result"]["groesste_ersparnisse"]) == 7  # intern vollständig
+    p1 = status(jid, liste="groesste_ersparnisse", ab=3, limit=3)
+    assert p1["gesamt"] == 7 and len(p1["eintraege"]) == 3 and p1["weitere"] is True and "ab=6" in p1["hinweis"]
+    p2 = status(jid, liste="groesste_ersparnisse", ab=6, limit=3)
+    assert len(p2["eintraege"]) == 1 and p2["weitere"] is False and "hinweis" not in p2
+    alle = status(jid, liste="groesste_ersparnisse", ab=0, limit=500)["eintraege"]
+    assert sorted(e["datei"] for e in alle) == sorted(f"httpdocs/uploads/{i}.jpg" for i in range(7))
+    assert status(jid, liste="fehler")["eintraege"] == []
+    with pytest.raises(ValueError, match="liste muss"):
+        status(jid, liste="dateien")
+    with pytest.raises(ValueError, match="limit muss"):
+        status(jid, liste="fehler", limit=0)
+    with pytest.raises(ValueError, match="ab muss"):
+        status(jid, liste="fehler", ab=-1)
+
+
+def test_fg_lists_report_truncation(vhost, monkeypatch):
+    monkeypatch.setattr(server, "_IMG_LIST_LIMIT", 2)
+    for i in range(3):
+        make_jpeg(vhost / f"httpdocs/uploads/{i}.jpg")
+    res = opt()
+    assert len(res["groesste_ersparnisse"]) == 2 and res["gekuerzt"] is True
+    assert res["listen_gesamt"]["groesste_ersparnisse"] == 3 and "hintergrund=true" in res["gekuerzt_hinweis"]
+
+
+def test_fg_timeout_hint_points_to_background(vhost, monkeypatch, tmp_path):
+    monkeypatch.setattr(server, "_IMG_JPEGOPTIM", _tool(tmp_path, "jpegoptim", "sleep 5\n"))
+    monkeypatch.setattr(server, "_IMG_TOOL_TIMEOUT", 1)
+    make_jpeg(vhost / "httpdocs/uploads/a.jpg")
+    res = opt()
+    assert res["timeout_hinweis"].startswith("1 Datei(en) im Timeout (1 s")
+    assert 'hintergrund=true und dateien=["httpdocs/uploads/a.jpg"]' in res["timeout_hinweis"]
+
+
+def test_dateien_param(vhost):
+    up = vhost / "httpdocs/uploads"
+    make_jpeg(up / "a.jpg")
+    make_png(up / "b.png")
+    (up / "sub").mkdir()
+    make_jpeg(up / "sub/c.jpg")
+    (up / "text.txt").write_text("x")
+    os.symlink(up / "a.jpg", up / "link.jpg")
+    (up / "sublink").symlink_to(up / "sub")
+    orig_b = (up / "b.png").read_bytes()
+    res = opt(dateien=["httpdocs/uploads/a.jpg", "httpdocs/uploads/sub/c.jpg", "httpdocs/uploads/sub/c.jpg",
+                       "httpdocs/uploads/text.txt", "httpdocs/uploads/fehlt.jpg", "httpdocs/uploads/link.jpg",
+                       "httpdocs/uploads/sublink/c.jpg"], dry_run=False, confirm=True)
+    assert res["pfad"] == "dateien (6 Einträge)" and res["bilder_geprueft"] == 2 and res["bilder_optimiert"] == 2
+    assert (up / "b.png").read_bytes() == orig_b  # nicht in der Liste
+    assert res["uebersprungen"] == {"kein_bild": 1, "nicht_gefunden": 1, "symlink": 2}
+    gr = {d["datei"]: d["grund"] for d in res["uebersprungen_details"]}
+    assert gr == {"httpdocs/uploads/text.txt": "kein_bild", "httpdocs/uploads/fehlt.jpg": "nicht_gefunden",
+                  "httpdocs/uploads/link.jpg": "symlink", "httpdocs/uploads/sublink/c.jpg": "symlink"}
+    assert "fehler" not in res and "verwaiste_temp_dateien" not in res
+    assert sorted(e["datei"] for e in res["groesste_ersparnisse"]) == ["httpdocs/uploads/a.jpg", "httpdocs/uploads/sub/c.jpg"]
+    for bad, msg in (("../etc/x.jpg", "'\\.\\.'"), ("/etc/x.jpg", "nur relative Pfade"),
+                     ("httpdocs/../conf/x.jpg", "'\\.\\.'"), ("conf/x.jpg", "keinem Docroot"),
+                     ("httpdocs", "keinem Docroot"), ("httpdocs/*.jpg", "Wildcards")):
+        with pytest.raises(ValueError, match=msg):
+            opt(dateien=["httpdocs/uploads/a.jpg", bad])
+    with pytest.raises(ValueError, match="höchstens 200"):
+        opt(dateien=[f"httpdocs/{i}.jpg" for i in range(201)])
+    with pytest.raises(ValueError, match="nicht beides"):
+        opt(path="httpdocs", dateien=["httpdocs/uploads/a.jpg"])
+    with pytest.raises(ValueError, match="dateien ist leer"):
+        opt(dateien=[])
+    with pytest.raises(ValueError, match="Liste relativer Pfade"):
+        opt(dateien=["httpdocs/uploads/a.jpg", 5])
+
+
+def test_bg_dateien(vhost, bg):
+    up = vhost / "httpdocs/uploads"
+    make_jpeg(up / "a.jpg")
+    make_jpeg(up / "b.jpg")
+    res = start(dateien=["httpdocs/uploads/b.jpg", "httpdocs/uploads/nein.jpg"], dry_run=False, confirm=True)
+    assert res["pfad"] == "dateien (2 Einträge)"
+    s = wait_job(res["job_id"])
+    assert s["bilder_optimiert"] == 1 and s["groesste_ersparnisse"][0]["datei"] == "httpdocs/uploads/b.jpg"
+    assert s["uebersprungen_details"] == [{"datei": "httpdocs/uploads/nein.jpg", "grund": "nicht_gefunden",
+                                          "meldung": "Datei nicht gefunden"}]
+    assert bg[0][1]["path"] == "dateien (2 Einträge)"
+
+
+def _bg_worker(vhost, tmp_path, tool_body):
+    """Worker direkt im Hintergrundmodus starten (ohne MCP-Schicht)."""
+    args = {"op": "optimize", "parts": ["httpdocs"], "dateien": [], "dry_run": False, "recursive": True,
+            "keep_backup": True, "max_bytes": 50 * 1024 * 1024, "run_id": "20260101120000-1a2b3c4d",
+            "jpegoptim": _tool(tmp_path, "jpegoptim", tool_body), "optipng": "/nonexistent",
+            "background": True, "max_files": 0, "start_after": "", "time_budget": None, "tool_timeout": 120,
+            "list_limit": 0, "base": str(vhost)}
+    p = subprocess.Popen([sys.executable, "-I", "-c", server._IMG_WORKER_SRC], stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p.stdin.write(json.dumps(args).encode() + b"\n")
+    p.stdin.flush()
+    return p
+
+
+@pytest.mark.parametrize("how,reason", [("eof", "verbindung_verloren"), ("sigterm", "signal"), ("sighup", "signal")])
+def test_bg_worker_aborts_cleanly_on_connection_loss(vhost, tmp_path, how, reason):
+    import signal
+    up = vhost / "httpdocs/uploads"
+    make_jpeg(up / "a.jpg")
+    make_jpeg(up / "b.jpg")
+    before = {n: (up / n).read_bytes() for n in ("a.jpg", "b.jpg")}
+    p = _bg_worker(vhost, tmp_path, "exec sleep 30\n")
+    first = json.loads(p.stdout.readline())
+    assert first["fortschritt"]["datei"] == "httpdocs/uploads/a.jpg" and first["fortschritt"]["gesamt"] == 2
+    tmp = vhost / ".plesk-mcp/tmp/20260101120000-1a2b3c4d"
+    deadline = __import__("time").time() + 10
+    while not (tmp.exists() and list(tmp.iterdir())) and __import__("time").time() < deadline:
+        __import__("time").sleep(0.05)
+    assert list(tmp.iterdir())
+    if how == "eof":
+        p.stdin.close()
+    else:
+        # stdin bleibt offen, bis der Worker fertig ist - sonst käme das EOF dem
+        # Signal zuvor und der Grund wäre "verbindung_verloren"
+        p.send_signal(signal.SIGTERM if how == "sigterm" else signal.SIGHUP)
+    out = p.stdout.read()
+    p.wait(timeout=20)
+    p.stdin.close()
+    p.stderr.close()
+    res = json.loads(out.strip().splitlines()[-1])
+    assert res["ok"] and res["abgebrochen"] == reason and res["geprueft"] == 0 and res["optimiert"] == 0
+    assert res["prioritaet"] == {"nice": 10, "ionice": os.path.exists("/usr/bin/ionice")}
+    assert res["uebersprungen"] == {"abgebrochen_rest": 2}
+    assert {n: (up / n).read_bytes() for n in before} == before
+    assert sorted(x.name for x in up.iterdir()) == ["a.jpg", "b.jpg"]
+    assert not tmp.exists() and not any((vhost / ".plesk-mcp/tmp").iterdir())
+    assert not (vhost / ".plesk-mcp/image-backups").exists()
+
+
+def test_progress_values_are_sanitised():
+    job = {"fortschritt": {"bearbeitet": 1, "gesamt": 5, "aktuelle_datei": None}}
+    server._img_progress(job, {"bearbeitet": "7", "gesamt": True, "optimiert": -1, "fehler": 10 ** 13,
+                               "datei": "x" * 500, "uebersprungen": 3})
+    assert job["fortschritt"] == {"bearbeitet": 1, "gesamt": 5, "aktuelle_datei": "x" * 300, "uebersprungen": 3}
+    server._img_progress(job, "kein dict")
+    server._img_progress(job, {"datei": ["liste"]})
+    assert job["fortschritt"]["aktuelle_datei"] == "x" * 300
+    assert server._img_consume(job, [b"kein json\n", b"{\"fortschritt\": {\"gesamt\": 9}}\n", b"[1]\n",
+                                     b"{\"ok\": true, \"x\": 1}\n"]) == {"ok": True, "x": 1}
+    assert job["fortschritt"]["gesamt"] == 9
+    assert server._img_consume(job, [b".\n"]) is None
