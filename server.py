@@ -114,7 +114,7 @@ if _HTTP_MODE and not _MCP_API_KEY:
 # Dateien (server.py, Dockerfile, requirements.txt, Workflow) geaendert haben.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.14"
+_VERSION_BASE = "0.15"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -4733,19 +4733,27 @@ def _phps_read_backup(client: paramiko.SSHClient, backup_id: str) -> dict[str, A
 
 
 def _phps_apply(client: paramiko.SSHClient, domain: str, state: dict[str, Any],
-                target_own: dict[str, str], target_add: str) -> tuple[dict[str, Any], list[str]]:
+                target_own: dict[str, str], target_add: str
+                ) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
     """Bringt die Domain auf target_own/target_add. Zuerst nur die geänderten
     Werte; fehlen danach andere eigene Werte (Plesk ersetzt statt
-    zusammenzuführen), wird der komplette Sollstand geschrieben."""
+    zusammenzuführen), wird der komplette Sollstand geschrieben. info hält
+    fest, wie Plesk sich verhalten hat."""
     errors: list[str] = []
+    info: dict[str, Any] = {}
     diff = {k: v for k, v in target_own.items() if state["own"].get(k) != v}
     if diff:
         rc, msg = _phps_write(client, domain, "-settings", "\n".join(f"{k} = {v}" for k, v in diff.items()))
+        info["settings_schreibvorgaenge"] = 1
         if rc != 0:
             errors.append(f"-settings: Exit-Code {rc}: {msg}")
         else:
             now = _phps_state(client, domain)
-            if any(now["own"].get(k) != v for k, v in target_own.items()):
+            deviating = sorted(k for k, v in target_own.items() if now["own"].get(k) != v)
+            info["abweichend_nach_teilschreiben"] = [
+                {"wert": k, "soll": target_own[k], "ist": now["own"].get(k)} for k in deviating]
+            if deviating:
+                info["settings_schreibvorgaenge"] = 2
                 rc, msg = _phps_write(client, domain, "-settings",
                                       "\n".join(f"{k} = {v}" for k, v in target_own.items()))
                 if rc != 0:
@@ -4754,7 +4762,7 @@ def _phps_apply(client: paramiko.SSHClient, domain: str, state: dict[str, Any],
         rc, msg = _phps_write(client, domain, "-additional-settings", _phps_norm_block(target_add))
         if rc != 0:
             errors.append(f"-additional-settings: Exit-Code {rc}: {msg}")
-    return _phps_state(client, domain), errors
+    return _phps_state(client, domain), errors, info
 
 
 def _phps_verify(client: paramiko.SSHClient, domain: str, now: dict[str, Any],
@@ -4812,7 +4820,13 @@ def _phps_change(domain: str, target_fn, confirm: bool, source: str) -> str:
             baseline = {"fpm": _phps_fpm(client, d)[0], "http": _phps_http(d)[0]}
             backup_id = _phps_write_backup(client, d, state, source)
             result["backup_id"] = backup_id
-            now, errors = _phps_apply(client, d, state, target_own, target_add)
+            now, errors, info = _phps_apply(client, d, state, target_own, target_add)
+            if info:
+                info["plesk_verhalten_settings"] = (
+                    "zusammenführend (nur die geänderten Werte geschrieben, alle anderen eigenen Werte blieben)"
+                    if not info.get("abweichend_nach_teilschreiben") else
+                    "abweichend nach dem Teilschreiben - vollständiger Sollstand nachgeschrieben")
+                result["schreibvorgang"] = info
             failed = errors + _phps_verify(client, d, now, target_own, target_add, show_expect, baseline)
             if not failed:
                 result["ergebnis"] = "Geschrieben und kontrolliert."
@@ -4821,14 +4835,14 @@ def _phps_change(domain: str, target_fn, confirm: bool, source: str) -> str:
                                         "startseite": "ok" if baseline["http"] is not None and baseline["http"] < 500
                                         else "vorher schon nicht prüfbar/5xx - übersprungen"}
                 _audit("php_settings", domain=d, source=source, changes=changes, backup_id=backup_id,
-                       result="ok")
+                       write_info=info, result="ok")
                 return _json(result)
 
             # Automatisch auf das Backup zurückstellen
             # Vorher geerbte Werte, die jetzt eigene sind, auf den damaligen Wert
             back_own = {k: state["standard"].get(k, v) for k, v in target_own.items()}
             back_own.update(state["own"])
-            after, rerrors = _phps_apply(client, d, now, back_own, state["additional"])
+            after, rerrors, _ = _phps_apply(client, d, now, back_own, state["additional"])
             rfailed = rerrors + _phps_verify(client, d, after, back_own, state["additional"], {}, baseline)
             result["ergebnis"] = ("FEHLER - automatisch auf das Backup zurückgestellt." if not rfailed
                                   else "FEHLER - Zurückstellen ebenfalls fehlgeschlagen, bitte sofort prüfen!")
