@@ -76,7 +76,9 @@ Ohne gesetztes `MCP_TRANSPORT` (oder mit `MCP_TRANSPORT=stdio`) verhält sich de
 | `PHP_SETTINGS_HTTP_TIMEOUT` | nein | `20` | Timeout in Sekunden für den Abruf der Startseite nach einer Änderung |
 | `WEB_SETTINGS_BACKUP_DIR` | nein | `/root/.plesk-mcp/web-server-backups` | Ablage der Backups von `web_server_settings_update` auf dem Plesk-Server (root-only) |
 | `IMAGE_JPEGOPTIM` / `IMAGE_OPTIPNG` | nein | `/usr/bin/jpegoptim` / `/usr/bin/optipng` | Programme für `optimize_images` auf dem Plesk-Server |
-| `IMAGE_OPT_TIMEOUT` | nein | `300` | Timeout in Sekunden ohne Fortschritt für `optimize_images` |
+| `IMAGE_OPT_TIMEOUT` | nein | `300` | SSH-Timeout in Sekunden ohne Fortschritt für `optimize_images` |
+| `IMAGE_OPT_TIME_BUDGET` | nein | `30` | Zeitbudget in Sekunden pro Aufruf von `optimize_images` |
+| `IMAGE_OPT_TOOL_TIMEOUT` | nein | `15` | Timeout in Sekunden pro Aufruf von `jpegoptim`/`optipng` |
 | `REPLACE_MAX_BYTES` | nein | `5242880` | Maximale Dateigrösse in Bytes für `replace_in_vhost_file(s)` (Standard 5 MB) |
 | `AUDIT_LOG_FILE` | nein | – | Optionaler Pfad im Container für das Audit-Log (zusätzlich zu stderr) |
 | `MCP_TRANSPORT` | nein | `stdio` | `stdio` = lokal (Standard) / `http` = Cloud-Modus (Streamable HTTP) |
@@ -349,12 +351,15 @@ Schlägt eine Prüfung fehl, stellt das Tool automatisch auf das Backup zurück 
 
 ## Bilder verlustfrei optimieren
 
-`optimize_images(domain, path="httpdocs", dry_run=true, confirm=false, max_files=500, recursive=true, keep_backup=true)` verkleinert JPG- und PNG-Dateien ohne Qualitätsverlust (gleiche Pixel). `domain` ist die Hauptdomain der Subscription, `path` ein Ordner oder eine Datei relativ zu `/var/www/vhosts/<domain>/` innerhalb eines Docroots.
+`optimize_images(domain, path="", dry_run=true, confirm=false, max_files=500, recursive=true, keep_backup=true, weiter_ab="")` verkleinert JPG- und PNG-Dateien ohne Qualitätsverlust (gleiche Pixel). `domain` ist die Hauptdomain der Subscription, `path` ein Ordner oder eine Datei relativ zu `/var/www/vhosts/<domain>/` innerhalb eines Docroots; leer = Docroot der Hauptdomain (die Rückgabe nennt ihn unter `pfad`). Ein ungültiger Pfad wird mit der Liste aller gültigen Docroots abgelehnt.
 
 - Pro Bild wird eine Kopie im selben Ordner bearbeitet: zuerst werden GPS-Daten, Kamera- und Objektiv-Seriennummern, Besitzername und Herstellerdaten (MakerNote) aus EXIF und XMP entfernt (Datenschutz), Farbprofil, Ausrichtung und alle übrigen Metadaten bleiben. Danach `jpegoptim -p` (ohne Qualitätsstufe, nur verlustfreie Optimierung) bzw. `optipng -o2 -preserve`. Ersetzt wird nur, wenn die Datei kleiner wird oder Datenschutzdaten entfernt wurden; Änderungsdatum und Rechte bleiben.
 - Der Worker läuft per `runuser` als System-User der Subscription (nie root), folgt keinen Symlinks, überspringt Hardlinks, Dateien über 50 MB, den Papierkorb und `.plesk-mcp`. Programme: `IMAGE_JPEGOPTIM` (Standard `/usr/bin/jpegoptim`), `IMAGE_OPTIPNG` (Standard `/usr/bin/optipng`); fehlt eines, wird der Dateityp übersprungen. Timeout ohne Fortschritt: `IMAGE_OPT_TIMEOUT` (Standard 300 Sekunden).
 - `dry_run=true` (Standard) rechnet die Ersparnis aus und ändert nichts. Ausführen mit `dry_run=false` und `confirm=true`.
-- Ein Aufruf arbeitet höchstens ca. 40 Sekunden (`IMAGE_OPT_TIME_BUDGET`), damit er unter dem Tool-Timeout des MCP-Clients bleibt. Sind danach noch Bilder offen, nennt die Rückgabe `fortsetzen_ab`; mit `start_after=<Wert>` und sonst gleichen Parametern geht es weiter. Bei sehr grossen Ordnern (z.B. ganzes `wp-content/uploads`) besser Unterordner angeben.
+- Auch der Probelauf führt `jpegoptim`/`optipng` tatsächlich aus (auf Kopien) und braucht ähnlich viel Zeit wie ein echter Lauf.
+- Damit kein Aufruf den 60-Sekunden-Timeout des MCP-Clients überschreitet: Zeitbudget von 30 Sekunden ab Start des Workers inkl. Einlesen (`IMAGE_OPT_TIME_BUDGET`), geprüft vor jeder Datei; die laufende Datei wird noch fertig bearbeitet. Jeder Aufruf von `jpegoptim`/`optipng` hat ein eigenes Timeout von 15 Sekunden (`IMAGE_OPT_TOOL_TIMEOUT`), danach bleibt die Datei unverändert und wird unter `uebersprungen.timeout` gezählt.
+- Ist nach Zeitbudget oder `max_files` noch nicht alles bearbeitet, enthält die Rückgabe `"unvollstaendig": true`, `"weiter_ab": "<letzte bearbeitete Datei>"` und einen Hinweis. Mit `weiter_ab=<Wert>` und sonst gleichen Parametern erneut aufrufen, bis `"unvollstaendig": false`. Die Bilder werden in fester, alphabetischer Pfad-Reihenfolge bearbeitet, jedes genau einmal; echte Teilläufe bekommen je eine eigene `backup_run_id`.
+- Läuft für eine Domain bereits eine Bildoptimierung, wird ein zweiter Aufruf mit "Für <domain> läuft bereits eine Bildoptimierung - bitte warten und erneut versuchen." abgelehnt.
 - Mit `keep_backup=true` (Standard) bleiben die Originale per Hardlink unter `.plesk-mcp/image-backups/<run_id>/` im Vhost (ausserhalb jedes Docroots). Der Speicher wird erst frei, wenn das Backup gelöscht ist: `image_backups(domain, action="list"|"restore"|"delete", run_id, confirm=true)`.
 
 ## Beispiel: WordPress-Option gezielt ändern
