@@ -180,3 +180,144 @@ def test_domain_required_and_limit(plesk):
     with pytest.raises(ValueError, match="Maximal"):
         server.set_php_handler("plesk-php83-fpm-dedicated", domains=[f"d{i}.example.com" for i in range(51)])
     assert plesk["calls"] == []
+
+
+# --- set_php_settings --------------------------------------------------------
+
+SECTIONS = {
+    "General settings": ["display_errors", "log_errors", "allow_url_fopen", "open_basedir"],
+    "Performance settings": ["memory_limit", "max_execution_time", "post_max_size", "upload_max_filesize"],
+    "PHP-FPM settings": ["pm", "pm.max_children"],
+}
+DEFAULTS = {"display_errors": "", "log_errors": "1", "allow_url_fopen": "1",
+            "open_basedir": "{WEBSPACEROOT}{/}{:}{TMP}{/}", "memory_limit": "128M",
+            "max_execution_time": "30", "post_max_size": "8M", "upload_max_filesize": "2M",
+            "pm": "ondemand", "pm.max_children": "10"}
+
+
+@pytest.fixture
+def php(monkeypatch):
+    """Simuliert show/update-php-settings. mode="merge": nur genannte Werte
+    ändern; mode="replace": nicht genannte Werte fallen auf Defaults zurück."""
+    state = {"values": dict(DEFAULTS, memory_limit="256M", max_execution_time="120", **{"pm.max_children": "200"}),
+             "additional": ["pm.status_path = /status_phpfpm", "; Kommentar bleibt"],
+             "mode": "merge", "calls": [], "files": [], "fail": False}
+
+    def show():
+        lines = []
+        for sec, keys in SECTIONS.items():
+            lines.append(sec + ":")
+            lines += [f"{k} = {state['values'][k]}" for k in keys]
+        lines.append("Additional directives:")
+        lines += state["additional"]
+        return "\n".join(lines)
+
+    def exec_(client, cmd, timeout=None, stdin_data=None):
+        state["calls"].append(cmd)
+        if cmd.startswith("plesk db"):
+            return ("plesk-php83-fpm-dedicated\n", "", 0) if "'example.com'" in cmd else ("", "", 0)
+        if cmd.startswith("plesk bin site --show-php-settings"):
+            return show(), "", 0
+        if "--update-php-settings" in cmd:
+            assert "example.com" in cmd and stdin_data is not None
+            text = stdin_data.decode()
+            state["files"].append(text)
+            if state["fail"]:
+                return "", "ERROR", 1
+            lines = [l for l in text.splitlines() if l.strip()]
+            if "-additional-settings" in cmd:
+                state["additional"] = lines
+                return "SUCCESS", "", 0
+            new = dict(DEFAULTS) if state["mode"] == "replace" else dict(state["values"])
+            for l in lines:
+                k, _, v = l.partition(" = ")
+                new[k] = "1" if v.lower() in ("on", "1", "true") else ("" if v.lower() in ("off", "0") else v)
+            state["values"] = new
+            state["mode"] = "merge"
+            return "SUCCESS", "", 0
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(server, "_ssh_connect", lambda: FakeClient())
+    monkeypatch.setattr(server, "_client_exec", exec_)
+    return state
+
+
+def php_updates(state):
+    return [c for c in state["calls"] if "--update-php-settings" in c]
+
+
+def test_php_preview(php):
+    res = json.loads(server.set_php_settings({"memory_limit": "512M", "max_input_vars": "5000"},
+                                             domain="example.com"))
+    d = res["domains"][0]
+    assert d["ergebnis"].startswith("Vorschau") and "hinweis" in res
+    assert {"wert": "memory_limit", "alt": "256M", "neu": "512M"} in d["aenderungen"]
+    assert {"wert": "max_input_vars", "alt": None, "neu": "5000"} in d["aenderungen"]
+    assert php_updates(php) == []
+
+
+def test_php_change_merge_keeps_additional(php):
+    res = json.loads(server.set_php_settings(
+        {"memory_limit": "512M", "display_errors": "off", "max_input_vars": "5000"},
+        domain="example.com", confirm=True))
+    d = res["domains"][0]
+    assert d["ergebnis"] == "geändert", d
+    # display_errors ist bereits aus -> keine Änderung
+    assert [a["wert"] for a in d["aenderungen"]] == ["memory_limit", "max_input_vars"]
+    assert php["values"]["memory_limit"] == "512M" and php["values"]["pm.max_children"] == "200"
+    assert php["files"][0] == "memory_limit = 512M\n"
+    assert php["additional"] == ["pm.status_path = /status_phpfpm", "; Kommentar bleibt", "max_input_vars = 5000"]
+    assert d["ruecksetzen"] == {"memory_limit": "256M"}
+
+
+def test_php_replace_semantics_restored(php):
+    php["mode"] = "replace"
+    res = json.loads(server.set_php_settings({"memory_limit": "512M"}, domain="example.com", confirm=True))
+    d = res["domains"][0]
+    assert d["ergebnis"] == "geändert", d
+    assert sorted(d["wiederhergestellt"]) == ["max_execution_time", "pm.max_children"]
+    assert php["values"]["max_execution_time"] == "120" and php["values"]["pm.max_children"] == "200"
+    assert php["values"]["memory_limit"] == "512M"
+
+
+def test_php_additional_existing_key_replaced(php):
+    php["additional"] = ["max_input_vars = 1000", "pm.status_path = /status_phpfpm"]
+    server.set_php_settings({"max_input_vars": "3000"}, domain="example.com", confirm=True)
+    assert php["additional"] == ["max_input_vars = 3000", "pm.status_path = /status_phpfpm"]
+
+
+def test_php_unchanged(php):
+    res = json.loads(server.set_php_settings({"memory_limit": "256M", "log_errors": "on"},
+                                             domain="example.com", confirm=True))
+    assert res["domains"][0]["ergebnis"].startswith("unverändert") and php_updates(php) == []
+
+
+@pytest.mark.parametrize("settings", [
+    {"open_basedir": "/"}, {"disable_functions": ""}, {"memory_limit": "512M\nopen_basedir = /"},
+    {"memory_limit": "viel"}, {"pm": "always"}, {"max_execution_time": "1; rm"}, {},
+    {"session.save_path": "/tmp"}, {"error_reporting": "E_ALL\n"},
+])
+def test_php_rejected(php, settings):
+    with pytest.raises(ValueError):
+        server.set_php_settings(settings, domain="example.com", confirm=True)
+    assert php_updates(php) == []
+
+
+def test_php_key_not_managed_by_plesk(php):
+    with pytest.raises(ValueError, match="nicht geführt"):
+        server.set_php_settings({"pm.max_spare_servers": "5"}, domain="example.com", confirm=True)
+    assert php_updates(php) == []
+
+
+def test_php_unknown_domain_changes_nothing(php):
+    with pytest.raises(ValueError, match="nicht mit Webhosting"):
+        server.set_php_settings({"memory_limit": "512M"}, domains=["example.com", "other.example.com"],
+                                confirm=True)
+    assert php_updates(php) == []
+
+
+def test_php_plesk_error_reported(php):
+    php["fail"] = True
+    res = json.loads(server.set_php_settings({"memory_limit": "512M"}, domain="example.com", confirm=True))
+    assert res["fehlgeschlagen"] == ["example.com"]
+    assert any("Exit-Code 1" in f for f in res["domains"][0]["fehler"])
