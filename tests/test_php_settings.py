@@ -154,6 +154,9 @@ def test_update_keeps_sections_and_other_values(plesk):
     assert plesk["additional"] == ("max_input_vars = 5000\nopcache.revalidate_freq = 60\n"
                                    "[php-fpm-pool-settings]\npm.status_path = /status_phpfpm")
     assert plesk["writes"][0] == ("-settings", "memory_limit = 512M\n")
+    assert res["schreibvorgang"]["settings_schreibvorgaenge"] == 1
+    assert res["schreibvorgang"]["abweichend_nach_teilschreiben"] == []
+    assert res["schreibvorgang"]["plesk_verhalten_settings"].startswith("zusammenführend")
     backup = json.loads(next(iter(plesk["files"].values())))
     assert backup["id"] == res["backup_id"] and backup["own_settings"]["memory_limit"] == "256M"
     assert backup["additional_directives"].startswith("[php-fpm-pool-settings]")
@@ -165,6 +168,9 @@ def test_update_with_replace_semantics_writes_full_set(plesk):
     assert res["ergebnis"] == "Geschrieben und kontrolliert.", res
     assert plesk["own"]["pm.max_children"] == "200" and plesk["own"]["enableFastcgi"] == "off"
     assert [w[0] for w in plesk["writes"]] == ["-settings", "-settings"]
+    info = res["schreibvorgang"]
+    assert info["settings_schreibvorgaenge"] == 2 and info["plesk_verhalten_settings"].startswith("abweichend")
+    assert {"wert": "pm.max_children", "soll": "200", "ist": None} in info["abweichend_nach_teilschreiben"]
 
 
 def test_failed_check_rolls_back(plesk):
