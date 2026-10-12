@@ -32,8 +32,9 @@ Gedacht für Fehleranalyse bei Support-Anfragen (z.B. "Website nicht erreichbar"
 Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven
 Kommandos (Whitelist + Blacklist weiter unten). Ausnahme: write_vhost_file,
 replace_in_vhost_file, replace_in_vhost_files, set_php_handler, php_settings_update,
-php_settings_rollback, delete_vhost_backup, delete_vhost_log, dns_add_record, dns_delete_record,
-dns_update_record, imunify_ignore_add, imunify_ignore_remove, wp_option_update
+php_settings_rollback, web_server_settings_update, web_server_settings_rollback,
+optimize_images, image_backups, delete_vhost_backup, delete_vhost_log,
+dns_add_record, dns_delete_record, dns_update_record, imunify_ignore_add, imunify_ignore_remove, wp_option_update
 wp_option_rollback sowie die Datei-Tools upload_begin, fetch_to_vhost,
 move_vhost_file, delete_vhost_file, restore_vhost_trash und empty_vhost_trash
 (siehe README "Datei-Upload"/"Dateiverwaltung") dürfen schreiben - die ersten beiden Dateien innerhalb von
@@ -114,7 +115,7 @@ if _HTTP_MODE and not _MCP_API_KEY:
 # Dateien (server.py, Dockerfile, requirements.txt, Workflow) geaendert haben.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.15"
+_VERSION_BASE = "0.16"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -5005,6 +5006,835 @@ def php_settings_rollback(domain: str, backup_id: str, confirm: bool = False) ->
         return target_own, rec["additional_directives"], changes, show_expect, notes
 
     return _phps_change(d, target, confirm, f"php_settings_rollback:{m.group(0)}")
+
+
+# ---------------------------------------------------------------------------
+# Webserver-Einstellungen (Browser-Caching, nginx-Cache)
+# ---------------------------------------------------------------------------
+#
+# Lesen/Schreiben pro Domain über `plesk bin domain --show-web-server-settings`
+# bzw. `--update-web-server-settings <domain> -<option> <wert>`. Freigegeben sind
+# nur Optionen mit einfachem, geprüftem Wertformat (Zahlen, true/false). Ablauf
+# wie bei den PHP-Einstellungen: Vorschau, Backup (root-only), Schreiben,
+# Kontrolle, bei Fehler automatisch zurück.
+
+_WEB_BOOL = r"true|false"
+_WEB_RULES: dict[str, str] = {
+    "web-server-expires": r"\d{1,9}",
+    "web-server-expires-static-only": _WEB_BOOL,
+    "nginx-serve-static": _WEB_BOOL,
+    "nginx-cache-enabled": _WEB_BOOL,
+    "nginx-cache-size": r"\d{1,12}",
+    "nginx-cache-timeout": r"\d{1,9}",
+    "nginx-cache-bypass-header-nocache": _WEB_BOOL,
+    "nginx-cache-bypass-header-auth": _WEB_BOOL,
+    "nginx-cache-bypass-get-nocache": _WEB_BOOL,
+    "nginx-cache-use-stale-5xx": _WEB_BOOL,
+    "nginx-cache-use-stale-4xx": _WEB_BOOL,
+    "nginx-cache-use-stale-updating": _WEB_BOOL,
+}
+_WEB_BACKUP_DIR = os.environ.get("WEB_SETTINGS_BACKUP_DIR", "/root/.plesk-mcp/web-server-backups").strip()
+
+
+def _web_check(key: Any, value: Any) -> tuple[str, str]:
+    if not isinstance(key, str) or key.strip() not in _WEB_RULES:
+        raise ValueError(f"Option {key!r} ist nicht freigegeben. Erlaubt: {', '.join(sorted(_WEB_RULES))}.")
+    k = key.strip()
+    if isinstance(value, bool):
+        value = "true" if value else "false"
+    if not isinstance(value, (str, int)) or isinstance(value, float):
+        raise ValueError(f"Wert für '{k}' muss ein String oder eine Zahl sein.")
+    v = str(value).strip().lower()
+    if not re.fullmatch(_WEB_RULES[k], v):
+        raise ValueError(f"Ungültiger Wert {value!r} für '{k}' (erwartet: "
+                         + ("true/false" if _WEB_RULES[k] == _WEB_BOOL else "Zahl") + ").")
+    return k, v
+
+
+def _web_parse(text: str) -> dict[str, str]:
+    """Ausgabe von --show-web-server-settings: "[name]" gefolgt vom Wert."""
+    out: dict[str, str] = {}
+    key = None
+    lines: list[str] = []
+    for line in text.splitlines() + ["[__ende__]"]:
+        m = re.match(r"^\[(.+)\]$", line.strip())
+        if m:
+            if key is not None:
+                while lines and not lines[-1].strip():
+                    lines.pop()
+                while lines and not lines[0].strip():
+                    lines.pop(0)
+                out[key] = "\n".join(lines)
+            key, lines = m.group(1), []
+        elif key is not None:
+            lines.append(line.rstrip())
+    return out
+
+
+def _web_read(client: paramiko.SSHClient, domain: str) -> dict[str, str]:
+    out, err, rc = _client_exec(client, f"plesk bin domain --show-web-server-settings {shlex.quote(domain)}",
+                                timeout=_HOSTING_TIMEOUT)
+    settings = _web_parse(out) if rc == 0 else {}
+    if not settings:
+        raise ValueError(f"Webserver-Einstellungen von '{domain}' nicht lesbar"
+                         + (f": {(err.strip() or out.strip())[:300]}" if (err.strip() or out.strip()) else "."))
+    return settings
+
+
+def _web_write(client: paramiko.SSHClient, domain: str, values: dict[str, str]) -> tuple[int, str]:
+    args = " ".join(f"-{k} {shlex.quote(v)}" for k, v in values.items())
+    out, err, rc = _client_exec(
+        client, f"plesk bin domain --update-web-server-settings {shlex.quote(domain)} {args}",
+        timeout=_HOSTING_TIMEOUT)
+    return rc, (err.strip() or out.strip())[-500:]
+
+
+def _root_json_write(client: paramiko.SSHClient, bdir: str, backup_id: str, record: dict[str, Any]) -> None:
+    data = json.dumps(record, ensure_ascii=False, indent=2).encode("utf-8")
+    d = shlex.quote(bdir)
+    path = shlex.quote(f"{bdir}/{backup_id}.json")
+    _, err, rc = _client_exec(client, f"umask 077 && mkdir -p {d} && chmod 700 {d} && set -C && cat > {path}",
+                              stdin_data=data)
+    if rc != 0:
+        raise SSHError(f"Backup konnte nicht angelegt werden - nichts geändert: {err.strip()}")
+
+
+def _root_json_read(client: paramiko.SSHClient, bdir: str, backup_id: str, domain: str) -> dict[str, Any]:
+    m = _WP_BACKUP_ID_RE.match((backup_id or "").strip())
+    if not m or m.group(3) != domain:
+        raise ValueError(f"backup_id {backup_id!r} gehört nicht zur Domain '{domain}'.")
+    out, err, rc = _client_exec(client, f"cat -- {shlex.quote(f'{bdir}/{m.group(0)}.json')}")
+    if rc != 0:
+        raise ValueError(f"Backup '{m.group(0)}' nicht gefunden: {err.strip()}")
+    try:
+        rec = json.loads(out)
+        if rec.get("domain") != domain:
+            raise ValueError("Inhalt passt nicht zur backup_id")
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"Backup '{m.group(0)}' ist ungültig: {e}")
+    return rec
+
+
+def _web_change(domain: str, targets_fn, confirm: bool, source: str) -> str:
+    d = _hosting_domain(domain)
+    lock = _phps_lock(f"web:{d}")
+    try:
+        client = _ssh_connect()
+        try:
+            before = _web_read(client, d)
+            targets = targets_fn(client, d, before)
+            for k in targets:
+                if k not in before:
+                    raise ValueError(f"Option '{k}' wird von Plesk für '{d}' nicht angezeigt - nichts geändert.")
+            changes = [{"option": k, "alt": before[k], "neu": v} for k, v in targets.items() if before[k] != v]
+            result: dict[str, Any] = {"domain": d, "aenderungen": changes}
+            if not changes:
+                result["ergebnis"] = "Keine Änderung nötig - alle Werte sind bereits gesetzt."
+                return _json(result)
+            if not confirm:
+                result["ergebnis"] = "Vorschau - nichts geschrieben. Mit confirm=true ausführen."
+                return _json(result)
+            todo = {c["option"]: c["neu"] for c in changes}
+            old = {k: before[k] for k in todo}
+            baseline = _phps_http(d)[0]
+            backup_id = _phps_new_backup_id(d)
+            _root_json_write(client, _WEB_BACKUP_DIR, backup_id, {
+                "id": backup_id, "created": datetime.datetime.now().isoformat(timespec="seconds"),
+                "source": source, "domain": d, "settings": before})
+            result["backup_id"] = backup_id
+            failed = []
+            rc, msg = _web_write(client, d, todo)
+            if rc != 0:
+                failed.append(f"Plesk: Exit-Code {rc}: {msg}")
+            now = _web_read(client, d)
+            failed += [f"{k}: ist {now.get(k)!r} statt {v!r}" for k, v in todo.items() if now.get(k) != v]
+            if baseline is not None and baseline < 500:
+                status, detail = _phps_http(d)
+                if status is not None and status >= 500:
+                    failed.append(f"Startseite liefert {status} ({detail})")
+            if not failed:
+                result["ergebnis"] = "Geschrieben und kontrolliert."
+                _audit("web_server_settings", domain=d, source=source, changes=changes, backup_id=backup_id,
+                       result="ok")
+                return _json(result)
+            rc, msg = _web_write(client, d, old)
+            after = _web_read(client, d)
+            rfailed = ([f"Plesk: Exit-Code {rc}: {msg}"] if rc != 0 else []) + [
+                f"{k}: ist {after.get(k)!r} statt {v!r}" for k, v in old.items() if after.get(k) != v]
+            result["ergebnis"] = ("FEHLER - automatisch auf das Backup zurückgestellt." if not rfailed
+                                  else "FEHLER - Zurückstellen ebenfalls fehlgeschlagen, bitte sofort prüfen!")
+            result["fehlgeschlagene_pruefungen"] = failed
+            if rfailed:
+                result["fehler_beim_zurueckstellen"] = rfailed
+            _audit("web_server_settings", domain=d, source=source, changes=changes, backup_id=backup_id,
+                   result="rolled_back" if not rfailed else "rollback_failed", failed=failed)
+            return _json(result)
+        finally:
+            client.close()
+    finally:
+        lock.release()
+
+
+@mcp.tool()
+def web_server_settings_show(domain: str) -> str:
+    """Zeigt die Webserver-Einstellungen einer Domain (Plesk "Apache &
+    nginx-Einstellungen"), u.a. Expires-Header (Browser-Caching),
+    nginx-Auslieferung statischer Dateien und nginx-Cache. Entspricht
+    `plesk bin domain --show-web-server-settings <domain>`. Rein lesend -
+    kein confirm nötig.
+    """
+    d = _hosting_domain(domain)
+    client = _ssh_connect()
+    try:
+        settings = _web_read(client, d)
+    finally:
+        client.close()
+    return _json({"domain": d, "einstellungen": settings, "aenderbar": sorted(_WEB_RULES)})
+
+
+@mcp.tool()
+def web_server_settings_update(domain: str, settings: dict[str, Any], confirm: bool = False) -> str:
+    """Ändert Webserver-Einstellungen einer Domain für Speed (Browser-Caching
+    und nginx-Cache), z.B. settings={"web-server-expires": "2592000",
+    "web-server-expires-static-only": "true", "nginx-serve-static": "true"}
+    oder {"nginx-cache-enabled": "true", "nginx-cache-timeout": "60"}.
+    Entspricht `plesk bin domain --update-web-server-settings <domain>
+    -<option> <wert>`.
+
+    Freigegeben: web-server-expires (Sekunden), web-server-expires-static-only,
+    nginx-serve-static, nginx-cache-enabled, nginx-cache-size (Bytes),
+    nginx-cache-timeout (Sekunden), nginx-cache-bypass-header-nocache,
+    nginx-cache-bypass-header-auth, nginx-cache-bypass-get-nocache,
+    nginx-cache-use-stale-5xx, nginx-cache-use-stale-4xx,
+    nginx-cache-use-stale-updating (true/false).
+    ACHTUNG nginx-Cache: kann bei dynamischen Seiten (Shop, Login,
+    Warenkorb) veraltete oder fremde Inhalte ausliefern - nur bei eher
+    statischen Seiten einsetzen und danach testen.
+
+    Ohne confirm=true nur Vorschau (alt/neu). Mit confirm=true: Backup des
+    kompletten Stands (backup_id für web_server_settings_rollback), dann
+    Schreiben und Kontrolle (Werte laut Plesk, Startseite ohne 5xx); bei
+    einem Fehler automatisch zurück auf den alten Stand.
+    """
+    if not isinstance(settings, dict) or not settings:
+        raise ValueError("settings als Objekt angeben, z.B. {\"web-server-expires\": \"2592000\"}.")
+    checked = dict(_web_check(k, v) for k, v in settings.items())
+    return _web_change(domain, lambda client, d, before: checked, confirm, "web_server_settings_update")
+
+
+@mcp.tool()
+def web_server_settings_rollback(domain: str, backup_id: str, confirm: bool = False) -> str:
+    """Stellt die freigegebenen Webserver-Einstellungen einer Domain auf den
+    Stand eines Backups von web_server_settings_update zurück. Ohne
+    confirm=true nur Vorschau, mit confirm=true vorher neues Backup und
+    dieselbe Kontrolle wie beim Update.
+    """
+    def targets(client: paramiko.SSHClient, d: str, before: dict[str, str]) -> dict[str, str]:
+        rec = _root_json_read(client, _WEB_BACKUP_DIR, backup_id, d)
+        old = rec.get("settings")
+        if not isinstance(old, dict):
+            raise ValueError("Backup ist ungültig (keine Einstellungen).")
+        out = {}
+        for k in _WEB_RULES:
+            v = old.get(k)
+            if isinstance(v, str) and v != before.get(k):
+                if v and not re.fullmatch(_WEB_RULES[k], v):
+                    raise ValueError(f"Backup enthält ungültigen Wert für '{k}'.")
+                out[k] = v
+        return out
+
+    return _web_change(domain, targets, confirm, f"web_server_settings_rollback:{backup_id}")
+
+
+# ---------------------------------------------------------------------------
+# Bilder verlustfrei optimieren (optimize_images / image_backups)
+# ---------------------------------------------------------------------------
+#
+# Der Worker (_IMG_WORKER_SRC) läuft per runuser als System-User der
+# Subscription (nie root): Er kann damit nur Dateien ändern, die der Kunde
+# selbst ändern darf. Pro Bild: Kopie im selben Ordner, GPS-Daten und
+# Seriennummern (EXIF, XMP) entfernen, verlustfrei optimieren (jpegoptim ohne
+# Qualitätsstufe = nur Huffman-Optimierung; optipng), nur ersetzen, wenn
+# kleiner oder Datenschutzdaten entfernt wurden. Farbprofil, Ausrichtung und
+# übrige Metadaten bleiben. Backup der Originale per Hardlink unter
+# <vhost>/.plesk-mcp/image-backups/<run_id>/ (ausserhalb jedes Docroots).
+
+_IMG_WORKER_SRC = r'''# plesk-mcp image worker - läuft per runuser als System-User der Subscription
+# (nie root) auf dem Plesk-Server (Python >= 3.6, nur Standardbibliothek).
+import errno
+import json
+import os
+import re
+import shutil
+import stat
+import struct
+import subprocess
+import sys
+import time
+import zlib
+
+TYPE_SIZES = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 8, 11: 4, 12: 8, 13: 4}
+GPS_TAG = 0x8825
+EXIF_TAG = 0x8769
+# CameraOwnerName, BodySerialNumber, LensSerialNumber, MakerNote (Herstellerdaten inkl. Seriennummern)
+PRIVATE_EXIF_TAGS = (0xA430, 0xA431, 0xA435, 0x927C)
+XMP_PRIVATE = r"(?:GPS[A-Za-z]*|SerialNumber|LensSerialNumber|BodySerialNumber|CameraOwnerName|OwnerName)"
+XMP_ATTR_RE = re.compile(r"\s+[\w.-]+:" + XMP_PRIVATE + r"\s*=\s*(?:\"[^\"]*\"|'[^']*')")
+XMP_EMPTY_RE = re.compile(r"<([\w.-]+:" + XMP_PRIVATE + r")\b[^>]*/>")
+XMP_ELEM_RE = re.compile(r"<([\w.-]+:" + XMP_PRIVATE + r")\b[^>]*>.*?</\1\s*>", re.S)
+XMP_ID = b"http://ns.adobe.com/xap/1.0/\x00"
+SKIP_DIRS = (".mcp-trash", ".plesk-mcp")
+
+
+class Bad(Exception):
+    pass
+
+
+def scrub_tiff(buf, start, end):
+    """Entfernt GPS-Daten und Seriennummern in einem TIFF/EXIF-Block (gleiche
+    Länge, Werte werden mit Nullbytes überschrieben). Rückgabe: Liste der
+    entfernten Gruppen."""
+    if end - start < 8:
+        raise Bad("exif")
+    bo = {b"II": "<", b"MM": ">"}.get(bytes(buf[start:start + 2]))
+    if bo is None:
+        raise Bad("exif")
+
+    def u16(o):
+        if o < start or o + 2 > end:
+            raise Bad("exif")
+        return struct.unpack(bo + "H", bytes(buf[o:o + 2]))[0]
+
+    def u32(o):
+        if o < start or o + 4 > end:
+            raise Bad("exif")
+        return struct.unpack(bo + "I", bytes(buf[o:o + 4]))[0]
+
+    def entries(ifd_off):
+        base = start + ifd_off
+        n = u16(base)
+        if n > 1000:
+            raise Bad("exif")
+        out = []
+        for i in range(n):
+            p = base + 2 + 12 * i
+            if p + 12 > end:
+                raise Bad("exif")
+            out.append((p, u16(p), u16(p + 2), u32(p + 4)))
+        return base, n, out
+
+    def zero_value(p, typ, count):
+        size = TYPE_SIZES.get(typ, 1) * count
+        if size <= 4:
+            buf[p + 8:p + 12] = b"\x00" * 4
+        else:
+            off = start + u32(p + 8)
+            if off < start or off + size > end:
+                raise Bad("exif")
+            buf[off:off + size] = b"\x00" * size
+
+    removed = []
+    _, _, ifd0 = entries(u32(start + 4))
+    for p, tag, typ, count in ifd0:
+        if tag == GPS_TAG:
+            gbase, gn, gents = entries(u32(p + 8))
+            if gn:
+                for gp, _, gtyp, gcount in gents:
+                    zero_value(gp, gtyp, gcount)
+                buf[gbase + 2:gbase + 2 + 12 * gn] = b"\x00" * (12 * gn)
+                buf[gbase:gbase + 2] = struct.pack(bo + "H", 0)
+                removed.append("gps")
+        elif tag == EXIF_TAG:
+            _, _, eents = entries(u32(p + 8))
+            for ep, etag, etyp, ecount in eents:
+                if etag in PRIVATE_EXIF_TAGS:
+                    zero_value(ep, etyp, ecount)
+                    if "seriennummern" not in removed:
+                        removed.append("seriennummern")
+    return removed
+
+
+def scrub_xmp(data):
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise Bad("xmp")
+    new = XMP_ELEM_RE.sub("", XMP_EMPTY_RE.sub("", XMP_ATTR_RE.sub("", text)))
+    return (new.encode("utf-8"), True) if new != text else (data, False)
+
+
+def scrub_jpeg(data):
+    if data[:2] != b"\xff\xd8":
+        raise Bad("jpeg")
+    out = [data[:2]]
+    removed = []
+    i = 2
+    while i < len(data):
+        if data[i] != 0xFF:
+            raise Bad("jpeg")
+        marker = data[i + 1]
+        if marker == 0xFF:
+            out.append(data[i:i + 1])
+            i += 1
+            continue
+        if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+            out.append(data[i:i + 2])
+            i += 2
+            continue
+        if marker in (0xDA, 0xD9):
+            out.append(data[i:])
+            break
+        if i + 4 > len(data):
+            raise Bad("jpeg")
+        length = struct.unpack(">H", data[i + 2:i + 4])[0]
+        seg_end = i + 2 + length
+        if length < 2 or seg_end > len(data):
+            raise Bad("jpeg")
+        payload = data[i + 4:seg_end]
+        if marker == 0xE1 and payload[:6] == b"Exif\x00\x00":
+            buf = bytearray(payload)
+            for r in scrub_tiff(buf, 6, len(buf)):
+                if r not in removed:
+                    removed.append(r)
+            out.append(data[i:i + 4] + bytes(buf))
+        elif marker == 0xE1 and payload.startswith(XMP_ID):
+            new, changed = scrub_xmp(payload[len(XMP_ID):])
+            if changed:
+                seg = XMP_ID + new
+                if len(seg) + 2 > 65535:
+                    raise Bad("xmp")
+                out.append(b"\xff\xe1" + struct.pack(">H", len(seg) + 2) + seg)
+                if "xmp" not in removed:
+                    removed.append("xmp")
+            else:
+                out.append(data[i:seg_end])
+        else:
+            out.append(data[i:seg_end])
+        i = seg_end
+    return b"".join(out), removed
+
+
+def png_chunk(typ, body):
+    return struct.pack(">I", len(body)) + typ + body + struct.pack(">I", zlib.crc32(typ + body) & 0xFFFFFFFF)
+
+
+def scrub_png(data):
+    sig = b"\x89PNG\r\n\x1a\n"
+    if data[:8] != sig:
+        raise Bad("png")
+    out = [sig]
+    removed = []
+    i = 8
+    while i < len(data):
+        if i + 8 > len(data):
+            raise Bad("png")
+        length = struct.unpack(">I", data[i:i + 4])[0]
+        typ = data[i + 4:i + 8]
+        end = i + 12 + length
+        if end > len(data):
+            raise Bad("png")
+        body = data[i + 8:i + 8 + length]
+        if typ == b"eXIf":
+            buf = bytearray(body)
+            rem = scrub_tiff(buf, 0, len(buf))
+            removed += [r for r in rem if r not in removed]
+            out.append(png_chunk(typ, bytes(buf)) if rem else data[i:end])
+        elif typ in (b"iTXt", b"tEXt") and body.startswith(b"XML:com.adobe.xmp\x00"):
+            head = b"XML:com.adobe.xmp\x00"
+            rest = body[len(head):]
+            if typ == b"iTXt":
+                if len(rest) < 2 or rest[0] != 0:
+                    out.append(data[i:end])  # komprimiertes XMP: unverändert
+                    i = end
+                    continue
+                parts = rest[2:].split(b"\x00", 2)
+                if len(parts) != 3:
+                    raise Bad("png")
+                new, changed = scrub_xmp(parts[2])
+                nb = head + rest[:2] + parts[0] + b"\x00" + parts[1] + b"\x00" + new
+            else:
+                new, changed = scrub_xmp(rest)
+                nb = head + new
+            if changed:
+                out.append(png_chunk(typ, nb))
+                if "xmp" not in removed:
+                    removed.append("xmp")
+            else:
+                out.append(data[i:end])
+        else:
+            out.append(data[i:end])
+        i = end
+        if typ == b"IEND":
+            break
+    return b"".join(out), removed
+
+
+def valid(path, kind):
+    with open(path, "rb") as f:
+        head = f.read(8)
+        f.seek(-12, 2)
+        tail = f.read(12)
+    if kind == "jpeg":
+        return head[:2] == b"\xff\xd8" and tail.rstrip(b"\x00")[-2:] == b"\xff\xd9"
+    return head == b"\x89PNG\r\n\x1a\n" and tail[4:8] == b"IEND"
+
+
+def lpath(base, parts):
+    """Pfad unter base, ohne Symlinks in irgendeinem Teil."""
+    p = base
+    for c in parts:
+        p = os.path.join(p, c)
+        st = os.lstat(p)
+        if stat.S_ISLNK(st.st_mode):
+            raise Bad("symlink:" + "/".join(parts))
+    return p
+
+
+def collect(start, rel, a, skipped):
+    files = []
+    st = os.lstat(start)
+    if stat.S_ISREG(st.st_mode):
+        cands = [(start, rel)]
+    else:
+        cands = []
+        for root, dirs, names in os.walk(start, followlinks=False):
+            dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS
+                             and not os.path.islink(os.path.join(root, d)))
+            if not a["recursive"]:
+                dirs[:] = []
+            r = os.path.relpath(root, start)
+            for n in sorted(names):
+                cands.append((os.path.join(root, n), rel + ([] if r == "." else r.split(os.sep)) + [n]))
+    for full, parts in cands:
+        name = parts[-1]
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        kind = "jpeg" if ext in ("jpg", "jpeg") else "png" if ext == "png" else None
+        if kind is None or ".mcp-" in name:
+            continue
+        st = os.lstat(full)
+        if not stat.S_ISREG(st.st_mode):
+            skipped["symlink_oder_kein_file"] = skipped.get("symlink_oder_kein_file", 0) + 1
+            continue
+        if st.st_nlink > 1:
+            skipped["hardlink"] = skipped.get("hardlink", 0) + 1
+            continue
+        if st.st_size > a["max_bytes"]:
+            skipped["zu_gross"] = skipped.get("zu_gross", 0) + 1
+            continue
+        if len(files) >= a["max_files"]:
+            skipped["limit_max_files"] = skipped.get("limit_max_files", 0) + 1
+            continue
+        files.append((full, parts, kind, st))
+    return files
+
+
+def run_tool(cmd):
+    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+    return p.returncode, (p.stderr or p.stdout).decode("utf-8", "replace")[-300:]
+
+
+def optimize(a):
+    base = a["base"]
+    start = lpath(base, a["parts"])
+    skipped = {}
+    files = collect(start, a["parts"], a, skipped)
+    tools = {"jpeg": a["jpegoptim"], "png": a["optipng"]}
+    done, errors = [], []
+    total_before = total_after = 0
+    backup_root = os.path.join(base, ".plesk-mcp", "image-backups", a["run_id"])
+    for full, parts, kind, st in files:
+        sys.stdout.write(".\n")
+        sys.stdout.flush()
+        rel = "/".join(parts)
+        if not tools[kind] or not os.path.exists(tools[kind]):
+            skipped["kein_werkzeug_" + kind] = skipped.get("kein_werkzeug_" + kind, 0) + 1
+            continue
+        d, name = os.path.split(full)
+        ext = name.rsplit(".", 1)[-1]
+        tmp = os.path.join(d, ".%s.mcp-%s.%s" % (name[:150], os.urandom(4).hex(), ext))
+        try:
+            with open(full, "rb") as f:
+                data = f.read()
+            try:
+                clean, removed = (scrub_jpeg if kind == "jpeg" else scrub_png)(data)
+            except Bad:
+                clean, removed = data, ["metadaten_nicht_lesbar"]
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(clean)
+            if kind == "jpeg":
+                rc, msg = run_tool([tools[kind], "-q", "-p", tmp])
+            else:
+                rc, msg = run_tool([tools[kind], "-quiet", "-o2", "-preserve", tmp])
+            if rc != 0:
+                raise Bad("werkzeug: " + msg.strip())
+            new_size = os.path.getsize(tmp)
+            if not valid(tmp, kind):
+                raise Bad("ergebnis_ungueltig")
+            privacy = [r for r in removed if r != "metadaten_nicht_lesbar"]
+            if new_size >= st.st_size and not privacy:
+                os.unlink(tmp)
+                skipped["nicht_kleiner"] = skipped.get("nicht_kleiner", 0) + 1
+                continue
+            entry = {"datei": rel, "vorher": st.st_size, "nachher": new_size, "entfernt": removed}
+            if not a["dry_run"]:
+                now = os.lstat(full)
+                if (now.st_ino, now.st_size, now.st_mtime_ns) != (st.st_ino, st.st_size, st.st_mtime_ns):
+                    raise Bad("datei_waehrend_lauf_geaendert")
+                os.chmod(tmp, stat.S_IMODE(st.st_mode))
+                if a["keep_backup"]:
+                    bpath = os.path.join(backup_root, *parts)
+                    os.makedirs(os.path.dirname(bpath), 0o700, exist_ok=True)
+                    try:
+                        os.link(full, bpath)
+                    except OSError as e:
+                        if e.errno != errno.EXDEV:
+                            raise
+                        shutil.copy2(full, bpath)
+                os.replace(tmp, full)
+                os.utime(full, ns=(st.st_atime_ns, st.st_mtime_ns))
+            else:
+                os.unlink(tmp)
+            total_before += st.st_size
+            total_after += new_size
+            done.append(entry)
+        except Exception as e:  # noqa
+            errors.append({"datei": rel, "fehler": str(e)[:200]})
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    done.sort(key=lambda x: x["vorher"] - x["nachher"], reverse=True)
+    return {"geprueft": len(files), "optimiert": len(done), "bytes_vorher": total_before,
+            "bytes_nachher": total_after, "dateien": done[:50], "fehler": errors[:50],
+            "uebersprungen": skipped,
+            "backup": (".plesk-mcp/image-backups/" + a["run_id"]) if done and a["keep_backup"]
+            and not a["dry_run"] else None}
+
+
+def backups_root(a):
+    return os.path.join(a["base"], ".plesk-mcp", "image-backups")
+
+
+def list_backups(a):
+    root = backups_root(a)
+    out = []
+    if os.path.isdir(root) and not os.path.islink(root):
+        for run in sorted(os.listdir(root)):
+            p = os.path.join(root, run)
+            if os.path.islink(p) or not os.path.isdir(p):
+                continue
+            n = size = 0
+            for r, ds, fs in os.walk(p, followlinks=False):
+                for f in fs:
+                    st = os.lstat(os.path.join(r, f))
+                    n += 1
+                    size += st.st_size if st.st_nlink == 1 else 0
+            out.append({"run_id": run, "dateien": n, "belegt_bytes": size})
+    return {"backups": out}
+
+
+def run_dir(a):
+    if not re.match(r"^\d{14}-[0-9a-f]{8}$", a["run_id"]):
+        raise Bad("run_id")
+    p = os.path.join(backups_root(a), a["run_id"])
+    if os.path.islink(p) or not os.path.isdir(p):
+        raise Bad("backup_nicht_gefunden")
+    return p
+
+
+def restore(a):
+    p = run_dir(a)
+    restored, errors = [], []
+    for r, ds, fs in os.walk(p, followlinks=False):
+        for f in fs:
+            src = os.path.join(r, f)
+            parts = os.path.relpath(src, p).split(os.sep)
+            try:
+                target = lpath(a["base"], parts[:-1])
+                tgt = os.path.join(target, parts[-1])
+                if os.path.islink(tgt) or os.path.islink(src):
+                    raise Bad("symlink")
+                if not a["dry_run"]:
+                    os.replace(src, tgt)
+                restored.append("/".join(parts))
+            except Exception as e:  # noqa
+                errors.append({"datei": "/".join(parts), "fehler": str(e)[:200]})
+    if not a["dry_run"] and not errors:
+        shutil.rmtree(p)
+    return {"wiederhergestellt": len(restored), "dateien": restored[:50], "fehler": errors[:50]}
+
+
+def delete(a):
+    p = run_dir(a)
+    info = [b for b in list_backups(a)["backups"] if b["run_id"] == a["run_id"]]
+    if not a["dry_run"]:
+        shutil.rmtree(p)
+    return {"geloescht": not a["dry_run"], "backup": info[0] if info else None}
+
+
+def main():
+    os.umask(0o077)
+    try:
+        a = json.loads(sys.stdin.read())
+        res = {"optimize": optimize, "list": list_backups, "restore": restore, "delete": delete}[a["op"]](a)
+        res["ok"] = True
+    except Bad as e:
+        res = {"ok": False, "error": str(e)}
+    except Exception as e:  # noqa
+        res = {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:200])}
+    sys.stdout.write(json.dumps(res) + "\n")
+    sys.stdout.flush()
+
+
+main()
+'''
+_IMG_JPEGOPTIM = os.environ.get("IMAGE_JPEGOPTIM", "/usr/bin/jpegoptim").strip()
+_IMG_OPTIPNG = os.environ.get("IMAGE_OPTIPNG", "/usr/bin/optipng").strip()
+_IMG_TIMEOUT = int(os.environ.get("IMAGE_OPT_TIMEOUT", "300"))
+_IMG_MAX_FILES = 2000
+_IMG_MAX_BYTES = 50 * 1024 * 1024
+_IMG_RUN_ID_RE = re.compile(r"^\d{14}-[0-9a-f]{8}$")
+
+
+def _img_run(ctx: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
+    """Startet den Worker als System-User der Subscription; Fortschritt kommt
+    als Punkte, das Ergebnis als letzte JSON-Zeile."""
+    payload = json.dumps({**args, "base": ctx["base"]}).encode("utf-8")
+    cmd = (
+        f"cd {shlex.quote(ctx['base'])} && runuser -u {shlex.quote(ctx['login'])} -- "
+        f"env -i HOME={shlex.quote(ctx['base'])} PATH=/usr/bin:/bin "
+        f"{shlex.quote(_HELPER_PYTHON)} -I -c {shlex.quote(_IMG_WORKER_SRC)}"
+    )
+    client = _ssh_connect()
+    try:
+        out, err, rc = _client_exec(client, cmd, timeout=_IMG_TIMEOUT, stdin_data=payload)
+    finally:
+        client.close()
+    for line in reversed(out.strip().splitlines()):
+        try:
+            res = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(res, dict) and "ok" in res:
+            if not res["ok"]:
+                raise ValueError(f"Bildoptimierung abgebrochen: {res.get('error')}")
+            return res
+    raise SSHError(f"Bildoptimierung: keine Antwort vom Worker (Exit-Code {rc}): {(err.strip() or out.strip())[-300:]}")
+
+
+def _img_ctx_and_parts(domain: str, path: str) -> tuple[dict[str, Any], list[str]]:
+    ctx = _vhost_ctx(domain)
+    parts = _strict_parts(path)
+    if parts not in ctx["docroots"] and _docroot_of(parts, ctx["docroots"]) is None:
+        raise ValueError(
+            f"'{path}' liegt in keinem Docroot der Subscription - nur Bilder in Webordnern "
+            f"(z.B. {'/'.join(ctx['docroots'][0])}) werden optimiert."
+        )
+    return ctx, parts
+
+
+@mcp.tool()
+def optimize_images(
+    domain: str,
+    path: str = "httpdocs",
+    dry_run: bool = True,
+    confirm: bool = False,
+    max_files: int = 500,
+    recursive: bool = True,
+    keep_backup: bool = True,
+) -> str:
+    """Optimiert JPG- und PNG-Bilder einer Domain verlustfrei (gleiche Pixel)
+    für weniger Speicher und schnellere Seiten. domain: Hauptdomain der
+    Subscription; path: Ordner oder Datei relativ zu /var/www/vhosts/<domain>/,
+    muss in einem Docroot liegen (z.B. "httpdocs/wp-content/uploads").
+
+    Pro Bild: GPS-Daten, Kamera-/Objektiv-Seriennummern, Besitzername und
+    Herstellerdaten (MakerNote) aus EXIF/XMP entfernen (Datenschutz);
+    Farbprofil, Ausrichtung und übrige Metadaten bleiben. Danach jpegoptim
+    (nur verlustfreie Huffman-Optimierung, keine Qualitätsstufe) bzw.
+    optipng -o2. Ersetzt wird nur, wenn die Datei kleiner wird oder
+    Datenschutzdaten entfernt wurden; Änderungsdatum und Rechte bleiben.
+    Läuft als System-User der Subscription (nie root), folgt keinen
+    Symlinks, überspringt Hardlinks, Dateien > 50 MB und den Papierkorb.
+
+    dry_run=true (Standard): rechnet die Ersparnis aus, ändert nichts.
+    Zum Ausführen dry_run=false UND confirm=true. Mit keep_backup=true
+    (Standard) bleiben die Originale per Hardlink unter
+    .plesk-mcp/image-backups/<run_id>/ erhalten (ausserhalb des Webroots) -
+    der Speicher wird erst frei, wenn das Backup mit image_backups gelöscht
+    wird. Max. max_files Bilder pro Aufruf (Standard 500, höchstens 2000).
+    """
+    if not dry_run and not confirm:
+        raise ValueError("Zum Ausführen dry_run=false UND confirm=true setzen - ändert Dateien auf dem "
+                         "Produktivserver.")
+    if not isinstance(max_files, int) or not 1 <= max_files <= _IMG_MAX_FILES:
+        raise ValueError(f"max_files muss zwischen 1 und {_IMG_MAX_FILES} liegen.")
+    ctx, parts = _img_ctx_and_parts(domain, path)
+    run_id = f"{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}-{os.urandom(4).hex()}"
+    lock = _phps_lock(f"img:{ctx['domain']}")
+    try:
+        res = _img_run(ctx, {"op": "optimize", "parts": parts, "dry_run": bool(dry_run),
+                             "recursive": bool(recursive), "keep_backup": bool(keep_backup),
+                             "max_files": max_files, "max_bytes": _IMG_MAX_BYTES, "run_id": run_id,
+                             "jpegoptim": _IMG_JPEGOPTIM, "optipng": _IMG_OPTIPNG})
+    finally:
+        lock.release()
+    saved = res["bytes_vorher"] - res["bytes_nachher"]
+    out: dict[str, Any] = {
+        "domain": ctx["domain"],
+        "pfad": "/".join(parts),
+        "modus": "Probelauf - nichts geändert" if dry_run else "ausgeführt",
+        "bilder_geprueft": res["geprueft"],
+        "bilder_optimiert": res["optimiert"],
+        "ersparnis_bytes": saved,
+        "ersparnis_mb": round(saved / 1048576, 2),
+        "ersparnis_prozent": round(100 * saved / res["bytes_vorher"], 1) if res["bytes_vorher"] else 0,
+        "groesste_ersparnisse": res["dateien"],
+        "uebersprungen": res["uebersprungen"],
+    }
+    if res["fehler"]:
+        out["fehler"] = res["fehler"]
+    if res.get("backup"):
+        out["backup_run_id"] = run_id
+        out["backup_hinweis"] = ("Originale unter " + res["backup"] + " - Speicher wird erst frei, wenn das "
+                                 "Backup mit image_backups(action=\"delete\") gelöscht ist.")
+    if res["uebersprungen"].get("limit_max_files"):
+        out["hinweis"] = "max_files erreicht - weitere Bilder mit einem weiteren Aufruf optimieren."
+    if not dry_run:
+        _audit("optimize_images", domain=ctx["domain"], path="/".join(parts), run_id=run_id,
+               optimized=res["optimiert"], saved=saved, errors=len(res["fehler"]))
+    return _json(out)
+
+
+@mcp.tool()
+def image_backups(domain: str, action: str = "list", run_id: str = "", confirm: bool = False) -> str:
+    """Verwaltet die Backups von optimize_images einer Domain.
+    action="list": vorhandene Backups mit Anzahl Dateien und belegtem Speicher.
+    action="restore": stellt die Originale eines Laufs (run_id) wieder her und
+    entfernt danach das Backup. action="delete": löscht das Backup eines
+    Laufs endgültig (gibt den Speicher frei). restore/delete ohne
+    confirm=true nur Vorschau.
+    """
+    if action not in ("list", "restore", "delete"):
+        raise ValueError("action muss 'list', 'restore' oder 'delete' sein.")
+    ctx = _vhost_ctx(domain)
+    if action == "list":
+        return _json({"domain": ctx["domain"], **{k: v for k, v in _img_run(ctx, {"op": "list"}).items()
+                                                  if k != "ok"}})
+    if not _IMG_RUN_ID_RE.match((run_id or "").strip()):
+        raise ValueError(f"Ungültige run_id {run_id!r} (siehe action=\"list\").")
+    lock = _phps_lock(f"img:{ctx['domain']}")
+    try:
+        res = _img_run(ctx, {"op": action, "run_id": run_id.strip(), "dry_run": not confirm})
+    finally:
+        lock.release()
+    res.pop("ok", None)
+    if confirm:
+        _audit("image_backups", domain=ctx["domain"], op=action, run_id=run_id.strip(),
+               result="failed" if res.get("fehler") else "ok")
+    return _json({"domain": ctx["domain"], "action": action, "run_id": run_id.strip(),
+                  "modus": "ausgeführt" if confirm else "Vorschau - nichts geändert", **res})
 
 
 # ---------------------------------------------------------------------------
