@@ -3720,7 +3720,8 @@ def _trash_autoclean() -> None:
 # Änderungen laufen über WP-CLI als System-User der Subscription (runuser,
 # nie als root) mit der PHP-Version der Domain. So laufen die WordPress-Hooks
 # (update_option) und ein Objekt-Cache (z.B. Redis) wird korrekt aktualisiert.
-# Nur Optionen aus der Allowlist sind erlaubt. Zugangsdaten (wp-config.php,
+# Jede Option mit gültigem Namen ist erlaubt (Vorschau ohne confirm, Backup vor
+# jeder Änderung, Rollback). Zugangsdaten (wp-config.php,
 # DB-Passwort, Salts, /etc/psa/.psa.shadow) werden von diesen Tools weder
 # gelesen noch ausgegeben: die Domain-Daten kommen über "plesk db", das sich
 # selbst authentifiziert.
@@ -3728,31 +3729,17 @@ def _trash_autoclean() -> None:
 _WP_CLI_PATH = os.environ.get("WP_CLI_PATH", "/usr/local/bin/wp-standalone").strip()
 _WP_CLI_TIMEOUT = int(os.environ.get("WP_CLI_TIMEOUT", "120"))
 _WP_OPTION_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]{1,191}$")
-_WP_OPTION_ALLOWLIST_DEFAULT = ("wp_rocket_settings", "elementor_font_display")
 _WP_DOMAIN_RE = re.compile(r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")
 _WP_SYSUSER_RE = re.compile(r"^[a-z_][a-z0-9_.-]{0,63}$")
 _WP_BACKUP_ID_RE = re.compile(r"^(\d{14})-([0-9a-f]{8})@([a-z0-9.-]+)$")
 _WP_BACKUP_SUBDIR = ".plesk-mcp/wp-option-backups"
 
 
-def _wp_option_allowlist() -> set[str]:
-    """Standard-Allowlist plus Einträge aus WP_OPTION_ALLOWLIST (kommagetrennt)."""
-    names = set(_WP_OPTION_ALLOWLIST_DEFAULT)
-    for n in os.environ.get("WP_OPTION_ALLOWLIST", "").split(","):
-        n = n.strip()
-        if n and _WP_OPTION_NAME_RE.match(n):
-            names.add(n)
-    return names
-
-
 def _wp_check_option(option_name: str) -> str:
+    """Nur Namensprüfung (Buchstaben, Ziffern, _ und -, max. 191 Zeichen)."""
     name = option_name.strip()
-    allowed = _wp_option_allowlist()
-    if not _WP_OPTION_NAME_RE.match(name) or name not in allowed:
-        raise ValueError(
-            f"Option {option_name!r} ist nicht freigegeben. Erlaubt: "
-            f"{', '.join(sorted(allowed))} (erweiterbar per ENV WP_OPTION_ALLOWLIST)."
-        )
+    if not _WP_OPTION_NAME_RE.match(name):
+        raise ValueError(f"Ungültiger Optionsname {option_name!r} - erlaubt sind Buchstaben, Ziffern, _ und -.")
     return name
 
 
@@ -4072,8 +4059,8 @@ def wp_option_update(
 
     Läuft als System-User der Subscription (nie root) mit der PHP-Version
     der Domain; WordPress-Hooks und Objekt-Cache (Redis) werden dadurch
-    korrekt bedient. Nur Optionen aus der Allowlist (wp_rocket_settings,
-    elementor_font_display, erweiterbar per ENV WP_OPTION_ALLOWLIST).
+    korrekt bedient. Jede Option mit gültigem Namen (z.B. imagify_settings,
+    blog_public).
     Ohne confirm=true nur Vorschau (alt/neu je Schlüssel, nichts geschrieben).
     Mit confirm=true wird vorher ein JSON-Backup ausserhalb des Webroots
     angelegt; Rückgabe mit backup_id (für wp_option_rollback) und alt/neu.
