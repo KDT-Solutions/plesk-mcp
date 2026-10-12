@@ -75,6 +75,7 @@ import posixpath
 import re
 import shlex
 import secrets
+import socket
 import stat
 import struct
 import sys
@@ -116,7 +117,7 @@ if _HTTP_MODE and not _MCP_API_KEY:
 # Dateien (server.py, Dockerfile, requirements.txt, Workflow) geaendert haben.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.20"
+_VERSION_BASE = "0.21"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -5294,11 +5295,13 @@ import os
 import pwd
 import re
 import shutil
+import signal
 import stat
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zlib
 
@@ -5318,6 +5321,47 @@ SKIP_DIRS = (".mcp-trash", ".plesk-mcp")
 OWN_TMP_RE = re.compile(r"^\..+\.mcp-[0-9a-f]{8}\.(?:png|jpe?g)(?:\.bak)?$", re.I)
 ORPHAN_MIN_AGE = 3600
 PNG_FAST_BYTES = 1024 * 1024
+IONICE_BIN = "/usr/bin/ionice"
+BG_NICE = 10
+
+# Hintergrundmodus: Abbruch kommt als Zeile "cancel" über stdin, bei
+# Verbindungsverlust (Container-Neustart, SSH-Abbruch) als EOF auf stdin,
+# sonst per SIGTERM/SIGHUP. Alle Wege setzen nur dieses Event; die Schleife
+# beendet das laufende Werkzeug, räumt die Arbeitskopie weg und liefert das
+# Ergebnis mit "abgebrochen" - nie bleibt eine halb geschriebene Datei zurück.
+CANCEL = threading.Event()
+CANCEL_REASON = {"grund": None}
+IONICE = None
+
+
+def request_cancel(reason):
+    if not CANCEL.is_set():
+        CANCEL_REASON["grund"] = reason
+        CANCEL.set()
+
+
+def watch_stdin():
+    """Liest im Hintergrundmodus stdin weiter: "cancel" oder EOF = Abbruch."""
+    try:
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                request_cancel("verbindung_verloren")
+                return
+            if line.strip() == "cancel":
+                request_cancel("cancel")
+                return
+    except Exception:  # noqa
+        request_cancel("verbindung_verloren")
+
+
+def emit(obj):
+    """Fortschrittszeile an den MCP-Server; Schreibfehler = Verbindung weg."""
+    try:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        request_cancel("verbindung_verloren")
 
 
 class Bad(Exception):
@@ -5541,28 +5585,75 @@ def collect(start, rel, a, skipped, orphans):
                 cands.append((os.path.join(root, n), rel + ([] if r == "." else r.split(os.sep)) + [n]))
     for full, parts in cands:
         name = parts[-1]
-        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-        kind = "jpeg" if ext in ("jpg", "jpeg") else "png" if ext == "png" else None
         if ".mcp-" in name:
             orphans.append((full, parts))
             continue
-        if kind is None:
+        check_candidate(full, parts, a, skipped, files)
+    return files
+
+
+def image_kind(name):
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    return "jpeg" if ext in ("jpg", "jpeg") else "png" if ext == "png" else None
+
+
+def check_candidate(full, parts, a, skipped, files):
+    """Prüft eine Datei und hängt sie an files an; Rückgabe: Grund, warum
+    nicht (None = übernommen)."""
+    kind = image_kind(parts[-1])
+    if kind is None:
+        return "kein_bild"
+    st = os.lstat(full)
+    if not stat.S_ISREG(st.st_mode):
+        skipped["symlink_oder_kein_file"] = skipped.get("symlink_oder_kein_file", 0) + 1
+        return "symlink_oder_kein_file"
+    if st.st_nlink > 1:
+        skipped["hardlink"] = skipped.get("hardlink", 0) + 1
+        return "hardlink"
+    if st.st_size > a["max_bytes"]:
+        skipped["zu_gross"] = skipped.get("zu_gross", 0) + 1
+        return "zu_gross"
+    files.append((full, parts, kind, st))
+    return None
+
+
+def collect_list(base, a, skipped, details):
+    """Gezielte Dateiliste (Parameter dateien): jede Datei einzeln prüfen,
+    ohne Symlink in irgendeinem Pfadteil; Probleme landen mit Grund unter
+    details, der Lauf geht mit den übrigen Dateien weiter."""
+    files = []
+    seen = set()
+    texts = {"kein_bild": "keine .jpg/.jpeg/.png-Datei", "nicht_gefunden": "Datei nicht gefunden",
+             "symlink": "Pfad enthält einen Symlink", "symlink_oder_kein_file": "Symlink oder keine normale Datei",
+             "hardlink": "Datei hat weitere Hardlinks", "zu_gross": "Datei über dem Grössenlimit"}
+    for parts in a["dateien"]:
+        rel = "/".join(parts)
+        if rel in seen:
             continue
-        st = os.lstat(full)
-        if not stat.S_ISREG(st.st_mode):
-            skipped["symlink_oder_kein_file"] = skipped.get("symlink_oder_kein_file", 0) + 1
+        seen.add(rel)
+        msg = None
+        try:
+            reason = check_candidate(lpath(base, parts), parts, a, skipped, files)
+        except Bad:
+            reason = "symlink"
+        except FileNotFoundError:
+            reason = "nicht_gefunden"
+        except OSError as e:
+            # nur den Fehlertext, nie den absoluten Serverpfad
+            reason, msg = "nicht_gefunden", "%s: %s" % (type(e).__name__, e.strerror or "Fehler beim Zugriff")
+        if reason is None:
             continue
-        if st.st_nlink > 1:
-            skipped["hardlink"] = skipped.get("hardlink", 0) + 1
-            continue
-        if st.st_size > a["max_bytes"]:
-            skipped["zu_gross"] = skipped.get("zu_gross", 0) + 1
-            continue
-        files.append((full, parts, kind, st))
+        if reason in ("kein_bild", "nicht_gefunden", "symlink"):
+            skipped[reason] = skipped.get(reason, 0) + 1
+        details.append({"datei": rel, "grund": reason, "meldung": msg or texts.get(reason, reason)})
     return files
 
 
 class ToolTimeout(Exception):
+    pass
+
+
+class Cancelled(Exception):
     pass
 
 
@@ -5575,12 +5666,22 @@ class Rejected(Exception):
 
 def run_tool(cmd, timeout):
     """Ohne -q/-quiet: sonst schreiben jpegoptim und optipng bei abgelehnten
-    Dateien gar nichts und es bleibt nur der Exit-Code."""
-    try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise ToolTimeout()
-    lines = [" ".join(l.split()) for l in (p.stderr + p.stdout).decode("utf-8", "replace").splitlines()]
+    Dateien gar nichts und es bleibt nur der Exit-Code. Läuft in kurzen
+    Wartezyklen, damit ein Abbruch das Werkzeug sofort beendet."""
+    if IONICE:
+        cmd = [IONICE, "-c2", "-n7"] + cmd
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    end = time.time() + timeout
+    while True:
+        try:
+            out, err = p.communicate(timeout=0.25)
+            break
+        except subprocess.TimeoutExpired:
+            if CANCEL.is_set() or time.time() > end:
+                p.kill()
+                p.communicate()
+                raise Cancelled() if CANCEL.is_set() else ToolTimeout()
+    lines = [" ".join(l.split()) for l in (err + out).decode("utf-8", "replace").splitlines()]
     lines = [l for l in lines if l]
     hits = [l for l in lines if re.search(r"error|warning|invalid|not a|unrecognized|corrupt|premature", l, re.I)
             and not re.search(r"status report|have been processed|have been encountered", l, re.I)]
@@ -5679,24 +5780,44 @@ def clean_tmp(root, keep):
 
 
 def optimize(a):
+    global IONICE
     t0 = time.time()
     base = a["base"]
-    start = lpath(base, a["parts"])
+    background = bool(a.get("background"))
+    priority = None
+    if background:
+        # Fremde Site soll nicht leiden: niedrige CPU- und IO-Priorität, vererbt
+        # an jpegoptim/optipng. Läuft per runuser ausserhalb der CloudLinux-LVE
+        # des Accounts (pam_lve hängt nur an su/sshd), daher ist das die
+        # einzige Bremse.
+        try:
+            if os.nice(0) < BG_NICE:
+                os.nice(BG_NICE - os.nice(0))
+        except OSError:
+            pass
+        IONICE = IONICE_BIN if os.path.exists(IONICE_BIN) else None
+        priority = {"nice": os.nice(0), "ionice": bool(IONICE)}
     skipped = {}
     orphans = []
-    files = collect(start, a["parts"], a, skipped, orphans)
+    done, errors, details = [], [], []
+    if a.get("dateien"):
+        files = collect_list(base, a, skipped, details)
+    else:
+        start = lpath(base, a["parts"])
+        files = collect(start, a["parts"], a, skipped, orphans)
     orphan_report = handle_orphans(orphans, a["dry_run"])
     files.sort(key=lambda f: "/".join(f[1]))
     if a.get("start_after"):
         files = [f for f in files if "/".join(f[1]) > a["start_after"]]
-    if len(files) > a["max_files"]:
+    if a.get("max_files") and len(files) > a["max_files"]:
         skipped["limit_max_files"] = len(files) - a["max_files"]
         files = files[:a["max_files"]]
     tools = {"jpeg": a["jpegoptim"], "png": a["optipng"]}
-    deadline = t0 + a.get("time_budget", 30)
+    budget = a.get("time_budget", 30)
+    deadline = None if budget is None else t0 + budget
+    tool_timeout = a.get("tool_timeout", 15)
     next_after = None
     checked = 0
-    done, errors, details = [], [], []
     dir_ok = {}
     no_write = {}
     total_before = total_after = 0
@@ -5712,14 +5833,21 @@ def optimize(a):
         # .plesk-mcp nicht beschreibbar: privates Temp-Verzeichnis des Users
         tmp_dir = tempfile.mkdtemp(prefix="plesk-mcp-img-")
     for idx, (full, parts, kind, st) in enumerate(files):
-        if time.time() > deadline:
+        if CANCEL.is_set():
+            break
+        if deadline is not None and time.time() > deadline:
             next_after = "/".join(files[idx - 1][1]) if idx else None
             skipped["zeitbudget_rest"] = len(files) - idx
             break
         checked += 1
-        sys.stdout.write(".\n")
-        sys.stdout.flush()
         rel = "/".join(parts)
+        if background:
+            emit({"fortschritt": {"bearbeitet": idx, "gesamt": len(files), "datei": rel, "optimiert": len(done),
+                                  "ersparnis_bytes": total_before - total_after,
+                                  "uebersprungen": sum(skipped.values()), "fehler": len(errors)}})
+        else:
+            sys.stdout.write(".\n")
+            sys.stdout.flush()
         if not tools[kind] or not os.path.exists(tools[kind]):
             skipped["kein_werkzeug_" + kind] = skipped.get("kein_werkzeug_" + kind, 0) + 1
             continue
@@ -5755,11 +5883,11 @@ def optimize(a):
             with os.fdopen(fd, "wb") as f:
                 f.write(clean)
             if kind == "jpeg":
-                rc, msg = run_tool([tools[kind], "-p", tmp], a.get("tool_timeout", 15))
+                rc, msg = run_tool([tools[kind], "-p", tmp], tool_timeout)
             else:
                 # grosse PNGs mit -o1 (ebenfalls verlustfrei, deutlich schneller), sonst Timeouts
                 level = "-o1" if st.st_size >= PNG_FAST_BYTES else "-o2"
-                rc, msg = run_tool([tools[kind], level, "-preserve", tmp], a.get("tool_timeout", 15))
+                rc, msg = run_tool([tools[kind], level, "-preserve", tmp], tool_timeout)
             if rc != 0:
                 raise Rejected("werkzeug_abgelehnt", "%s Exit-Code %d: %s" % (
                     os.path.basename(tools[kind]), rc, msg or "keine Ausgabe"))
@@ -5806,10 +5934,14 @@ def optimize(a):
             total_before += st.st_size
             total_after += new_size
             done.append(entry)
+        except Cancelled:
+            # Datei zählt nicht als geprüft: Arbeitskopie wird im finally entfernt,
+            # das Original bleibt unverändert
+            checked -= 1
         except ToolTimeout:
             skipped["timeout"] = skipped.get("timeout", 0) + 1
             details.append({"datei": rel, "grund": "timeout", "meldung": "%s nach %d s abgebrochen" % (
-                os.path.basename(tools[kind]), a.get("tool_timeout", 15))})
+                os.path.basename(tools[kind]), tool_timeout)})
         except Rejected as e:
             skipped[e.reason] = skipped.get(e.reason, 0) + 1
             details.append({"datei": rel, "grund": e.reason, "meldung": str(e)[:300]})
@@ -5823,13 +5955,22 @@ def optimize(a):
                     except OSError:
                         pass
     shutil.rmtree(tmp_dir, ignore_errors=True)
+    aborted = CANCEL_REASON["grund"] if CANCEL.is_set() else None
+    if aborted and len(files) > checked:
+        skipped["abgebrochen_rest"] = len(files) - checked
     if next_after is None and skipped.get("limit_max_files") and checked:
         next_after = "/".join(files[checked - 1][1])
     done.sort(key=lambda x: x["vorher"] - x["nachher"], reverse=True)
+    # Listenlimit: Vordergrund 50 (Antwort bleibt klein), Hintergrund 0 = alles
+    # (der MCP-Server blättert selbst)
+    lim = a.get("list_limit", 50) or None
     return {"geprueft": checked, "optimiert": len(done), "fortsetzen_ab": next_after, "bytes_vorher": total_before,
-            "bytes_nachher": total_after, "dateien": done[:50], "fehler": errors[:50],
-            "uebersprungen": skipped, "details": details[:50], "ohne_schreibrechte": list(no_write.values())[:50],
-            "verwaiste_temp_dateien": orphan_report[:50],
+            "bytes_nachher": total_after, "dateien": done[:lim], "fehler": errors[:lim],
+            "uebersprungen": skipped, "details": details[:lim], "ohne_schreibrechte": list(no_write.values())[:lim],
+            "verwaiste_temp_dateien": orphan_report[:lim],
+            "anzahl": {"dateien": len(done), "fehler": len(errors), "details": len(details),
+                       "ohne_schreibrechte": len(no_write), "verwaiste_temp_dateien": len(orphan_report)},
+            "abgebrochen": aborted, "prioritaet": priority, "laufzeit_s": round(time.time() - t0, 1),
             "backup": (".plesk-mcp/image-backups/" + a["run_id"]) if done and a["keep_backup"]
             and not a["dry_run"] else None}
 
@@ -5898,15 +6039,26 @@ def delete(a):
 def main():
     os.umask(0o077)
     try:
-        a = json.loads(sys.stdin.read())
+        # Auftrag ist genau eine JSON-Zeile; im Hintergrundmodus bleibt stdin
+        # danach offen (Abbruchkanal), sonst folgt sofort EOF.
+        a = json.loads(sys.stdin.readline())
+        if a.get("background"):
+            for sig in (signal.SIGTERM, signal.SIGHUP):
+                signal.signal(sig, lambda s, f: request_cancel("signal"))
+            t = threading.Thread(target=watch_stdin)
+            t.daemon = True
+            t.start()
         res = {"optimize": optimize, "list": list_backups, "restore": restore, "delete": delete}[a["op"]](a)
         res["ok"] = True
     except Bad as e:
         res = {"ok": False, "error": str(e)}
     except Exception as e:  # noqa
         res = {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:200])}
-    sys.stdout.write(json.dumps(res) + "\n")
-    sys.stdout.flush()
+    try:
+        sys.stdout.write(json.dumps(res) + "\n")
+        sys.stdout.flush()
+    except (OSError, ValueError):
+        pass
 
 
 main()
@@ -5919,22 +6071,37 @@ _IMG_MAX_FILES = 2000
 # laufende Datei (je Werkzeug höchstens _IMG_TOOL_TIMEOUT) + SSH/DB-Overhead.
 _IMG_TIME_BUDGET = int(os.environ.get("IMAGE_OPT_TIME_BUDGET", "30"))
 _IMG_TOOL_TIMEOUT = int(os.environ.get("IMAGE_OPT_TOOL_TIMEOUT", "15"))
+# Hintergrundmodus: kein Zeitbudget, dafür ein grosszügiges Limit pro Werkzeugaufruf
+_IMG_BG_TOOL_TIMEOUT = int(os.environ.get("IMAGE_OPT_BG_TOOL_TIMEOUT", "300"))
 _IMG_MAX_BYTES = 50 * 1024 * 1024
+_IMG_MAX_DATEIEN = 200
+_IMG_LIST_LIMIT = 50          # Listen im Vordergrund
+_IMG_JOB_PAGE = 200           # Listen in image_job(action="status")
+_IMG_JOB_PAGE_MAX = 500       # Maximum beim Blättern
+_IMG_JOB_LISTS = ("groesste_ersparnisse", "uebersprungen_details", "fehler")
+_IMG_MAX_JOBS = 4             # gleichzeitig laufende Hintergrundjobs (alle Domains)
+_IMG_JOB_KEEP = 86400         # abgeschlossene Jobs bleiben 24 h abrufbar
+_IMG_CANCEL_WAIT = 15
 _IMG_RUN_ID_RE = re.compile(r"^\d{14}-[0-9a-f]{8}$")
+_img_jobs: dict[str, dict[str, Any]] = {}
+_img_jobs_lock = threading.Lock()
+
+
+def _img_cmd(ctx: dict[str, Any]) -> str:
+    return (
+        f"cd {shlex.quote(ctx['base'])} && runuser -u {shlex.quote(ctx['login'])} -- "
+        f"env -i HOME={shlex.quote(ctx['base'])} PATH=/usr/bin:/bin "
+        f"{shlex.quote(_HELPER_PYTHON)} -I -c {shlex.quote(_IMG_WORKER_SRC)}"
+    )
 
 
 def _img_run(ctx: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
     """Startet den Worker als System-User der Subscription; Fortschritt kommt
     als Punkte, das Ergebnis als letzte JSON-Zeile."""
     payload = json.dumps({**args, "base": ctx["base"]}).encode("utf-8")
-    cmd = (
-        f"cd {shlex.quote(ctx['base'])} && runuser -u {shlex.quote(ctx['login'])} -- "
-        f"env -i HOME={shlex.quote(ctx['base'])} PATH=/usr/bin:/bin "
-        f"{shlex.quote(_HELPER_PYTHON)} -I -c {shlex.quote(_IMG_WORKER_SRC)}"
-    )
     client = _ssh_connect()
     try:
-        out, err, rc = _client_exec(client, cmd, timeout=_IMG_TIMEOUT, stdin_data=payload)
+        out, err, rc = _client_exec(client, _img_cmd(ctx), timeout=_IMG_TIMEOUT, stdin_data=payload)
     finally:
         client.close()
     for line in reversed(out.strip().splitlines()):
@@ -5947,6 +6114,86 @@ def _img_run(ctx: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
                 raise _UserError(f"Bildoptimierung abgebrochen: {res.get('error')}")
             return res
     raise SSHError(f"Bildoptimierung: keine Antwort vom Worker (Exit-Code {rc}): {(err.strip() or out.strip())[-300:]}")
+
+
+def _img_progress(job: dict[str, Any], p: Any) -> None:
+    """Fortschrittszeile des Workers übernehmen. Der Worker läuft als
+    Subscription-User, die Werte werden deshalb wie Fremddaten geprüft."""
+    if not isinstance(p, dict):
+        return
+    prog = job["fortschritt"]
+    for k in ("bearbeitet", "gesamt", "optimiert", "ersparnis_bytes", "uebersprungen", "fehler"):
+        v = p.get(k)
+        if isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 10 ** 12:
+            prog[k] = v
+    d = p.get("datei")
+    if isinstance(d, str):
+        prog["aktuelle_datei"] = d[:300]
+
+
+def _img_consume(job: dict[str, Any], lines: Any) -> dict[str, Any] | None:
+    """Liest die Ausgabe des Hintergrund-Workers zeilenweise: Fortschritt in
+    den Job, Rückgabe ist die Ergebniszeile (None, wenn keine kam)."""
+    res = None
+    for raw in lines:
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        if len(raw) > 4 * 1024 * 1024:
+            continue
+        line = raw.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if "fortschritt" in obj:
+            _img_progress(job, obj["fortschritt"])
+        elif "ok" in obj:
+            res = obj
+    return res
+
+
+def _img_run_bg(ctx: dict[str, Any], args: dict[str, Any], job: dict[str, Any]) -> dict[str, Any]:
+    """Wie _img_run, aber die SSH-Sitzung bleibt für die ganze Laufzeit offen:
+    stdin ist der Abbruchkanal ("cancel"), stdout liefert Fortschrittszeilen."""
+    payload = json.dumps({**args, "base": ctx["base"]}).encode("utf-8") + b"\n"
+    client = _ssh_connect()
+    try:
+        transport = client.get_transport()
+        if transport is not None:
+            transport.set_keepalive(30)
+        timeout = max(_IMG_TIMEOUT, _IMG_BG_TOOL_TIMEOUT + 60)
+        stdin, stdout, stderr = client.exec_command(_img_cmd(ctx), timeout=timeout)
+        stdin.write(payload)
+        stdin.flush()
+
+        def cancel() -> None:
+            try:
+                stdin.write(b"cancel\n")
+                stdin.flush()
+            except (OSError, EOFError):
+                pass
+
+        job["_cancel"] = cancel
+        if job["_cancel_requested"]:
+            cancel()
+        try:
+            res = _img_consume(job, stdout)
+        except socket.timeout:
+            raise SSHError(f"Bildoptimierung: keine Ausgabe vom Worker seit {timeout} s - Job abgebrochen.")
+        rc = stdout.channel.recv_exit_status()
+        err = stderr.read().decode("utf-8", "replace")
+    finally:
+        job["_cancel"] = None
+        client.close()
+    if res is None:
+        raise SSHError(f"Bildoptimierung: keine Antwort vom Worker (Exit-Code {rc}): {err.strip()[-300:]}")
+    if not res["ok"]:
+        raise _UserError(f"Bildoptimierung abgebrochen: {res.get('error')}")
+    return res
 
 
 def _img_ctx_and_parts(domain: str, path: str) -> tuple[dict[str, Any], list[str]]:
@@ -5968,6 +6215,144 @@ def _img_ctx_and_parts(domain: str, path: str) -> tuple[dict[str, Any], list[str
     return ctx, parts
 
 
+def _img_dateien_parts(ctx: dict[str, Any], dateien: Any) -> list[list[str]]:
+    """Parameter dateien: jede Angabe so streng wie path (relativ, kein "..",
+    keine Wildcards, in einem Docroot); ein ungültiger Eintrag lehnt den
+    ganzen Aufruf ab. Symlinks prüft der Worker pro Pfadteil."""
+    if not isinstance(dateien, list) or not all(isinstance(d, str) for d in dateien):
+        raise _UserError("dateien muss eine Liste relativer Pfade sein (z.B. [\"httpdocs/bild.jpg\"]).")
+    if not dateien:
+        raise _UserError("dateien ist leer.")
+    if len(dateien) > _IMG_MAX_DATEIEN:
+        raise _UserError(f"dateien: höchstens {_IMG_MAX_DATEIEN} Einträge pro Aufruf ({len(dateien)} angegeben).")
+    out: list[list[str]] = []
+    seen: set[str] = set()
+    for d in dateien:
+        try:
+            parts = _strict_parts(d)
+        except ValueError as e:
+            raise _UserError(f"dateien: {e}")
+        if _docroot_of(parts, ctx["docroots"]) is None:
+            raise _UserError(
+                f"dateien: '{d}' liegt in keinem Docroot der Subscription - nur Bilder in Webordnern werden "
+                f"optimiert. Gültige Docroots: {', '.join('/'.join(x) for x in ctx['docroots'])}.")
+        rel = "/".join(parts)
+        if rel not in seen:
+            seen.add(rel)
+            out.append(parts)
+    return out
+
+
+def _img_format(ctx: dict[str, Any], pfad: str, dry_run: bool, res: dict[str, Any], run_id: str,
+                hintergrund: bool) -> dict[str, Any]:
+    """Ergebnis des Workers in die Rückgabe von optimize_images bzw. image_job."""
+    saved = res["bytes_vorher"] - res["bytes_nachher"]
+    out: dict[str, Any] = {
+        "domain": ctx["domain"],
+        "pfad": pfad,
+        "modus": "Probelauf - nichts geändert" if dry_run else "ausgeführt",
+        "bilder_geprueft": res["geprueft"],
+        "bilder_optimiert": res["optimiert"],
+        "ersparnis_bytes": saved,
+        "ersparnis_mb": round(saved / 1048576, 2),
+        "ersparnis_prozent": round(100 * saved / res["bytes_vorher"], 1) if res["bytes_vorher"] else 0,
+        "groesste_ersparnisse": res["dateien"],
+        "uebersprungen": res["uebersprungen"],
+    }
+    if res["fehler"]:
+        out["fehler"] = res["fehler"]
+    if res.get("details"):
+        out["uebersprungen_details"] = res["details"]
+    if res.get("ohne_schreibrechte"):
+        out["ohne_schreibrechte"] = res["ohne_schreibrechte"]
+        out["schreibrechte_hinweis"] = (
+            "In diesen Ordnern darf der System-User der Subscription nicht schreiben - die Bilder werden "
+            + ("auch im echten Lauf übersprungen" if dry_run else "übersprungen")
+            + ". Besitzer bzw. Rechte des Ordners korrigieren und erneut aufrufen.")
+    if res.get("verwaiste_temp_dateien"):
+        out["verwaiste_temp_dateien"] = res["verwaiste_temp_dateien"]
+    if res.get("backup"):
+        out["backup_run_id"] = run_id
+        out["backup_hinweis"] = ("Originale unter " + res["backup"] + " - Speicher wird erst frei, wenn das "
+                                 "Backup mit image_backups(action=\"delete\") gelöscht ist.")
+    # Listen sind gekürzt? Immer die Gesamtzahl nennen (Vordergrund: 50 pro
+    # Liste; Hintergrund: image_job blättert mit liste/ab/limit).
+    anzahl = res.get("anzahl") or {}
+    gesamt = {"groesste_ersparnisse": anzahl.get("dateien", len(res["dateien"])),
+              "uebersprungen_details": anzahl.get("details", len(res.get("details") or [])),
+              "fehler": anzahl.get("fehler", len(res["fehler"]))}
+    for k in ("ohne_schreibrechte", "verwaiste_temp_dateien"):
+        if res.get(k):
+            gesamt[k] = anzahl.get(k, len(res[k]))
+    out["listen_gesamt"] = gesamt
+    out["gekuerzt"] = any(n > len(out.get(k) or []) for k, n in gesamt.items())
+    if out["gekuerzt"] and not hintergrund:
+        out["gekuerzt_hinweis"] = (f"Listen auf {_IMG_LIST_LIMIT} Einträge gekürzt (Gesamtzahl unter listen_gesamt) - "
+                                   "vollständige Listen liefert ein Lauf mit hintergrund=true über image_job.")
+    if hintergrund:
+        out["unvollstaendig"] = bool(res.get("abgebrochen"))
+        if res.get("abgebrochen"):
+            out["abgebrochen"] = res["abgebrochen"]
+            out["hinweis"] = ("Job abgebrochen (" + str(res["abgebrochen"]) + ") - bereits ersetzte Bilder bleiben "
+                              "optimiert, die laufende Datei wurde verworfen, "
+                              f"{res['uebersprungen'].get('abgebrochen_rest', 0)} Dateien nicht mehr bearbeitet.")
+        if res.get("prioritaet"):
+            out["prioritaet"] = res["prioritaet"]
+        if res.get("laufzeit_s") is not None:
+            out["laufzeit_s"] = res["laufzeit_s"]
+        return out
+    out["unvollstaendig"] = bool(res.get("fortsetzen_ab") or res["uebersprungen"].get("zeitbudget_rest")
+                                 or res["uebersprungen"].get("limit_max_files"))
+    if res.get("fortsetzen_ab"):
+        out["weiter_ab"] = res["fortsetzen_ab"]
+        grund = "Zeitbudget" if res["uebersprungen"].get("zeitbudget_rest") else "max_files"
+        out["hinweis"] = (f"{grund} erreicht - mit weiter_ab=\"{res['fortsetzen_ab']}\" und sonst gleichen "
+                          "Parametern erneut aufrufen.")
+    elif res["uebersprungen"].get("zeitbudget_rest"):
+        out["hinweis"] = ("Zeitbudget schon beim Einlesen aufgebraucht (sehr viele Dateien) - einen "
+                          "Unterordner angeben, z.B. einen Jahresordner unter wp-content/uploads.")
+    if res["uebersprungen"].get("timeout"):
+        timeouts = [d["datei"] for d in (res.get("details") or []) if d.get("grund") == "timeout"]
+        n = res["uebersprungen"]["timeout"]
+        out["timeout_hinweis"] = (
+            f"{n} Datei(en) im Timeout ({_IMG_TOOL_TIMEOUT} s pro Werkzeugaufruf) - erneut versuchen mit "
+            f"hintergrund=true und dateien={json.dumps(timeouts, ensure_ascii=False)}"
+            + (" (Liste gekürzt, weitere unter uebersprungen_details)" if len(timeouts) < n else "")
+            + f"; im Hintergrund gilt {_IMG_BG_TOOL_TIMEOUT} s pro Datei.")
+    return out
+
+
+def _img_jobs_gc(now: float) -> None:
+    for jid, job in list(_img_jobs.items()):
+        if job["ended"] is not None and now - job["ended"] > _IMG_JOB_KEEP:
+            del _img_jobs[jid]
+
+
+def _img_job_thread(job: dict[str, Any], ctx: dict[str, Any], args: dict[str, Any],
+                    lock: threading.Lock) -> None:
+    """Hintergrundjob: hält die Domain-Sperre bis zum Ende, Ergebnis bleibt
+    im Speicher (image_job)."""
+    try:
+        res = _img_run_bg(ctx, args, job)
+        out = _img_format(ctx, job["pfad"], job["dry_run"], res, job["job_id"], hintergrund=True)
+        job["result"] = out
+        job["status"] = "abgebrochen" if res.get("abgebrochen") else "fertig"
+        if not job["dry_run"]:
+            _audit("image_job_done", domain=ctx["domain"], path=job["pfad"], job_id=job["job_id"],
+                   status=job["status"], optimized=res["optimiert"], saved=out["ersparnis_bytes"],
+                   errors=len(res["fehler"]), aborted=res.get("abgebrochen"))
+    except Exception as e:  # noqa - Fehler gehören in den Jobstatus, nicht in den Thread
+        job["status"] = "fehler"
+        job["fehler_meldung"] = str(e)[:500] or type(e).__name__
+        _audit("image_job_failed", domain=ctx["domain"], path=job["pfad"], job_id=job["job_id"],
+               error=job["fehler_meldung"][:200])
+    finally:
+        job["ended"] = time.time()
+        job["_cancel"] = None
+        lock.release()
+        job["_done"].set()
+
+
 @mcp.tool()
 def optimize_images(
     domain: str,
@@ -5978,12 +6363,17 @@ def optimize_images(
     recursive: bool = True,
     keep_backup: bool = True,
     weiter_ab: str = "",
+    hintergrund: bool = False,
+    dateien: list[str] | None = None,
 ) -> str:
     """Optimiert JPG- und PNG-Bilder einer Domain verlustfrei (gleiche Pixel)
     für weniger Speicher und schnellere Seiten. domain: Hauptdomain der
     Subscription; path: Ordner oder Datei relativ zu /var/www/vhosts/<domain>/,
     muss in einem Docroot liegen (z.B. "httpdocs/wp-content/uploads"). Leer
     (Standard) = Docroot der Hauptdomain; die Rückgabe nennt ihn unter "pfad".
+    Alternativ dateien=[...]: Liste einzelner Bilder (relative Pfade wie path,
+    max. 200, path dann leer), z.B. die Timeout-Dateien eines früheren Laufs;
+    nicht gefundene oder nicht-Bild-Einträge stehen unter uebersprungen_details.
 
     Pro Bild: GPS-Daten, Kamera-/Objektiv-Seriennummern, Besitzername und
     Herstellerdaten (MakerNote) aus EXIF/XMP entfernen (Datenschutz);
@@ -6014,72 +6404,196 @@ def optimize_images(
     Kopien) und braucht deshalb ähnlich viel Zeit wie ein echter Lauf.
     Ein Aufruf dauert höchstens etwa 30 Sekunden Bearbeitung (Zeitbudget,
     IMAGE_OPT_TIME_BUDGET) plus die Datei, die gerade läuft (jpegoptim/optipng
-    je höchstens 15 s, sonst unter uebersprungen.timeout). Ist danach noch
-    nicht alles bearbeitet, enthält die Rückgabe "unvollstaendig": true und
+    je höchstens 15 s, sonst unter uebersprungen.timeout; "timeout_hinweis"
+    nennt die Dateien für einen erneuten Versuch im Hintergrund). Ist danach
+    noch nicht alles bearbeitet, enthält die Rückgabe "unvollstaendig": true und
     "weiter_ab" - mit weiter_ab=<dieser Wert> und sonst gleichen Parametern
     erneut aufrufen, bis "unvollstaendig": false. Bilder werden in fester,
     alphabetischer Pfad-Reihenfolge bearbeitet, jedes genau einmal; echte
-    Teilläufe bekommen je eine eigene backup_run_id.
+    Teilläufe bekommen je eine eigene backup_run_id. Die Listen
+    groesste_ersparnisse, uebersprungen_details und fehler zeigen höchstens
+    50 Einträge; "listen_gesamt" nennt die Gesamtzahl, "gekuerzt" ob gekürzt.
+
+    hintergrund=true (nur HTTP-Modus): kehrt sofort mit "job_id" zurück, der
+    ganze Pfad läuft als EIN Job ohne Zeitbudget, ohne max_files und
+    weiter_ab, mit EINEM Backup (backup_run_id = job_id) und 300 s pro
+    Werkzeugaufruf (IMAGE_OPT_BG_TOOL_TIMEOUT); jpegoptim/optipng laufen mit
+    nice/ionice. Fortschritt, Ergebnis (gleiches Format, Listen blätterbar)
+    und Abbruch über image_job(domain, action="status"|"cancel", job_id).
+    Solange der Job läuft, sind weitere Bildoptimierungen dieser Domain
+    gesperrt. Nach einem Neustart des MCP-Servers ist der Job unbekannt;
+    das Backup steht dann weiter unter image_backups(action="list").
     """
     if not dry_run and not confirm:
         raise _UserError("Zum Ausführen dry_run=false UND confirm=true setzen - ändert Dateien auf dem "
                          "Produktivserver.")
-    if not isinstance(max_files, int) or not 1 <= max_files <= _IMG_MAX_FILES:
+    if hintergrund and not _HTTP_MODE:
+        raise _UserError("hintergrund=true ist nur im HTTP-Modus (Docker) verfügbar - im stdio-Modus gibt es "
+                         "keinen langlebigen Serverprozess, der den Job weiterführt. Ohne hintergrund in "
+                         "Teilläufen arbeiten (weiter_ab).")
+    if hintergrund and (weiter_ab or "").strip():
+        raise _UserError("weiter_ab gilt nur im Vordergrund - ein Hintergrundjob bearbeitet den ganzen Pfad.")
+    if not hintergrund and (not isinstance(max_files, int) or not 1 <= max_files <= _IMG_MAX_FILES):
         raise _UserError(f"max_files muss zwischen 1 und {_IMG_MAX_FILES} liegen.")
-    ctx, parts = _img_ctx_and_parts(domain, path)
+    if dateien is not None:
+        if (path or "").strip():
+            raise _UserError("Entweder path oder dateien angeben, nicht beides.")
+        ctx = _vhost_ctx(domain)
+        parts_list = _img_dateien_parts(ctx, dateien)
+        parts: list[str] = []
+        pfad = f"dateien ({len(parts_list)} Einträge)"
+    else:
+        ctx, parts = _img_ctx_and_parts(domain, path)
+        parts_list = []
+        pfad = "/".join(parts)
     run_id = f"{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}-{os.urandom(4).hex()}"
+    args: dict[str, Any] = {"op": "optimize", "parts": parts, "dateien": parts_list, "dry_run": bool(dry_run),
+                            "recursive": bool(recursive), "keep_backup": bool(keep_backup),
+                            "max_bytes": _IMG_MAX_BYTES, "run_id": run_id,
+                            "jpegoptim": _IMG_JPEGOPTIM, "optipng": _IMG_OPTIPNG}
+    if hintergrund:
+        args.update({"background": True, "max_files": 0, "start_after": "", "time_budget": None,
+                     "tool_timeout": _IMG_BG_TOOL_TIMEOUT, "list_limit": 0})
+        with _img_jobs_lock:
+            _img_jobs_gc(time.time())
+            running = sum(1 for j in _img_jobs.values() if j["ended"] is None)
+            if running >= _IMG_MAX_JOBS:
+                raise _UserError(f"Es laufen bereits {running} Hintergrundjobs - bitte warten, bis einer fertig ist "
+                                 "(image_job).")
+            lock = _phps_lock(f"img:{ctx['domain']}", ctx["domain"], "eine Bildoptimierung")
+            job: dict[str, Any] = {
+                "job_id": run_id, "domain": ctx["domain"], "pfad": pfad, "dry_run": bool(dry_run),
+                "status": "laeuft", "started": time.time(), "ended": None,
+                "fortschritt": {"bearbeitet": 0, "gesamt": None, "aktuelle_datei": None, "optimiert": 0,
+                                "ersparnis_bytes": 0, "uebersprungen": 0, "fehler": 0},
+                "result": None, "fehler_meldung": None,
+                "_cancel": None, "_cancel_requested": False, "_done": threading.Event(),
+            }
+            _img_jobs[run_id] = job
+        _audit("image_job_start", domain=ctx["domain"], path=pfad, job_id=run_id, dry_run=bool(dry_run))
+        threading.Thread(target=_img_job_thread, args=(job, ctx, args, lock), daemon=True).start()
+        return _json({
+            "domain": ctx["domain"], "pfad": pfad, "job_id": run_id, "status": "laeuft",
+            "modus": "Hintergrund - Probelauf, nichts wird geändert" if dry_run else "Hintergrund - ausgeführt",
+            "hinweis": (f"Läuft im Hintergrund. Status: image_job(domain=\"{ctx['domain']}\", action=\"status\", "
+                        f"job_id=\"{run_id}\"); abbrechen: action=\"cancel\" mit confirm=true. "
+                        + ("Backup des ganzen Laufs unter backup_run_id = job_id. " if not dry_run and keep_backup else "")
+                        + "Bis zum Ende sind weitere Bildoptimierungen dieser Domain gesperrt."),
+        })
+    args.update({"max_files": max_files, "start_after": (weiter_ab or "").strip(),
+                 "time_budget": _IMG_TIME_BUDGET, "tool_timeout": _IMG_TOOL_TIMEOUT, "list_limit": _IMG_LIST_LIMIT})
     lock = _phps_lock(f"img:{ctx['domain']}", ctx["domain"], "eine Bildoptimierung")
     try:
-        res = _img_run(ctx, {"op": "optimize", "parts": parts, "dry_run": bool(dry_run),
-                             "recursive": bool(recursive), "keep_backup": bool(keep_backup),
-                             "max_files": max_files, "max_bytes": _IMG_MAX_BYTES, "run_id": run_id,
-                             "start_after": (weiter_ab or "").strip(), "time_budget": _IMG_TIME_BUDGET,
-                             "tool_timeout": _IMG_TOOL_TIMEOUT,
-                             "jpegoptim": _IMG_JPEGOPTIM, "optipng": _IMG_OPTIPNG})
+        res = _img_run(ctx, args)
     finally:
         lock.release()
-    saved = res["bytes_vorher"] - res["bytes_nachher"]
-    out: dict[str, Any] = {
-        "domain": ctx["domain"],
-        "pfad": "/".join(parts),
-        "modus": "Probelauf - nichts geändert" if dry_run else "ausgeführt",
-        "bilder_geprueft": res["geprueft"],
-        "bilder_optimiert": res["optimiert"],
-        "ersparnis_bytes": saved,
-        "ersparnis_mb": round(saved / 1048576, 2),
-        "ersparnis_prozent": round(100 * saved / res["bytes_vorher"], 1) if res["bytes_vorher"] else 0,
-        "groesste_ersparnisse": res["dateien"],
-        "uebersprungen": res["uebersprungen"],
-    }
-    if res["fehler"]:
-        out["fehler"] = res["fehler"]
-    if res.get("details"):
-        out["uebersprungen_details"] = res["details"]
-    if res.get("ohne_schreibrechte"):
-        out["ohne_schreibrechte"] = res["ohne_schreibrechte"]
-        out["schreibrechte_hinweis"] = (
-            "In diesen Ordnern darf der System-User der Subscription nicht schreiben - die Bilder werden "
-            + ("auch im echten Lauf übersprungen" if dry_run else "übersprungen")
-            + ". Besitzer bzw. Rechte des Ordners korrigieren und erneut aufrufen.")
-    if res.get("verwaiste_temp_dateien"):
-        out["verwaiste_temp_dateien"] = res["verwaiste_temp_dateien"]
-    if res.get("backup"):
-        out["backup_run_id"] = run_id
-        out["backup_hinweis"] = ("Originale unter " + res["backup"] + " - Speicher wird erst frei, wenn das "
-                                 "Backup mit image_backups(action=\"delete\") gelöscht ist.")
-    out["unvollstaendig"] = bool(res.get("fortsetzen_ab") or res["uebersprungen"].get("zeitbudget_rest")
-                                 or res["uebersprungen"].get("limit_max_files"))
-    if res.get("fortsetzen_ab"):
-        out["weiter_ab"] = res["fortsetzen_ab"]
-        grund = "Zeitbudget" if res["uebersprungen"].get("zeitbudget_rest") else "max_files"
-        out["hinweis"] = (f"{grund} erreicht - mit weiter_ab=\"{res['fortsetzen_ab']}\" und sonst gleichen "
-                          "Parametern erneut aufrufen.")
-    elif res["uebersprungen"].get("zeitbudget_rest"):
-        out["hinweis"] = ("Zeitbudget schon beim Einlesen aufgebraucht (sehr viele Dateien) - einen "
-                          "Unterordner angeben, z.B. einen Jahresordner unter wp-content/uploads.")
+    out = _img_format(ctx, pfad, dry_run, res, run_id, hintergrund=False)
     if not dry_run:
-        _audit("optimize_images", domain=ctx["domain"], path="/".join(parts), run_id=run_id,
-               optimized=res["optimiert"], saved=saved, errors=len(res["fehler"]))
+        _audit("optimize_images", domain=ctx["domain"], path=pfad, run_id=run_id,
+               optimized=res["optimiert"], saved=out["ersparnis_bytes"], errors=len(res["fehler"]))
+    return _json(out)
+
+
+def _img_job_view(job: dict[str, Any], liste: str, ab: int, limit: int) -> dict[str, Any]:
+    now = time.time()
+    out: dict[str, Any] = {
+        "job_id": job["job_id"], "domain": job["domain"], "pfad": job["pfad"], "status": job["status"],
+        "modus": "Probelauf - nichts geändert" if job["dry_run"] else "ausgeführt",
+        "gestartet": datetime.datetime.fromtimestamp(job["started"]).isoformat(timespec="seconds"),
+        "laufzeit_s": round((job["ended"] or now) - job["started"], 1),
+    }
+    if job["status"] == "laeuft":
+        out["fortschritt"] = dict(job["fortschritt"])
+        if job["_cancel_requested"]:
+            out["fortschritt"]["abbruch_angefordert"] = True
+        return out
+    if job["status"] == "fehler":
+        out["fehler_meldung"] = job["fehler_meldung"]
+        out["hinweis"] = ("Job mit Fehler beendet - bereits ersetzte Bilder bleiben optimiert; vorhandene Backups "
+                          "mit image_backups(action=\"list\") prüfen.")
+        return out
+    res = job["result"]
+    if liste:
+        items = res.get(liste) or []
+        page = items[ab:ab + limit]
+        out.update({"liste": liste, "ab": ab, "limit": limit, "gesamt": len(items), "eintraege": page,
+                    "weitere": ab + len(page) < len(items)})
+        if ab + len(page) < len(items):
+            out["hinweis"] = f"Weitere Einträge mit ab={ab + len(page)}."
+        return out
+    res = dict(res)
+    cut = {}
+    for k in _IMG_JOB_LISTS:
+        items = res.get(k)
+        if items and len(items) > _IMG_JOB_PAGE:
+            res[k] = items[:_IMG_JOB_PAGE]
+            cut[k] = len(items)
+    res["gekuerzt"] = bool(cut)
+    if cut:
+        res["gekuerzt_hinweis"] = (f"Listen auf {_IMG_JOB_PAGE} Einträge gekürzt ({', '.join(f'{k}: {v}' for k, v in cut.items())}) - "
+                                   f"blättern mit liste=\"<name>\", ab=<n>, limit=<1..{_IMG_JOB_PAGE_MAX}>.")
+    out.update(res)
+    return out
+
+
+@mcp.tool()
+def image_job(domain: str, action: str = "status", job_id: str = "", confirm: bool = False,
+              liste: str = "", ab: int = 0, limit: int = 200) -> str:
+    """Status und Abbruch eines Hintergrundjobs von optimize_images(hintergrund=true).
+    action="status": während des Laufs "fortschritt" (bearbeitet/gesamt,
+    aktuelle_datei, optimiert, ersparnis_bytes, uebersprungen, fehler) und
+    laufzeit_s; nach Abschluss ("fertig", "abgebrochen" oder "fehler") dasselbe
+    Ergebnis wie optimize_images. Die Listen groesste_ersparnisse,
+    uebersprungen_details und fehler zeigen die ersten 200 Einträge
+    ("gekuerzt": true, Gesamtzahl unter listen_gesamt); blättern mit
+    liste="<name>", ab=<Start>, limit=<1..500>.
+    action="cancel": ohne confirm=true nur Vorschau. Mit confirm=true wird der
+    Job sauber beendet: das laufende Werkzeug wird gestoppt, die Arbeitskopie
+    verworfen, bereits ersetzte Bilder bleiben optimiert (Backup unter
+    backup_run_id = job_id). Jobs bleiben 24 h abrufbar; nach einem Neustart
+    des MCP-Servers sind sie unbekannt - Backups dann über image_backups.
+    """
+    if action not in ("status", "cancel"):
+        raise _UserError("action muss 'status' oder 'cancel' sein.")
+    jid = (job_id or "").strip()
+    if not _IMG_RUN_ID_RE.match(jid):
+        raise _UserError(f"Ungültige job_id {job_id!r} (Format wie 20260101120000-1a2b3c4d).")
+    if liste and liste not in _IMG_JOB_LISTS:
+        raise _UserError(f"liste muss eine von {', '.join(_IMG_JOB_LISTS)} sein.")
+    if not isinstance(ab, int) or isinstance(ab, bool) or ab < 0:
+        raise _UserError("ab muss eine Zahl >= 0 sein.")
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= _IMG_JOB_PAGE_MAX:
+        raise _UserError(f"limit muss zwischen 1 und {_IMG_JOB_PAGE_MAX} liegen.")
+    ctx = _vhost_ctx(domain)
+    with _img_jobs_lock:
+        _img_jobs_gc(time.time())
+        job = _img_jobs.get(jid)
+    if job is None or job["domain"] != ctx["domain"]:
+        raise _UserError(f"Unbekannte job_id {jid!r} für {ctx['domain']} - älter als 24 Stunden oder der MCP-Server "
+                         "wurde neu gestartet (der Job ist dann beendet; bereits ersetzte Bilder bleiben optimiert). "
+                         "Vorhandene Backups: image_backups(action=\"list\").")
+    if action == "status":
+        return _json(_img_job_view(job, liste, ab, limit))
+    if job["status"] != "laeuft":
+        raise _UserError(f"Job {jid} läuft nicht mehr (Status: {job['status']}) - nichts abzubrechen.")
+    if not confirm:
+        out = _img_job_view(job, "", 0, limit)
+        out["modus"] = "Vorschau - Job läuft weiter"
+        out["hinweis"] = ("Mit confirm=true abbrechen: das laufende Werkzeug wird gestoppt und die Arbeitskopie "
+                          "verworfen; bereits ersetzte Bilder bleiben optimiert"
+                          + ("" if job["dry_run"] else " (Backup unter backup_run_id = job_id)") + ".")
+        return _json(out)
+    job["_cancel_requested"] = True
+    cancel = job["_cancel"]
+    if cancel is not None:
+        cancel()
+    _audit("image_job_cancel", domain=ctx["domain"], path=job["pfad"], job_id=jid)
+    job["_done"].wait(_IMG_CANCEL_WAIT)
+    out = _img_job_view(job, "", 0, limit)
+    out["modus"] = "Abbruch ausgeführt" if job["status"] != "laeuft" else "Abbruch angefordert"
+    if job["status"] == "laeuft":
+        out["hinweis"] = (f"Der Worker hat den Abbruch nach {_IMG_CANCEL_WAIT} s noch nicht bestätigt (die laufende "
+                          "Datei wird beendet) - Status erneut abfragen.")
     return _json(out)
 
 
