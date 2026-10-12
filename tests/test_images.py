@@ -199,11 +199,23 @@ def test_symlinks_hardlinks_and_paths(vhost, tmp_path):
             opt(path=p)
 
 
-def test_max_files_limit(vhost):
+def test_max_files_limit_and_continue(vhost):
     for i in range(3):
         make_jpeg(vhost / f"httpdocs/uploads/{i}.jpg")
-    res = opt(max_files=2)
-    assert res["bilder_geprueft"] == 2 and res["uebersprungen"]["limit_max_files"] == 1 and "hinweis" in res
+    res = opt(max_files=2, dry_run=False, confirm=True)
+    assert res["bilder_geprueft"] == 2 and res["uebersprungen"]["limit_max_files"] == 1
+    assert res["fortsetzen_ab"] == "httpdocs/uploads/1.jpg" and "start_after" in res["hinweis"]
+    res = opt(max_files=2, dry_run=False, confirm=True, start_after=res["fortsetzen_ab"])
+    assert res["bilder_geprueft"] == 1 and res["groesste_ersparnisse"][0]["datei"] == "httpdocs/uploads/2.jpg"
+    assert "fortsetzen_ab" not in res
+
+
+def test_time_budget(vhost, monkeypatch):
+    for i in range(3):
+        make_jpeg(vhost / f"httpdocs/uploads/{i}.jpg")
+    monkeypatch.setattr(server, "_IMG_TIME_BUDGET", -1)
+    res = opt()
+    assert res["bilder_geprueft"] == 0 and res["uebersprungen"]["zeitbudget_rest"] == 3 and "Unterordner" in res["hinweis"]
 
 
 def test_backups_list_restore_delete(vhost):

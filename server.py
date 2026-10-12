@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import base64
 import datetime
+import functools
 import hashlib
 import hmac
 import ipaddress
@@ -115,7 +116,7 @@ if _HTTP_MODE and not _MCP_API_KEY:
 # Dateien (server.py, Dockerfile, requirements.txt, Workflow) geaendert haben.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.16"
+_VERSION_BASE = "0.17"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -140,6 +141,39 @@ def _read_version() -> str:
 __version__ = _read_version()
 
 mcp = MCPServer("plesk-mcp", version=__version__)
+
+
+class _UserError(ToolError, ValueError):
+    """Ablehnung/Validierungsfehler mit Klartext-Meldung für den Client."""
+
+
+_mcp_tool = mcp.tool
+
+
+def _tool_with_messages(*args: Any, **kwargs: Any):
+    """Wie mcp.tool(), aber ValueError (Ablehnungen mit Begründung) wird als
+    ToolError gemeldet - sonst zeigt der Client nur "Error executing tool"
+    ohne die Begründung. Registriert wird der Wrapper, das Modul behält die
+    Originalfunktion (direkte Aufrufe, z.B. in Tests, bleiben unverändert)."""
+    register = _mcp_tool(*args, **kwargs)
+
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*a: Any, **kw: Any):
+            try:
+                return fn(*a, **kw)
+            except ToolError:
+                raise
+            except ValueError as e:
+                raise _UserError(str(e)) from e
+
+        register(wrapper)
+        return fn
+
+    return decorator
+
+
+mcp.tool = _tool_with_messages
 
 # ---------------------------------------------------------------------------
 # SSH-Verbindung zum Plesk-Server
@@ -5521,9 +5555,6 @@ def collect(start, rel, a, skipped):
         if st.st_size > a["max_bytes"]:
             skipped["zu_gross"] = skipped.get("zu_gross", 0) + 1
             continue
-        if len(files) >= a["max_files"]:
-            skipped["limit_max_files"] = skipped.get("limit_max_files", 0) + 1
-            continue
         files.append((full, parts, kind, st))
     return files
 
@@ -5538,11 +5569,25 @@ def optimize(a):
     start = lpath(base, a["parts"])
     skipped = {}
     files = collect(start, a["parts"], a, skipped)
+    files.sort(key=lambda f: "/".join(f[1]))
+    if a.get("start_after"):
+        files = [f for f in files if "/".join(f[1]) > a["start_after"]]
+    if len(files) > a["max_files"]:
+        skipped["limit_max_files"] = len(files) - a["max_files"]
+        files = files[:a["max_files"]]
     tools = {"jpeg": a["jpegoptim"], "png": a["optipng"]}
+    deadline = time.time() + a.get("time_budget", 40)
+    next_after = None
+    checked = 0
     done, errors = [], []
     total_before = total_after = 0
     backup_root = os.path.join(base, ".plesk-mcp", "image-backups", a["run_id"])
-    for full, parts, kind, st in files:
+    for idx, (full, parts, kind, st) in enumerate(files):
+        if time.time() > deadline:
+            next_after = "/".join(files[idx - 1][1]) if idx else None
+            skipped["zeitbudget_rest"] = len(files) - idx
+            break
+        checked += 1
         sys.stdout.write(".\n")
         sys.stdout.flush()
         rel = "/".join(parts)
@@ -5604,8 +5649,10 @@ def optimize(a):
                 os.unlink(tmp)
             except OSError:
                 pass
+    if next_after is None and skipped.get("limit_max_files") and checked:
+        next_after = "/".join(files[checked - 1][1])
     done.sort(key=lambda x: x["vorher"] - x["nachher"], reverse=True)
-    return {"geprueft": len(files), "optimiert": len(done), "bytes_vorher": total_before,
+    return {"geprueft": checked, "optimiert": len(done), "fortsetzen_ab": next_after, "bytes_vorher": total_before,
             "bytes_nachher": total_after, "dateien": done[:50], "fehler": errors[:50],
             "uebersprungen": skipped,
             "backup": (".plesk-mcp/image-backups/" + a["run_id"]) if done and a["keep_backup"]
@@ -5693,6 +5740,8 @@ _IMG_JPEGOPTIM = os.environ.get("IMAGE_JPEGOPTIM", "/usr/bin/jpegoptim").strip()
 _IMG_OPTIPNG = os.environ.get("IMAGE_OPTIPNG", "/usr/bin/optipng").strip()
 _IMG_TIMEOUT = int(os.environ.get("IMAGE_OPT_TIMEOUT", "300"))
 _IMG_MAX_FILES = 2000
+# Unter dem Tool-Timeout des MCP-Clients (typisch 60 s) bleiben.
+_IMG_TIME_BUDGET = int(os.environ.get("IMAGE_OPT_TIME_BUDGET", "40"))
 _IMG_MAX_BYTES = 50 * 1024 * 1024
 _IMG_RUN_ID_RE = re.compile(r"^\d{14}-[0-9a-f]{8}$")
 
@@ -5743,6 +5792,7 @@ def optimize_images(
     max_files: int = 500,
     recursive: bool = True,
     keep_backup: bool = True,
+    start_after: str = "",
 ) -> str:
     """Optimiert JPG- und PNG-Bilder einer Domain verlustfrei (gleiche Pixel)
     für weniger Speicher und schnellere Seiten. domain: Hauptdomain der
@@ -5764,6 +5814,11 @@ def optimize_images(
     .plesk-mcp/image-backups/<run_id>/ erhalten (ausserhalb des Webroots) -
     der Speicher wird erst frei, wenn das Backup mit image_backups gelöscht
     wird. Max. max_files Bilder pro Aufruf (Standard 500, höchstens 2000).
+
+    Ein Aufruf arbeitet höchstens ca. 40 Sekunden (Zeitbudget) und hört dann
+    sauber auf; die Rückgabe nennt in "fortsetzen_ab" den zuletzt bearbeiteten
+    Pfad - mit start_after=<dieser Wert> und sonst gleichen Parametern geht es
+    weiter (Bilder werden in alphabetischer Pfad-Reihenfolge bearbeitet).
     """
     if not dry_run and not confirm:
         raise ValueError("Zum Ausführen dry_run=false UND confirm=true setzen - ändert Dateien auf dem "
@@ -5777,6 +5832,7 @@ def optimize_images(
         res = _img_run(ctx, {"op": "optimize", "parts": parts, "dry_run": bool(dry_run),
                              "recursive": bool(recursive), "keep_backup": bool(keep_backup),
                              "max_files": max_files, "max_bytes": _IMG_MAX_BYTES, "run_id": run_id,
+                             "start_after": (start_after or "").strip(), "time_budget": _IMG_TIME_BUDGET,
                              "jpegoptim": _IMG_JPEGOPTIM, "optipng": _IMG_OPTIPNG})
     finally:
         lock.release()
@@ -5799,8 +5855,13 @@ def optimize_images(
         out["backup_run_id"] = run_id
         out["backup_hinweis"] = ("Originale unter " + res["backup"] + " - Speicher wird erst frei, wenn das "
                                  "Backup mit image_backups(action=\"delete\") gelöscht ist.")
-    if res["uebersprungen"].get("limit_max_files"):
-        out["hinweis"] = "max_files erreicht - weitere Bilder mit einem weiteren Aufruf optimieren."
+    if res.get("fortsetzen_ab"):
+        out["fortsetzen_ab"] = res["fortsetzen_ab"]
+        out["hinweis"] = ("Noch nicht alle Bilder bearbeitet (Zeitbudget oder max_files) - mit start_after=\""
+                          + res["fortsetzen_ab"] + "\" und sonst gleichen Parametern fortsetzen.")
+    elif res["uebersprungen"].get("zeitbudget_rest"):
+        out["hinweis"] = ("Zeitbudget schon beim Einlesen aufgebraucht (sehr viele Dateien) - einen "
+                          "Unterordner angeben, z.B. einen Jahresordner unter wp-content/uploads.")
     if not dry_run:
         _audit("optimize_images", domain=ctx["domain"], path="/".join(parts), run_id=run_id,
                optimized=res["optimiert"], saved=saved, errors=len(res["fehler"]))
