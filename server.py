@@ -5330,6 +5330,7 @@ SKIP_DIRS = (".mcp-trash", ".plesk-mcp")
 # ".<name>.mcp-<8 hex>.<ext>", optipng legt beim Abbruch zusätzlich "<...>.bak" an.
 OWN_TMP_RE = re.compile(r"^\..+\.mcp-[0-9a-f]{8}\.(?:png|jpe?g)(?:\.bak)?$", re.I)
 ORPHAN_MIN_AGE = 3600
+PNG_FAST_BYTES = 1024 * 1024
 
 
 class Bad(Exception):
@@ -5769,7 +5770,9 @@ def optimize(a):
             if kind == "jpeg":
                 rc, msg = run_tool([tools[kind], "-p", tmp], a.get("tool_timeout", 15))
             else:
-                rc, msg = run_tool([tools[kind], "-o2", "-preserve", tmp], a.get("tool_timeout", 15))
+                # grosse PNGs mit -o1 (ebenfalls verlustfrei, deutlich schneller), sonst Timeouts
+                level = "-o1" if st.st_size >= PNG_FAST_BYTES else "-o2"
+                rc, msg = run_tool([tools[kind], level, "-preserve", tmp], a.get("tool_timeout", 15))
             if rc != 0:
                 raise Rejected("werkzeug_abgelehnt", "%s Exit-Code %d: %s" % (
                     os.path.basename(tools[kind]), rc, msg or "keine Ausgabe"))
@@ -5999,7 +6002,7 @@ def optimize_images(
     Herstellerdaten (MakerNote) aus EXIF/XMP entfernen (Datenschutz);
     Farbprofil, Ausrichtung und übrige Metadaten bleiben. Danach jpegoptim
     (nur verlustfreie Huffman-Optimierung, keine Qualitätsstufe) bzw.
-    optipng -o2. Ersetzt wird nur, wenn die Datei kleiner wird oder
+    optipng -o2 (PNGs ab 1 MB: -o1, schneller). Ersetzt wird nur, wenn die Datei kleiner wird oder
     Datenschutzdaten entfernt wurden; Änderungsdatum und Rechte bleiben.
     Läuft als System-User der Subscription (nie root), folgt keinen
     Symlinks, überspringt Hardlinks, Dateien > 50 MB und den Papierkorb.
