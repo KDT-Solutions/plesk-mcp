@@ -116,7 +116,7 @@ if _HTTP_MODE and not _MCP_API_KEY:
 # Dateien (server.py, Dockerfile, requirements.txt, Workflow) geaendert haben.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.19"
+_VERSION_BASE = "0.20"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -5301,14 +5301,17 @@ def web_server_settings_rollback(domain: str, backup_id: str, confirm: bool = Fa
 _IMG_WORKER_SRC = r'''# plesk-mcp image worker - läuft per runuser als System-User der Subscription
 # (nie root) auf dem Plesk-Server (Python >= 3.6, nur Standardbibliothek).
 import errno
+import grp
 import json
 import os
+import pwd
 import re
 import shutil
 import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import zlib
 
@@ -5323,6 +5326,10 @@ XMP_EMPTY_RE = re.compile(r"<([\w.-]+:" + XMP_PRIVATE + r")\b[^>]*/>")
 XMP_ELEM_RE = re.compile(r"<([\w.-]+:" + XMP_PRIVATE + r")\b[^>]*>.*?</\1\s*>", re.S)
 XMP_ID = b"http://ns.adobe.com/xap/1.0/\x00"
 SKIP_DIRS = (".mcp-trash", ".plesk-mcp")
+# Arbeitskopien früherer Versionen (bis 0.18) lagen neben dem Original:
+# ".<name>.mcp-<8 hex>.<ext>", optipng legt beim Abbruch zusätzlich "<...>.bak" an.
+OWN_TMP_RE = re.compile(r"^\..+\.mcp-[0-9a-f]{8}\.(?:png|jpe?g)(?:\.bak)?$", re.I)
+ORPHAN_MIN_AGE = 3600
 
 
 class Bad(Exception):
@@ -5529,7 +5536,7 @@ def lpath(base, parts):
     return p
 
 
-def collect(start, rel, a, skipped):
+def collect(start, rel, a, skipped, orphans):
     files = []
     st = os.lstat(start)
     if stat.S_ISREG(st.st_mode):
@@ -5548,7 +5555,10 @@ def collect(start, rel, a, skipped):
         name = parts[-1]
         ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
         kind = "jpeg" if ext in ("jpg", "jpeg") else "png" if ext == "png" else None
-        if kind is None or ".mcp-" in name:
+        if ".mcp-" in name:
+            orphans.append((full, parts))
+            continue
+        if kind is None:
             continue
         st = os.lstat(full)
         if not stat.S_ISREG(st.st_mode):
@@ -5568,13 +5578,103 @@ class ToolTimeout(Exception):
     pass
 
 
+class Rejected(Exception):
+    """Datei wird bewusst nicht bearbeitet (kein Fehler unseres Codes)."""
+    def __init__(self, reason, msg):
+        Exception.__init__(self, msg)
+        self.reason = reason
+
+
 def run_tool(cmd, timeout):
+    """Ohne -q/-quiet: sonst schreiben jpegoptim und optipng bei abgelehnten
+    Dateien gar nichts und es bleibt nur der Exit-Code."""
     try:
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise ToolTimeout()
-    out = (p.stderr + p.stdout).decode("utf-8", "replace").strip()
-    return p.returncode, " ".join(out.split())[-300:]
+    lines = [" ".join(l.split()) for l in (p.stderr + p.stdout).decode("utf-8", "replace").splitlines()]
+    lines = [l for l in lines if l]
+    hits = [l for l in lines if re.search(r"error|warning|invalid|not a|unrecognized|corrupt|premature", l, re.I)
+            and not re.search(r"status report|have been processed|have been encountered", l, re.I)]
+    return p.returncode, " | ".join(hits or lines)[-300:]
+
+
+def sniff(head):
+    """Tatsächliches Format anhand der ersten Bytes."""
+    if head[:3] == b"\xff\xd8\xff":
+        return "jpeg"
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if head[:4] == b"GIF8":
+        return "gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "webp"
+    if head[:4] in (b"\x00\x00\x01\x00", b"\x00\x00\x02\x00"):
+        return "ico"
+    if head[:2] == b"BM":
+        return "bmp"
+    if head[4:8] == b"ftyp":
+        return "heif/avif"
+    if head.lstrip()[:5] in (b"<?xml", b"<svg "):
+        return "svg"
+    return None
+
+
+def exc_text(e):
+    """Fehlermeldung, die nie leer ist: eigene Fehler (Bad) mit Text, sonst Typ und Text."""
+    text = str(e).strip()
+    if isinstance(e, Bad):
+        return (text or "unbekannter Fehler")[:300]
+    return ("%s: %s" % (type(e).__name__, text or repr(e)))[:300]
+
+
+def owner_of(st):
+    try:
+        u = pwd.getpwuid(st.st_uid).pw_name
+    except KeyError:
+        u = str(st.st_uid)
+    try:
+        g = grp.getgrgid(st.st_gid).gr_name
+    except KeyError:
+        g = str(st.st_gid)
+    return "%s:%s" % (u, g)
+
+
+def handle_orphans(orphans, dry_run):
+    """Verwaiste Temp-Dateien (".mcp-" im Namen) im Zielpfad melden. Gelöscht
+    (nur im echten Lauf) wird eine Datei nur, wenn sie genau dem Namensschema
+    der Arbeitskopien dieses Workers entspricht, eine normale Datei des
+    Subscription-Users ohne weitere Hardlinks ist und älter als 1 Stunde.
+    Begründung: Die Sperre pro Domain verhindert parallele Läufe, ein Lauf
+    dauert höchstens wenige Minuten - eine ältere Datei gehört sicher zu
+    keinem laufenden Vorgang. Andere ".mcp-"-Dateien (z.B. von Dateitools)
+    werden nur gemeldet."""
+    out = []
+    now = time.time()
+    for full, parts in orphans:
+        rel = "/".join(parts)
+        try:
+            st = os.lstat(full)
+        except OSError:
+            continue
+        age = now - st.st_mtime
+        e = {"datei": rel, "bytes": st.st_size, "alter_min": int(age // 60)}
+        if not OWN_TMP_RE.match(parts[-1]):
+            e["aktion"] = "behalten: nicht das Namensschema der Bildoptimierung"
+        elif not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_uid != os.getuid():
+            e["aktion"] = "behalten: keine normale Datei des Subscription-Users"
+        elif age < ORPHAN_MIN_AGE:
+            e["aktion"] = "behalten: jünger als 1 Stunde"
+        elif dry_run:
+            e["aktion"] = "wird im echten Lauf gelöscht"
+        else:
+            try:
+                os.unlink(full)
+                e["aktion"] = "gelöscht"
+            except OSError as ex:
+                e["aktion"] = "behalten: " + exc_text(ex)
+        out.append(e)
+    return out
 
 
 def clean_tmp(root, keep):
@@ -5595,7 +5695,9 @@ def optimize(a):
     base = a["base"]
     start = lpath(base, a["parts"])
     skipped = {}
-    files = collect(start, a["parts"], a, skipped)
+    orphans = []
+    files = collect(start, a["parts"], a, skipped, orphans)
+    orphan_report = handle_orphans(orphans, a["dry_run"])
     files.sort(key=lambda f: "/".join(f[1]))
     if a.get("start_after"):
         files = [f for f in files if "/".join(f[1]) > a["start_after"]]
@@ -5606,15 +5708,21 @@ def optimize(a):
     deadline = t0 + a.get("time_budget", 30)
     next_after = None
     checked = 0
-    done, errors = [], []
+    done, errors, details = [], [], []
+    dir_ok = {}
+    no_write = {}
     total_before = total_after = 0
     backup_root = os.path.join(base, ".plesk-mcp", "image-backups", a["run_id"])
     # Arbeitskopien ausserhalb der Webordner (nicht per Web erreichbar, auch
     # in Ordnern ohne Schreibrecht möglich)
     tmp_root = os.path.join(base, ".plesk-mcp", "tmp")
     tmp_dir = os.path.join(tmp_root, a["run_id"])
-    os.makedirs(tmp_dir, 0o700, exist_ok=True)
-    clean_tmp(tmp_root, a["run_id"])
+    try:
+        os.makedirs(tmp_dir, 0o700, exist_ok=True)
+        clean_tmp(tmp_root, a["run_id"])
+    except OSError:
+        # .plesk-mcp nicht beschreibbar: privates Temp-Verzeichnis des Users
+        tmp_dir = tempfile.mkdtemp(prefix="plesk-mcp-img-")
     for idx, (full, parts, kind, st) in enumerate(files):
         if time.time() > deadline:
             next_after = "/".join(files[idx - 1][1]) if idx else None
@@ -5630,9 +5738,27 @@ def optimize(a):
         d, name = os.path.split(full)
         ext = name.rsplit(".", 1)[-1]
         tmp = os.path.join(tmp_dir, "%d.%s" % (idx, ext))
+        local = None
+        if d not in dir_ok:
+            dir_ok[d] = os.access(d, os.W_OK | os.X_OK)
+        if not dir_ok[d]:
+            # gleiche Prüfung im Probelauf, damit er das Ergebnis des echten Laufs vorhersagt
+            skipped["keine_schreibrechte"] = skipped.get("keine_schreibrechte", 0) + 1
+            if d not in no_write:
+                try:
+                    own = owner_of(os.lstat(d))
+                except OSError:
+                    own = "?"
+                no_write[d] = {"ordner": "/".join(parts[:-1]), "besitzer": own, "dateien": 0}
+            no_write[d]["dateien"] += 1
+            continue
         try:
             with open(full, "rb") as f:
                 data = f.read()
+            real = sniff(data[:16])
+            if real != kind:
+                raise Rejected("format_passt_nicht_zur_endung",
+                               "Inhalt ist %s, Endung .%s" % (real or "kein bekanntes Bildformat", ext))
             try:
                 clean, removed = (scrub_jpeg if kind == "jpeg" else scrub_png)(data)
             except Bad:
@@ -5641,14 +5767,15 @@ def optimize(a):
             with os.fdopen(fd, "wb") as f:
                 f.write(clean)
             if kind == "jpeg":
-                rc, msg = run_tool([tools[kind], "-q", "-p", tmp], a.get("tool_timeout", 15))
+                rc, msg = run_tool([tools[kind], "-p", tmp], a.get("tool_timeout", 15))
             else:
-                rc, msg = run_tool([tools[kind], "-quiet", "-o2", "-preserve", tmp], a.get("tool_timeout", 15))
+                rc, msg = run_tool([tools[kind], "-o2", "-preserve", tmp], a.get("tool_timeout", 15))
             if rc != 0:
-                raise Bad("%s Exit-Code %d: %s" % (os.path.basename(tools[kind]), rc, msg or "keine Ausgabe"))
+                raise Rejected("werkzeug_abgelehnt", "%s Exit-Code %d: %s" % (
+                    os.path.basename(tools[kind]), rc, msg or "keine Ausgabe"))
             new_size = os.path.getsize(tmp)
             if not valid(tmp, kind):
-                raise Bad("ergebnis_ungueltig")
+                raise Bad("ergebnis_ungueltig: %s lieferte keine gültige Datei" % os.path.basename(tools[kind]))
             privacy = [r for r in removed if r != "metadaten_nicht_lesbar"]
             if new_size >= st.st_size and not privacy:
                 os.unlink(tmp)
@@ -5666,7 +5793,8 @@ def optimize(a):
                     try:
                         os.link(full, bpath)
                     except OSError as e:
-                        if e.errno != errno.EXDEV:
+                        # EXDEV: anderes Dateisystem; EPERM/EACCES: fremde Datei (protected_hardlinks)
+                        if e.errno not in (errno.EXDEV, errno.EPERM, errno.EACCES):
                             raise
                         shutil.copy2(full, bpath)
                 try:
@@ -5674,11 +5802,13 @@ def optimize(a):
                 except OSError as e:
                     if e.errno != errno.EXDEV:
                         raise
-                    # anderes Dateisystem: erst in den Zielordner kopieren, dann atomar ersetzen
+                    # anderes Dateisystem: nur für den Moment des Ersetzens eine Kopie im
+                    # Zielordner (wird im finally entfernt, falls etwas schiefgeht)
                     local = os.path.join(d, ".%s.mcp-%s.%s" % (name[:150], os.urandom(4).hex(), ext))
                     shutil.copyfile(tmp, local)
                     os.chmod(local, stat.S_IMODE(st.st_mode))
                     os.replace(local, full)
+                    local = None
                     os.unlink(tmp)
                 os.utime(full, ns=(st.st_atime_ns, st.st_mtime_ns))
             else:
@@ -5688,23 +5818,28 @@ def optimize(a):
             done.append(entry)
         except ToolTimeout:
             skipped["timeout"] = skipped.get("timeout", 0) + 1
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            details.append({"datei": rel, "grund": "timeout", "meldung": "%s nach %d s abgebrochen" % (
+                os.path.basename(tools[kind]), a.get("tool_timeout", 15))})
+        except Rejected as e:
+            skipped[e.reason] = skipped.get(e.reason, 0) + 1
+            details.append({"datei": rel, "grund": e.reason, "meldung": str(e)[:300]})
         except Exception as e:  # noqa
-            errors.append({"datei": rel, "fehler": str(e)[:200]})
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+            errors.append({"datei": rel, "fehler": exc_text(e)})
+        finally:
+            for p in (tmp, local):
+                if p:
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
     shutil.rmtree(tmp_dir, ignore_errors=True)
     if next_after is None and skipped.get("limit_max_files") and checked:
         next_after = "/".join(files[checked - 1][1])
     done.sort(key=lambda x: x["vorher"] - x["nachher"], reverse=True)
     return {"geprueft": checked, "optimiert": len(done), "fortsetzen_ab": next_after, "bytes_vorher": total_before,
             "bytes_nachher": total_after, "dateien": done[:50], "fehler": errors[:50],
-            "uebersprungen": skipped,
+            "uebersprungen": skipped, "details": details[:50], "ohne_schreibrechte": list(no_write.values())[:50],
+            "verwaiste_temp_dateien": orphan_report[:50],
             "backup": (".plesk-mcp/image-backups/" + a["run_id"]) if done and a["keep_backup"]
             and not a["dry_run"] else None}
 
@@ -5868,8 +6003,17 @@ def optimize_images(
     Datenschutzdaten entfernt wurden; Änderungsdatum und Rechte bleiben.
     Läuft als System-User der Subscription (nie root), folgt keinen
     Symlinks, überspringt Hardlinks, Dateien > 50 MB und den Papierkorb.
+    Ebenfalls unter "uebersprungen" (nicht "fehler"), mit Datei und Meldung
+    unter "uebersprungen_details": format_passt_nicht_zur_endung (z.B. JPEG
+    mit Endung .png), werkzeug_abgelehnt (defekte/abgeschnittene Datei,
+    Meldung mit Werkzeug und Exit-Code), timeout, keine_schreibrechte (Ordner
+    und Besitzer unter "ohne_schreibrechte", auch im Probelauf).
+    Verwaiste Arbeitskopien früherer Läufe (".<name>.mcp-xxxxxxxx.<ext>[.bak]")
+    im Zielpfad stehen unter "verwaiste_temp_dateien"; der echte Lauf löscht
+    sie, wenn sie älter als 1 Stunde sind.
 
-    dry_run=true (Standard): rechnet die Ersparnis aus, ändert nichts.
+    dry_run=true (Standard): rechnet die Ersparnis aus, ändert nichts und
+    legt in den Webordnern nichts an (Arbeitskopien unter .plesk-mcp/tmp).
     Zum Ausführen dry_run=false UND confirm=true. Mit keep_backup=true
     (Standard) bleiben die Originale per Hardlink unter
     .plesk-mcp/image-backups/<run_id>/ erhalten (ausserhalb des Webroots) -
@@ -5919,6 +6063,16 @@ def optimize_images(
     }
     if res["fehler"]:
         out["fehler"] = res["fehler"]
+    if res.get("details"):
+        out["uebersprungen_details"] = res["details"]
+    if res.get("ohne_schreibrechte"):
+        out["ohne_schreibrechte"] = res["ohne_schreibrechte"]
+        out["schreibrechte_hinweis"] = (
+            "In diesen Ordnern darf der System-User der Subscription nicht schreiben - die Bilder werden "
+            + ("auch im echten Lauf übersprungen" if dry_run else "übersprungen")
+            + ". Besitzer bzw. Rechte des Ordners korrigieren und erneut aufrufen.")
+    if res.get("verwaiste_temp_dateien"):
+        out["verwaiste_temp_dateien"] = res["verwaiste_temp_dateien"]
     if res.get("backup"):
         out["backup_run_id"] = run_id
         out["backup_hinweis"] = ("Originale unter " + res["backup"] + " - Speicher wird erst frei, wenn das "
