@@ -31,8 +31,8 @@ Read-only MCP-Server für Diagnose auf einem Plesk-Server. Drei Datenquellen:
 Gedacht für Fehleranalyse bei Support-Anfragen (z.B. "Website nicht erreichbar").
 Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven
 Kommandos (Whitelist + Blacklist weiter unten). Ausnahme: write_vhost_file,
-replace_in_vhost_file, replace_in_vhost_files, set_php_handler, set_php_settings,
-delete_vhost_backup, delete_vhost_log, dns_add_record, dns_delete_record,
+replace_in_vhost_file, replace_in_vhost_files, set_php_handler, php_settings_update,
+php_settings_rollback, delete_vhost_backup, delete_vhost_log, dns_add_record, dns_delete_record,
 dns_update_record, imunify_ignore_add, imunify_ignore_remove, wp_option_update
 wp_option_rollback sowie die Datei-Tools upload_begin, fetch_to_vhost,
 move_vhost_file, delete_vhost_file, restore_vhost_trash und empty_vhost_trash
@@ -114,7 +114,7 @@ if _HTTP_MODE and not _MCP_API_KEY:
 # Dateien (server.py, Dockerfile, requirements.txt, Workflow) geaendert haben.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.13"
+_VERSION_BASE = "0.14"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -4418,304 +4418,579 @@ def set_php_handler(
     return _json(out_)
 
 
-# --- PHP-Einstellungen ändern -------------------------------------------------
+# --- PHP-Einstellungen (php_settings_show / _update / _rollback) --------------
 #
-# Plesk: `plesk bin site --update-php-settings <domain> -settings <datei>`
-# (Zeilen "parameter = wert") für die Werte, die Plesk unter "General",
-# "Performance" und "PHP-FPM" führt, `-additional-settings <datei>` für die
-# zusätzlichen Direktiven - Letzteres ersetzt bei jedem Aufruf alle bisherigen
-# zusätzlichen Direktiven, darum wird die bestehende Liste übernommen und nur
-# um die gewünschten Schlüssel ergänzt/geändert.
+# Stand lesen: wörtlich aus der Plesk-Datenbank (`plesk db`): eigene Werte der
+# Domain (PhpSettingsParameters über dom_param.phpSettingsId) und der Block
+# "Additional directives" (PhpSettingsCustom) inkl. Abschnittsüberschriften wie
+# [php-fpm-pool-settings] - `--show-php-settings` lässt diese weg und mischt
+# eigene mit geerbten Werten, taugt also nur zur Anzeige und Kontrolle.
+# Schreiben: `plesk bin site --update-php-settings <domain> -settings <datei>`
+# bzw. `-additional-settings <datei>`; die Datei liegt nur kurz in einem
+# root-only Verzeichnis (0600) und wird immer gelöscht. Danach Kontrolle
+# (Datenbank, Show-Ausgabe, PHP-FPM-Dienst, Startseite) und bei einem Fehler
+# automatisch zurück auf das vorher angelegte Backup.
 
-_PHP_SIZE = r"-1|\d{1,6}[KMGkmg]?"
-_PHP_INT = r"-?\d{1,9}"
-_PHP_BOOL = r"(?i:on|off|true|false|yes|no|1|0|)"
-_PHP_SETTING_RULES: dict[str, str] = {
-    # von Plesk verwaltet (General/Performance/PHP-FPM)
-    "memory_limit": _PHP_SIZE,
-    "max_execution_time": _PHP_INT,
-    "max_input_time": _PHP_INT,
-    "post_max_size": _PHP_SIZE,
-    "upload_max_filesize": _PHP_SIZE,
-    "opcache.enable": _PHP_BOOL,
-    "display_errors": _PHP_BOOL,
-    "log_errors": _PHP_BOOL,
-    "allow_url_fopen": _PHP_BOOL,
-    "file_uploads": _PHP_BOOL,
-    "short_open_tag": _PHP_BOOL,
-    "error_reporting": r"[A-Z_ &~|^()0-9-]{1,200}",
+_PHPS_SIZE = r"-1|\d{1,6}[KMGkmg]?"
+_PHPS_UINT = r"\d{1,9}"
+_PHPS_BOOL = r"(?i:on|off|true|false|1|0)"
+_PHPS_OPEN_BASEDIR_DEFAULT = "{WEBSPACEROOT}{/}{:}{TMP}{/}"
+_PHPS_RULES_DEFAULT: dict[str, str] = {
+    "open_basedir": "open_basedir",  # Sonderregel, siehe _phps_check_value
+    "memory_limit": _PHPS_SIZE,
+    "max_execution_time": _PHPS_UINT,
+    "max_input_time": r"-1|\d{1,9}",
+    "max_input_vars": _PHPS_UINT,
+    "post_max_size": _PHPS_SIZE,
+    "upload_max_filesize": _PHPS_SIZE,
+    "realpath_cache_size": _PHPS_SIZE,
+    "realpath_cache_ttl": _PHPS_UINT,
+    "opcache.memory_consumption": _PHPS_UINT,
+    "opcache.interned_strings_buffer": _PHPS_UINT,
+    "opcache.max_accelerated_files": _PHPS_UINT,
+    "opcache.revalidate_freq": _PHPS_UINT,
+    "opcache.validate_timestamps": _PHPS_BOOL,
+    "opcache.enable_file_override": _PHPS_BOOL,
     "pm": r"static|dynamic|ondemand",
-    "pm.max_children": _PHP_INT,
-    "pm.max_requests": _PHP_INT,
-    "pm.start_servers": _PHP_INT,
-    "pm.min_spare_servers": _PHP_INT,
-    "pm.max_spare_servers": _PHP_INT,
+    "pm.max_children": _PHPS_UINT,
+    "pm.max_requests": _PHPS_UINT,
+    "pm.start_servers": _PHPS_UINT,
+    "pm.min_spare_servers": _PHPS_UINT,
+    "pm.max_spare_servers": _PHPS_UINT,
 }
-_PHP_ADDITIONAL_RULES: dict[str, str] = {
-    # zusätzliche Direktiven (Performance-relevant)
-    "max_input_vars": _PHP_INT,
-    "max_file_uploads": _PHP_INT,
-    "default_socket_timeout": _PHP_INT,
-    "output_buffering": r"(?i:on|off)|\d{1,9}",
-    "zlib.output_compression": _PHP_BOOL,
-    "realpath_cache_size": _PHP_SIZE,
-    "realpath_cache_ttl": _PHP_INT,
-    "session.gc_maxlifetime": _PHP_INT,
-    "date.timezone": r"[A-Za-z][A-Za-z0-9_+/-]{0,63}",
-    "opcache.memory_consumption": _PHP_INT,
-    "opcache.interned_strings_buffer": _PHP_INT,
-    "opcache.max_accelerated_files": _PHP_INT,
-    "opcache.revalidate_freq": _PHP_INT,
-    "opcache.validate_timestamps": _PHP_BOOL,
-    "opcache.jit": r"(?i:off|on|disable|tracing|function)|\d{4}",
-    "opcache.jit_buffer_size": _PHP_SIZE,
-    "pm.process_idle_timeout": r"\d{1,6}[smhd]?",
+# Per ENV PHP_SETTINGS_ALLOWLIST ergänzte Direktiven: generische Wertprüfung.
+_PHPS_GENERIC_VALUE = r"[A-Za-z0-9_.,:/{}+~&|^() -]{0,200}"
+# Nie erlaubt - auch nicht per ENV.
+_PHPS_NEVER = {
+    "disable_functions", "auto_prepend_file", "auto_append_file", "allow_url_include",
+    "extension", "zend_extension", "sendmail_path", "enable_dl", "include_path", "doc_root",
+    "user_dir", "session.save_path", "error_log",
 }
-_PHP_ADDITIONAL_HEADER = "Additional directives"
-_PHP_TRUE = {"1", "on", "true", "yes"}
-_PHP_FALSE = {"", "0", "off", "false", "no"}
+_PHPS_KEY_RE = re.compile(r"^[a-z0-9_]+(?:\.[a-z0-9_]+)*$")
+_PHPS_BAD_CHARS = set("\n\r\0;[]\"'")
+_PHPS_BACKUP_DIR = os.environ.get("PHP_SETTINGS_BACKUP_DIR", "/root/.plesk-mcp/php-settings-backups").strip()
+_PHPS_TMP_DIR = "/root/.plesk-mcp/tmp"
+_PHPS_HTTP_TIMEOUT = int(os.environ.get("PHP_SETTINGS_HTTP_TIMEOUT", "20"))
+_PHPS_FPM_RETRY_DELAY = 3
+_PHPS_SECTIONS = ("General settings", "Performance settings", "PHP-FPM settings")
+_phps_locks: dict[str, threading.Lock] = {}
+_phps_locks_guard = threading.Lock()
 
 
-def _php_value_eq(key: str, a: str, b: str) -> bool:
-    """Vergleich wie Plesk ihn anzeigt (Booleans als "1"/"")."""
-    a, b = a.strip(), b.strip()
-    if _PHP_SETTING_RULES.get(key, _PHP_ADDITIONAL_RULES.get(key)) == _PHP_BOOL:
-        la, lb = a.lower(), b.lower()
-        if (la in _PHP_TRUE and lb in _PHP_TRUE) or (la in _PHP_FALSE and lb in _PHP_FALSE):
-            return True
-    return a == b
+def _phps_rules() -> dict[str, str]:
+    """Allowlist: Standardumfang plus PHP_SETTINGS_ALLOWLIST (kommagetrennt),
+    nie die Einträge aus _PHPS_NEVER."""
+    rules = dict(_PHPS_RULES_DEFAULT)
+    for n in os.environ.get("PHP_SETTINGS_ALLOWLIST", "").split(","):
+        n = n.strip().lower()
+        if n and _PHPS_KEY_RE.match(n) and n not in _PHPS_NEVER and n not in rules:
+            rules[n] = _PHPS_GENERIC_VALUE
+    return rules
 
 
-def _php_check_settings(settings: dict[str, Any]) -> dict[str, str]:
-    if not isinstance(settings, dict) or not settings:
-        raise ValueError("settings muss ein Objekt mit mindestens einem Wert sein, z.B. {\"memory_limit\": \"512M\"}.")
-    if len(settings) > 40:
-        raise ValueError("Maximal 40 Werte pro Aufruf.")
-    out: dict[str, str] = {}
-    for key, value in settings.items():
-        rule = _PHP_SETTING_RULES.get(key) or _PHP_ADDITIONAL_RULES.get(key)
-        if rule is None:
-            raise ValueError(
-                f"PHP-Wert {key!r} ist nicht freigegeben. Erlaubt: "
-                + ", ".join(sorted(_PHP_SETTING_RULES) + sorted(_PHP_ADDITIONAL_RULES))
-            )
-        if isinstance(value, bool):
-            value = "1" if value else "0"
-        v = str(value).strip()
-        if not re.fullmatch(rule, v):
-            raise ValueError(f"Ungültiger Wert {value!r} für {key}.")
-        out[key] = v
-    return out
+def _phps_check_value(key: Any, value: Any) -> tuple[str, str]:
+    """Prüft Schlüssel und Wert; Ablehnung immer mit Grund im Klartext."""
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError(f"Ungültiger Schlüssel {key!r}.")
+    k = key.strip()
+    if _PHPS_BAD_CHARS & set(k) or not _PHPS_KEY_RE.match(k):
+        raise ValueError(f"Schlüssel {key!r} abgelehnt: nur Kleinbuchstaben, Ziffern, '_' und '.' erlaubt "
+                         "(keine Zeilenumbrüche, ';', eckigen Klammern oder Anführungszeichen).")
+    if k in _PHPS_NEVER:
+        raise ValueError(f"'{k}' ist aus Sicherheitsgründen nie änderbar (auch nicht per ENV).")
+    rules = _phps_rules()
+    if k not in rules:
+        raise ValueError(f"'{k}' ist nicht freigegeben. Erlaubt: {', '.join(sorted(rules))} "
+                         "(erweiterbar per ENV PHP_SETTINGS_ALLOWLIST).")
+    if isinstance(value, bool):
+        value = "on" if value else "off"
+    if not isinstance(value, (str, int)) or isinstance(value, float):
+        raise ValueError(f"Wert für '{k}' muss ein String oder eine Zahl sein.")
+    v = str(value).strip()
+    if _PHPS_BAD_CHARS & set(v):
+        raise ValueError(f"Wert für '{k}' abgelehnt: keine Zeilenumbrüche, ';', eckigen Klammern "
+                         "oder Anführungszeichen erlaubt.")
+    if k == "open_basedir":
+        if v not in ("none", _PHPS_OPEN_BASEDIR_DEFAULT):
+            raise ValueError(f"open_basedir: nur 'none' oder der Plesk-Standard "
+                             f"'{_PHPS_OPEN_BASEDIR_DEFAULT}' erlaubt.")
+    elif not re.fullmatch(rules[k], v):
+        raise ValueError(f"Ungültiger Wert {value!r} für '{k}'.")
+    return k, v
 
 
-def _php_read(client: paramiko.SSHClient, domain: str) -> tuple[dict[str, str], list[str]]:
-    """Plesk-verwaltete Werte (flach) und Rohzeilen der zusätzlichen Direktiven."""
+def _phps_lock(domain: str) -> threading.Lock:
+    with _phps_locks_guard:
+        lock = _phps_locks.setdefault(domain, threading.Lock())
+    if not lock.acquire(blocking=False):
+        raise ValueError(f"Für '{domain}' läuft bereits eine Änderung der PHP-Einstellungen - "
+                         "bitte warten und erneut versuchen.")
+    return lock
+
+
+def _phps_db(client: paramiko.SSHClient, sql: str) -> list[list[str]]:
+    out, err, rc = _client_exec(client, f"plesk db -Ne {shlex.quote(sql)}")
+    if rc != 0:
+        raise SSHError(f"Plesk-Datenbank nicht lesbar: {(err.strip() or out.strip())[:300]}")
+    return [r.split("\t") for r in out.splitlines() if r.strip()]
+
+
+def _phps_unhex(h: str) -> str:
+    try:
+        return bytes.fromhex(h.strip()).decode("utf-8")
+    except ValueError:
+        raise SSHError("Unerwartete Antwort der Plesk-Datenbank.")
+
+
+def _phps_parse_show(text: str) -> dict[str, dict[str, str]]:
+    return _parse_php_settings(text)
+
+
+def _phps_state(client: paramiko.SSHClient, domain: str) -> dict[str, Any]:
+    """Aktueller Stand: System-User, eigene Werte und Additional-Block (wörtlich,
+    aus der DB) sowie die Show-Ausgabe (inkl. geerbter Werte)."""
+    q = _sql_quote(domain)
+    rows = _phps_db(client, (
+        "SELECT s.login, IFNULL(p.val, '') FROM domains d JOIN hosting h ON h.dom_id = d.id "
+        "JOIN sys_users s ON s.id = h.sys_user_id "
+        "LEFT JOIN dom_param p ON p.dom_id = d.id AND p.param = 'phpSettingsId' "
+        f"WHERE d.name = {q}"
+    ))
+    if len(rows) != 1 or len(rows[0]) != 2:
+        raise ValueError(f"Domain '{domain}' nicht mit Webhosting in Plesk gefunden.")
+    login, sid = (c.strip() for c in rows[0])
+    if not _WP_SYSUSER_RE.match(login):
+        raise ValueError(f"Unerwarteter System-User für '{domain}'.")
+    own: dict[str, str] = {}
+    additional = ""
+    if sid:
+        if not sid.isdigit():
+            raise SSHError("Unerwartete phpSettingsId in der Plesk-Datenbank.")
+        for r in _phps_db(client, f"SELECT HEX(name), HEX(value) FROM PhpSettingsParameters WHERE id = {int(sid)}"):
+            if len(r) == 2:
+                own[_phps_unhex(r[0])] = _phps_unhex(r[1])
+        rows = _phps_db(client, f"SELECT HEX(value) FROM PhpSettingsCustom WHERE id = {int(sid)}")
+        if rows and rows[0] and rows[0][0].strip():
+            additional = _phps_unhex(rows[0][0])
     out, err, rc = _client_exec(client, f"plesk bin site --show-php-settings {shlex.quote(domain)}",
                                 timeout=_HOSTING_TIMEOUT)
     if rc != 0:
         raise SSHError(f"PHP-Einstellungen von '{domain}' nicht lesbar: {(err.strip() or out.strip())[:300]}")
-    managed: dict[str, str] = {}
-    additional: list[str] = []
-    section = None
-    for line in out.splitlines():
-        if line.endswith(":") and " = " not in line and not line.startswith((" ", ";")):
-            section = line[:-1].strip()
-            continue
-        if section == _PHP_ADDITIONAL_HEADER:
-            if line.strip():
-                additional.append(line)
-            continue
-        m = _PHP_SETTING_LINE_RE.match(line)
-        if m and section is not None:
-            managed[m.group(1)] = m.group(2)
-    if not managed:
+    show = _phps_parse_show(out)
+    standard = {k: v for sec in _PHPS_SECTIONS for k, v in show.get(sec, {}).items()}
+    if not standard:
         raise SSHError(f"PHP-Einstellungen von '{domain}' nicht lesbar (leere Ausgabe).")
-    return managed, additional
+    return {"login": login, "settings_id": sid or None, "own": own, "additional": additional,
+            "show": show, "standard": standard}
 
 
-def _php_additional_key(line: str) -> str | None:
-    m = _PHP_SETTING_LINE_RE.match(line.strip())
-    return m.group(1) if m else None
+def _phps_norm_block(text: str) -> str:
+    lines = [l.rstrip() for l in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    while lines and not lines[-1]:
+        lines.pop()
+    while lines and not lines[0]:
+        lines.pop(0)
+    return "\n".join(lines)
 
 
-def _php_merge_additional(lines: list[str], changes: dict[str, str]) -> list[str]:
-    out = []
-    done = set()
-    for line in lines:
-        key = _php_additional_key(line)
-        if key in changes:
-            if key not in done:
-                out.append(f"{key} = {changes[key]}")
-                done.add(key)
-            continue
-        out.append(line)
-    out += [f"{k} = {v}" for k, v in changes.items() if k not in done]
+def _phps_block_key(line: str) -> str | None:
+    s = line.strip()
+    if not s or s.startswith((";", "#", "[")) or "=" not in s:
+        return None
+    return s.split("=", 1)[0].strip().lower()
+
+
+def _phps_block_values(text: str) -> dict[str, str]:
+    """Schlüssel/Werte im php.ini-Teil des Blocks (vor dem ersten Abschnitt)."""
+    out: dict[str, str] = {}
+    for line in _phps_norm_block(text).split("\n"):
+        if line.strip().startswith("["):
+            break
+        k = _phps_block_key(line)
+        if k:
+            out[k] = line.split("=", 1)[1].strip()
     return out
 
 
-def _php_apply(client: paramiko.SSHClient, domain: str, option: str, lines: list[str]) -> tuple[int, str]:
-    """Schreibt lines in eine Temp-Datei auf dem Server und ruft
-    `plesk bin site --update-php-settings <domain> <option> <datei>` auf."""
+def _phps_merge_additional(text: str, changes: dict[str, str]) -> str:
+    """Ändert/ergänzt Schlüssel nur im php.ini-Teil vor dem ersten Abschnitt;
+    Abschnitte (z.B. [php-fpm-pool-settings]) und alle anderen Zeilen bleiben
+    wörtlich erhalten."""
+    lines = _phps_norm_block(text).split("\n") if _phps_norm_block(text) else []
+    first_sec = next((i for i, l in enumerate(lines) if l.strip().startswith("[")), len(lines))
+    head, tail = lines[:first_sec], lines[first_sec:]
+    done: set[str] = set()
+    new_head = []
+    for line in head:
+        k = _phps_block_key(line)
+        if k in changes:
+            if k not in done:
+                new_head.append(f"{k} = {changes[k]}")
+                done.add(k)
+            continue
+        new_head.append(line)
+    while new_head and not new_head[-1].strip():
+        new_head.pop()
+    new_head += [f"{k} = {v}" for k, v in changes.items() if k not in done]
+    return "\n".join(new_head + tail)
+
+
+def _phps_write(client: paramiko.SSHClient, domain: str, option: str, content: str) -> tuple[int, str]:
+    """Übergabedatei als root (0600) in einem root-only Verzeichnis anlegen,
+    `plesk bin site --update-php-settings` aufrufen, Datei immer löschen."""
+    d = shlex.quote(_PHPS_TMP_DIR)
     script = (
-        'f=$(mktemp /tmp/.plesk-mcp-php.XXXXXXXX) || exit 97; trap \'rm -f "$f"\' EXIT; '
+        f"umask 077; mkdir -p {d} && chmod 700 {d} || exit 96; "
+        f"f=$(mktemp {d}/php.XXXXXXXX) || exit 97; trap 'rm -f \"$f\"' EXIT; "
         f'cat > "$f" && plesk bin site --update-php-settings {shlex.quote(domain)} {option} "$f"'
     )
-    data = ("\n".join(lines) + "\n").encode("utf-8")
-    out, err, rc = _client_exec(client, f"umask 077; {script}", timeout=_HOSTING_TIMEOUT, stdin_data=data)
+    data = (content + "\n").encode("utf-8") if content else b""
+    out, err, rc = _client_exec(client, script, timeout=_HOSTING_TIMEOUT, stdin_data=data)
     return rc, (err.strip() or out.strip())[-500:]
 
 
-def _php_update_domain(client: paramiko.SSHClient, domain: str, changes: dict[str, str],
-                       confirm: bool) -> dict[str, Any]:
-    managed, additional = _php_read(client, domain)
-    add_current = {k: _PHP_SETTING_LINE_RE.match(l.strip()).group(2)
-                   for l in additional if (k := _php_additional_key(l))}
-    main_changes = {k: v for k, v in changes.items() if k in _PHP_SETTING_RULES}
-    add_changes = {k: v for k, v in changes.items() if k in _PHP_ADDITIONAL_RULES}
-    missing = [k for k in main_changes if k not in managed]
-    if missing:
-        raise ValueError(
-            f"{', '.join(missing)} wird von Plesk für '{domain}' nicht geführt (z.B. pm.* nur bei "
-            "PHP-FPM-Handlern) - nichts geändert."
-        )
-    diff = []
-    for k, v in changes.items():
-        old = managed.get(k) if k in main_changes else add_current.get(k)
-        if old is None or not _php_value_eq(k, old, v):
-            diff.append({"wert": k, "alt": old, "neu": v})
-    result: dict[str, Any] = {"domain": domain, "aenderungen": diff}
-    if not diff:
-        result["ergebnis"] = "unverändert (Werte bereits gesetzt)"
-        return result
-    if not confirm:
-        result["ergebnis"] = "Vorschau - würde geändert"
-        return result
+def _phps_fpm(client: paramiko.SSHClient, domain: str) -> tuple[bool | None, str]:
+    """PHP-FPM-Dienst der Domain aktiv? None = kein FPM-Dienst (z.B. FastCGI)."""
+    out, _, _ = _client_exec(
+        client,
+        "systemctl list-units --type=service --all --no-legend --plain | "
+        f"grep -F -- {shlex.quote('_' + domain + '_')}",
+    )
+    units = [l.split()[0] for l in out.splitlines() if l.strip()]
+    if not units:
+        return None, "kein PHP-FPM-Dienst"
+    unit = units[0]
+    out, _, _ = _client_exec(client, f"systemctl is-active {shlex.quote(unit)}")
+    state = out.strip() or "unbekannt"
+    return state == "active", f"{unit}: {state}"
 
-    todo_main = {d["wert"]: d["neu"] for d in diff if d["wert"] in main_changes}
-    todo_add = {d["wert"]: d["neu"] for d in diff if d["wert"] in add_changes}
-    errors = []
-    if todo_main:
-        rc, msg = _php_apply(client, domain, "-settings", [f"{k} = {v}" for k, v in todo_main.items()])
+
+def _phps_http(domain: str) -> tuple[int | None, str]:
+    """HTTP-Status der Startseite (ohne Redirects zu folgen)."""
+    try:
+        with httpx.Client(timeout=_PHPS_HTTP_TIMEOUT, follow_redirects=False) as c:
+            r = c.get(f"https://{domain}/")
+        return r.status_code, f"https://{domain}/ -> {r.status_code}"
+    except Exception as e:  # noqa: BLE001 - nicht prüfbar, kein Fehler der Änderung
+        return None, f"https://{domain}/ nicht abrufbar ({type(e).__name__})"
+
+
+def _phps_new_backup_id(domain: str) -> str:
+    ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    return f"{ts}-{os.urandom(4).hex()}@{domain}"
+
+
+def _phps_write_backup(client: paramiko.SSHClient, domain: str, state: dict[str, Any],
+                       source: str) -> str:
+    """Kompletter Stand als JSON (Schema wie die wp-option-backups, aber root-only
+    unter PHP_SETTINGS_BACKUP_DIR: der Inhalt wird beim Rollback als root an
+    Plesk übergeben und darf deshalb nicht im Vhost des Kunden liegen)."""
+    backup_id = _phps_new_backup_id(domain)
+    record = {
+        "id": backup_id,
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "source": source,
+        "domain": domain,
+        "settings_id": state["settings_id"],
+        "own_settings": state["own"],
+        "additional_directives": state["additional"],
+        "show_settings": state["standard"],
+    }
+    data = json.dumps(record, ensure_ascii=False, indent=2).encode("utf-8")
+    bdir = shlex.quote(_PHPS_BACKUP_DIR)
+    path = shlex.quote(f"{_PHPS_BACKUP_DIR}/{backup_id}.json")
+    _, err, rc = _client_exec(
+        client, f"umask 077 && mkdir -p {bdir} && chmod 700 {bdir} && set -C && cat > {path}",
+        stdin_data=data,
+    )
+    if rc != 0:
+        raise SSHError(f"Backup konnte nicht angelegt werden - nichts geändert: {err.strip()}")
+    return backup_id
+
+
+def _phps_read_backup(client: paramiko.SSHClient, backup_id: str) -> dict[str, Any]:
+    m = _WP_BACKUP_ID_RE.match((backup_id or "").strip())
+    if not m:
+        raise ValueError(f"Ungültige backup_id: {backup_id!r}")
+    bid = m.group(0)
+    out, err, rc = _client_exec(client, f"cat -- {shlex.quote(f'{_PHPS_BACKUP_DIR}/{bid}.json')}")
+    if rc != 0:
+        raise ValueError(f"Backup '{bid}' nicht gefunden: {err.strip()}")
+    try:
+        rec = json.loads(out)
+        own, add = rec["own_settings"], rec["additional_directives"]
+        if (rec.get("domain") != m.group(3) or not isinstance(own, dict) or not isinstance(add, str)
+                or not isinstance(rec.get("show_settings"), dict)):
+            raise ValueError("Inhalt passt nicht zur backup_id")
+        for k, v in list(own.items()) + list(rec["show_settings"].items()):
+            if not isinstance(k, str) or not isinstance(v, str) or set("\n\r\0") & set(k + v):
+                raise ValueError(f"ungültiger Eintrag {k!r}")
+        if "\0" in add:
+            raise ValueError("ungültiger Additional-Block")
+    except (ValueError, KeyError, TypeError) as e:
+        raise ValueError(f"Backup '{bid}' ist ungültig: {e}")
+    return rec
+
+
+def _phps_apply(client: paramiko.SSHClient, domain: str, state: dict[str, Any],
+                target_own: dict[str, str], target_add: str) -> tuple[dict[str, Any], list[str]]:
+    """Bringt die Domain auf target_own/target_add. Zuerst nur die geänderten
+    Werte; fehlen danach andere eigene Werte (Plesk ersetzt statt
+    zusammenzuführen), wird der komplette Sollstand geschrieben."""
+    errors: list[str] = []
+    diff = {k: v for k, v in target_own.items() if state["own"].get(k) != v}
+    if diff:
+        rc, msg = _phps_write(client, domain, "-settings", "\n".join(f"{k} = {v}" for k, v in diff.items()))
         if rc != 0:
             errors.append(f"-settings: Exit-Code {rc}: {msg}")
-    if todo_add and not errors:
-        rc, msg = _php_apply(client, domain, "-additional-settings", _php_merge_additional(additional, todo_add))
+        else:
+            now = _phps_state(client, domain)
+            if any(now["own"].get(k) != v for k, v in target_own.items()):
+                rc, msg = _phps_write(client, domain, "-settings",
+                                      "\n".join(f"{k} = {v}" for k, v in target_own.items()))
+                if rc != 0:
+                    errors.append(f"-settings (vollständig): Exit-Code {rc}: {msg}")
+    if _phps_norm_block(state["additional"]) != _phps_norm_block(target_add):
+        rc, msg = _phps_write(client, domain, "-additional-settings", _phps_norm_block(target_add))
         if rc != 0:
             errors.append(f"-additional-settings: Exit-Code {rc}: {msg}")
+    return _phps_state(client, domain), errors
 
-    # Kontrolle: gewünschte Werte gesetzt, alle anderen unverändert
-    now, now_add = _php_read(client, domain)
-    now_add_map = {k: _PHP_SETTING_LINE_RE.match(l.strip()).group(2)
-                   for l in now_add if (k := _php_additional_key(l))}
-    not_set = [k for k, v in todo_main.items() if not _php_value_eq(k, now.get(k, ""), v)]
-    not_set += [k for k, v in todo_add.items() if k not in now_add_map or not _php_value_eq(k, now_add_map[k], v)]
-    side = {k: (managed[k], now.get(k)) for k in managed if k not in todo_main
-            and (k not in now or not _php_value_eq(k, managed[k], now[k]))}
-    restored: list[str] = []
-    if side:
-        # Plesk hat weitere Werte verändert: alte Werte wiederherstellen
-        rc, msg = _php_apply(client, domain, "-settings", [f"{k} = {old}" for k, (old, _) in side.items()])
-        again, _ = _php_read(client, domain)
-        restored = [k for k, (old, _) in side.items() if _php_value_eq(k, old, again.get(k, ""))]
-        lost = [k for k in side if k not in restored]
-        if lost:
-            errors.append("Weitere Werte wurden von Plesk verändert und konnten nicht wiederhergestellt werden: "
-                          + ", ".join(f"{k} (vorher {side[k][0]!r})" for k in lost))
-    if set(add_current) - set(now_add_map) - set(todo_add):
-        errors.append("Zusätzliche Direktiven fehlen nach der Änderung: "
-                      + ", ".join(sorted(set(add_current) - set(now_add_map))))
-    if not_set:
-        errors.append("Nicht übernommen: " + ", ".join(not_set))
-    _audit("php_settings", domain=domain, changes={d["wert"]: d["neu"] for d in diff},
-           old={d["wert"]: d["alt"] for d in diff}, restored=restored,
-           result="failed" if errors else "ok")
-    if restored:
-        result["wiederhergestellt"] = restored
-    if errors:
-        result["ergebnis"] = "FEHLER"
-        result["fehler"] = errors
-    else:
-        result["ergebnis"] = "geändert"
-    result["ruecksetzen"] = {d["wert"]: d["alt"] for d in diff if d["alt"] is not None}
-    return result
+
+def _phps_verify(client: paramiko.SSHClient, domain: str, now: dict[str, Any],
+                 target_own: dict[str, str], target_add: str, show_expect: dict[str, str],
+                 baseline: dict[str, Any]) -> list[str]:
+    """Prüfungen nach einer Änderung; Rückgabe: fehlgeschlagene Prüfungen."""
+    failed = []
+    bad = [k for k, v in target_own.items() if now["own"].get(k) != v]
+    if bad:
+        failed.append("Plesk-Datenbank: abweichend " + ", ".join(
+            f"{k} (soll {target_own[k]!r}, ist {now['own'].get(k)!r})" for k in bad))
+    if _phps_norm_block(now["additional"]) != _phps_norm_block(target_add):
+        failed.append("Plesk-Datenbank: Block 'Additional directives' weicht vom Soll ab")
+    add_now = _phps_block_values(now["additional"])
+    show_add = now["show"].get("Additional directives", {})
+    for k, v in show_expect.items():
+        is_now = now["standard"].get(k, show_add.get(k, add_now.get(k)))
+        if is_now != v:
+            failed.append(f"Show-Ausgabe: {k} = {is_now!r} statt {v!r}")
+    if baseline["fpm"] is True:
+        ok, detail = _phps_fpm(client, domain)
+        if ok is not True:
+            time.sleep(_PHPS_FPM_RETRY_DELAY)
+            ok, detail = _phps_fpm(client, domain)
+        if ok is not True:
+            failed.append(f"PHP-FPM-Dienst nicht aktiv ({detail})")
+    if baseline["http"] is not None and baseline["http"] < 500:
+        status, detail = _phps_http(domain)
+        if status is not None and status >= 500:
+            failed.append(f"Startseite liefert {status} ({detail})")
+    return failed
+
+
+def _phps_change(domain: str, target_fn, confirm: bool, source: str) -> str:
+    """Gemeinsamer Ablauf für Update und Rollback: Stand lesen, Soll berechnen,
+    Vorschau bzw. Backup + Schreiben + Prüfungen + automatisches Zurückstellen."""
+    d = _hosting_domain(domain)
+    lock = _phps_lock(d)
+    try:
+        client = _ssh_connect()
+        try:
+            state = _phps_state(client, d)
+            target_own, target_add, changes, show_expect, notes = target_fn(client, state)
+            result: dict[str, Any] = {"domain": d, "aenderungen": changes}
+            if notes:
+                result["hinweise"] = notes
+            if (all(state["own"].get(k) == v for k, v in target_own.items())
+                    and _phps_norm_block(state["additional"]) == _phps_norm_block(target_add)):
+                result["ergebnis"] = "Keine Änderung nötig - alle Werte sind bereits gesetzt."
+                return _json(result)
+            if not confirm:
+                result["ergebnis"] = "Vorschau - nichts geschrieben. Mit confirm=true ausführen."
+                return _json(result)
+
+            baseline = {"fpm": _phps_fpm(client, d)[0], "http": _phps_http(d)[0]}
+            backup_id = _phps_write_backup(client, d, state, source)
+            result["backup_id"] = backup_id
+            now, errors = _phps_apply(client, d, state, target_own, target_add)
+            failed = errors + _phps_verify(client, d, now, target_own, target_add, show_expect, baseline)
+            if not failed:
+                result["ergebnis"] = "Geschrieben und kontrolliert."
+                result["pruefungen"] = {"datenbank": "ok", "show_ausgabe": "ok",
+                                        "php_fpm": "ok" if baseline["fpm"] else "nicht anwendbar",
+                                        "startseite": "ok" if baseline["http"] is not None and baseline["http"] < 500
+                                        else "vorher schon nicht prüfbar/5xx - übersprungen"}
+                _audit("php_settings", domain=d, source=source, changes=changes, backup_id=backup_id,
+                       result="ok")
+                return _json(result)
+
+            # Automatisch auf das Backup zurückstellen
+            # Vorher geerbte Werte, die jetzt eigene sind, auf den damaligen Wert
+            back_own = {k: state["standard"].get(k, v) for k, v in target_own.items()}
+            back_own.update(state["own"])
+            after, rerrors = _phps_apply(client, d, now, back_own, state["additional"])
+            rfailed = rerrors + _phps_verify(client, d, after, back_own, state["additional"], {}, baseline)
+            result["ergebnis"] = ("FEHLER - automatisch auf das Backup zurückgestellt." if not rfailed
+                                  else "FEHLER - Zurückstellen ebenfalls fehlgeschlagen, bitte sofort prüfen!")
+            result["fehlgeschlagene_pruefungen"] = failed
+            if rfailed:
+                result["fehler_beim_zurueckstellen"] = rfailed
+            _audit("php_settings", domain=d, source=source, changes=changes, backup_id=backup_id,
+                   result="rolled_back" if not rfailed else "rollback_failed", failed=failed)
+            return _json(result)
+        finally:
+            client.close()
+    finally:
+        lock.release()
 
 
 @mcp.tool()
-def set_php_settings(
-    settings: dict[str, Any],
-    domain: str = "",
-    domains: list[str] | None = None,
-    confirm: bool = False,
-) -> str:
-    """Ändert PHP-Einstellungen einer oder mehrerer Domains (wie in Plesk
-    unter "PHP-Einstellungen"), z.B. settings={"memory_limit": "512M",
-    "max_execution_time": "120", "pm.max_children": "20",
-    "max_input_vars": "5000"}. Entweder domain oder domains (max. 50, IDN
-    als Punycode oder Unicode).
-
-    Freigegebene Werte:
-    - von Plesk verwaltet: memory_limit, max_execution_time, max_input_time,
-      post_max_size, upload_max_filesize, opcache.enable, display_errors,
-      log_errors, allow_url_fopen, file_uploads, short_open_tag,
-      error_reporting, pm, pm.max_children, pm.max_requests,
-      pm.start_servers, pm.min_spare_servers, pm.max_spare_servers (pm.* nur
-      bei PHP-FPM-Handlern)
-    - als zusätzliche Direktive: max_input_vars, max_file_uploads,
-      default_socket_timeout, output_buffering, zlib.output_compression,
-      realpath_cache_size, realpath_cache_ttl, session.gc_maxlifetime,
-      date.timezone, opcache.memory_consumption,
-      opcache.interned_strings_buffer, opcache.max_accelerated_files,
-      opcache.revalidate_freq, opcache.validate_timestamps, opcache.jit,
-      opcache.jit_buffer_size, pm.process_idle_timeout
-    Sicherheitsrelevante Werte (open_basedir, disable_functions,
-    include_path, session.save_path, mail.*) sind bewusst nicht änderbar.
-    Grössen wie "256M", Booleans als on/off/1/0.
-
-    Ohne confirm=true nur Vorschau (alt -> neu je Domain) - nichts wird
-    geändert. Mit confirm=true per `plesk bin site --update-php-settings`;
-    bestehende zusätzliche Direktiven bleiben erhalten. Danach werden alle
-    Werte erneut gelesen: gewünschte Werte müssen gesetzt, alle anderen
-    unverändert sein - hat Plesk weitere Werte verändert, werden diese
-    automatisch auf den alten Stand zurückgesetzt und gemeldet. Die Rückgabe
-    enthält je Domain die alten Werte (ruecksetzen) für einen Rückbau mit
-    demselben Tool.
+def php_settings_show(domain: str) -> str:
+    """Zeigt die PHP-Einstellungen einer Domain (Plesk "PHP-Einstellungen"):
+    die Abschnitte von `plesk bin site --show-php-settings` ("General
+    settings", "Performance settings", "PHP-FPM settings", "Additional
+    directives") sowie zusätzlich aus der Plesk-Datenbank die eigenen Werte
+    der Domain (alles andere ist vom Service-Plan/Server geerbt) und den
+    Block "Additional directives" wörtlich - inkl. Abschnittsüberschriften wie
+    [php-fpm-pool-settings], die die Show-Ausgabe nicht anzeigt.
+    Rein lesend - kein confirm nötig.
     """
-    changes = _php_check_settings(settings)
-    raw = ([domain] if (domain or "").strip() else []) + list(domains or [])
-    if not raw:
-        raise ValueError("domain oder domains angeben.")
-    if len(raw) > _PHP_HANDLER_MAX_DOMAINS:
-        raise ValueError(f"Maximal {_PHP_HANDLER_MAX_DOMAINS} Domains pro Aufruf.")
-    names = []
-    for r in raw:
-        d = _hosting_domain(r)
-        if d not in names:
-            names.append(d)
-
+    d = _hosting_domain(domain)
     client = _ssh_connect()
     try:
-        # Zuerst alle Domains prüfen (bekannt, Werte von Plesk geführt) -
-        # bei einem Fehler wird nichts geändert.
-        for d in names:
-            _hosting_handler_id(client, d)
-        results = [_php_update_domain(client, d, changes, False) for d in names]
-        if confirm:
-            applied = []
-            for d in names:
-                try:
-                    applied.append(_php_update_domain(client, d, changes, True))
-                except (ValueError, SSHError) as e:
-                    applied.append({"domain": d, "ergebnis": "FEHLER", "fehler": [str(e)]})
-            results = applied
+        state = _phps_state(client, d)
     finally:
         client.close()
-    out: dict[str, Any] = {"domains": results}
-    if not confirm and any(r["ergebnis"].startswith("Vorschau") for r in results):
-        out["hinweis"] = "Vorschau - nichts geändert. Zum Übernehmen confirm=true setzen."
-    failed = [r["domain"] for r in results if r["ergebnis"] == "FEHLER"]
-    if failed:
-        out["fehlgeschlagen"] = failed
-    return _json(out)
+    return _json({
+        "domain": d,
+        "abschnitte": state["show"],
+        "eigene_werte": state["own"],
+        "additional_directives_roh": state["additional"],
+        "aenderbar": sorted(_phps_rules()),
+    })
+
+
+@mcp.tool()
+def php_settings_update(
+    domain: str,
+    settings: dict[str, Any] | None = None,
+    additional_directives: dict[str, Any] | None = None,
+    confirm: bool = False,
+) -> str:
+    """Ändert PHP-Einstellungen einer Domain (wie Plesk "PHP-Einstellungen").
+    settings: Plesk-Standardfelder, z.B. {"memory_limit": "512M",
+    "max_execution_time": "120", "pm.max_children": "20"}.
+    additional_directives: Zeilen im Block "Additional directives", z.B.
+    {"max_input_vars": "5000", "opcache.revalidate_freq": "60"}.
+
+    Freigegeben (Allowlist mit Wertprüfung, erweiterbar per ENV
+    PHP_SETTINGS_ALLOWLIST): open_basedir, memory_limit, max_execution_time,
+    max_input_time, max_input_vars, post_max_size, upload_max_filesize,
+    realpath_cache_size, realpath_cache_ttl, opcache.memory_consumption,
+    opcache.interned_strings_buffer, opcache.max_accelerated_files,
+    opcache.revalidate_freq, opcache.validate_timestamps,
+    opcache.enable_file_override, pm, pm.max_children, pm.max_requests,
+    pm.start_servers, pm.min_spare_servers, pm.max_spare_servers. Nie
+    änderbar: disable_functions, auto_prepend_file, auto_append_file,
+    allow_url_include, extension, zend_extension, sendmail_path, enable_dl,
+    include_path, doc_root, user_dir, session.save_path, error_log.
+    open_basedir nur "none" (nur wenn der System-User in CageFS läuft) oder
+    der Plesk-Standard "{WEBSPACEROOT}{/}{:}{TMP}{/}". Keine Zeilenumbrüche,
+    ';', eckigen Klammern oder Anführungszeichen. Plesk-Standardfelder (inkl.
+    pm.*) nur über settings, alles andere nur über additional_directives.
+    Bestehende Zeilen und Abschnitte im Additional-Block bleiben erhalten.
+
+    Ohne confirm=true nur Vorschau (alt/neu je Schlüssel, ob der alte Wert
+    eigen oder geerbt ist) - nichts wird geschrieben. Mit confirm=true:
+    Backup des kompletten Stands (backup_id für php_settings_rollback), dann
+    `plesk bin site --update-php-settings`. Danach Prüfungen: Plesk-DB und
+    Show-Ausgabe entsprechen dem Soll, PHP-FPM-Dienst aktiv, Startseite ohne
+    5xx. Schlägt eine Prüfung fehl, wird automatisch auf das Backup
+    zurückgestellt und das deutlich gemeldet. Pro Domain nur eine Änderung
+    gleichzeitig.
+    """
+    s_in = settings or {}
+    a_in = additional_directives or {}
+    if not isinstance(s_in, dict) or not isinstance(a_in, dict) or not (s_in or a_in):
+        raise ValueError("settings und/oder additional_directives als Objekt angeben, "
+                         "z.B. settings={\"memory_limit\": \"512M\"}.")
+    if len(s_in) + len(a_in) > 40:
+        raise ValueError("Maximal 40 Werte pro Aufruf.")
+    s_chk = dict(_phps_check_value(k, v) for k, v in s_in.items())
+    a_chk = dict(_phps_check_value(k, v) for k, v in a_in.items())
+    both = set(s_chk) & set(a_chk)
+    if both:
+        raise ValueError(f"{', '.join(sorted(both))} sowohl in settings als auch in additional_directives.")
+
+    def target(client: paramiko.SSHClient, state: dict[str, Any]):
+        for k in s_chk:
+            if k not in state["standard"]:
+                raise ValueError(
+                    f"'{k}' ist für diese Domain kein Plesk-Standardfeld"
+                    + (" (pm.* gibt es nur bei PHP-FPM-Handlern)" if k.startswith("pm") else
+                       " - über additional_directives setzen") + ".")
+        for k in a_chk:
+            if k in state["standard"] or k.startswith("pm"):
+                raise ValueError(f"'{k}' ist ein Plesk-Standardfeld - über settings setzen, "
+                                 "nicht über additional_directives.")
+        if s_chk.get("open_basedir") == "none" and state["own"].get("open_basedir",
+                                                                    state["standard"].get("open_basedir")) != "none":
+            out, _, rc = _client_exec(client, f"/usr/sbin/cagefsctl --user-status {shlex.quote(state['login'])}")
+            if rc != 0 or out.strip().lower() != "enabled":
+                raise ValueError(f"open_basedir = none abgelehnt: System-User '{state['login']}' läuft nicht "
+                                 f"in CageFS (cagefsctl: {out.strip() or 'keine Antwort'}).")
+        changes = []
+        for k, v in s_chk.items():
+            old = state["own"].get(k)
+            if old != v:
+                changes.append({"bereich": "settings", "wert": k,
+                                "alt": old if old is not None else state["standard"].get(k), "neu": v,
+                                "alt_war": "eigen" if old is not None else "geerbt"})
+        add_old = _phps_block_values(state["additional"])
+        for k, v in a_chk.items():
+            if add_old.get(k) != v:
+                changes.append({"bereich": "additional_directives", "wert": k, "alt": add_old.get(k), "neu": v})
+        target_own = dict(state["own"])
+        target_own.update(s_chk)
+        target_add = _phps_merge_additional(state["additional"], a_chk) if a_chk else state["additional"]
+        return target_own, target_add, changes, {**s_chk, **a_chk}, []
+
+    return _phps_change(domain, target, confirm, "php_settings_update")
+
+
+@mcp.tool()
+def php_settings_rollback(domain: str, backup_id: str, confirm: bool = False) -> str:
+    """Stellt die PHP-Einstellungen einer Domain auf den Stand eines Backups
+    von php_settings_update zurück (eigene Werte und Block "Additional
+    directives" wörtlich). Werte, die vorher geerbt waren und inzwischen
+    eigene Werte sind, werden auf den damaligen Wert gesetzt (Plesk kann sie
+    per CLI nicht wieder auf "geerbt" stellen - wird gemeldet).
+    Ohne confirm=true nur Vorschau. Mit confirm=true wird vorher der
+    aktuelle Stand selbst als Backup abgelegt (neue backup_id), danach
+    dieselben Prüfungen wie beim Update inkl. automatischem Zurückstellen.
+    """
+    d = _hosting_domain(domain)
+    m = _WP_BACKUP_ID_RE.match((backup_id or "").strip())
+    if not m or m.group(3) != d:
+        raise ValueError(f"backup_id {backup_id!r} gehört nicht zur Domain '{d}'.")
+
+    def target(client: paramiko.SSHClient, state: dict[str, Any]):
+        rec = _phps_read_backup(client, backup_id)
+        target_own = dict(rec["own_settings"])
+        notes = []
+        for k in state["own"]:
+            if k not in target_own:
+                target_own[k] = rec["show_settings"].get(k, state["own"][k])
+                notes.append(f"{k} war damals geerbt und bleibt ein eigener Wert ({target_own[k]!r}).")
+        changes = [{"bereich": "settings", "wert": k, "alt": state["own"].get(k), "neu": v}
+                   for k, v in target_own.items() if state["own"].get(k) != v]
+        if _phps_norm_block(state["additional"]) != _phps_norm_block(rec["additional_directives"]):
+            changes.append({"bereich": "additional_directives", "alt": state["additional"],
+                            "neu": rec["additional_directives"]})
+        show_expect = {k: v for k, v in target_own.items() if k in state["standard"]}
+        return target_own, rec["additional_directives"], changes, show_expect, notes
+
+    return _phps_change(d, target, confirm, f"php_settings_rollback:{m.group(0)}")
 
 
 # ---------------------------------------------------------------------------
