@@ -116,7 +116,7 @@ if _HTTP_MODE and not _MCP_API_KEY:
 # Dateien (server.py, Dockerfile, requirements.txt, Workflow) geaendert haben.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.18"
+_VERSION_BASE = "0.19"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -5291,7 +5291,7 @@ def web_server_settings_rollback(domain: str, backup_id: str, confirm: bool = Fa
 #
 # Der Worker (_IMG_WORKER_SRC) läuft per runuser als System-User der
 # Subscription (nie root): Er kann damit nur Dateien ändern, die der Kunde
-# selbst ändern darf. Pro Bild: Kopie im selben Ordner, GPS-Daten und
+# selbst ändern darf. Pro Bild: Arbeitskopie unter .plesk-mcp/tmp, GPS-Daten und
 # Seriennummern (EXIF, XMP) entfernen, verlustfrei optimieren (jpegoptim ohne
 # Qualitätsstufe = nur Huffman-Optimierung; optipng), nur ersetzen, wenn
 # kleiner oder Datenschutzdaten entfernt wurden. Farbprofil, Ausrichtung und
@@ -5573,7 +5573,21 @@ def run_tool(cmd, timeout):
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
     except subprocess.TimeoutExpired:
         raise ToolTimeout()
-    return p.returncode, (p.stderr or p.stdout).decode("utf-8", "replace")[-300:]
+    out = (p.stderr + p.stdout).decode("utf-8", "replace").strip()
+    return p.returncode, " ".join(out.split())[-300:]
+
+
+def clean_tmp(root, keep):
+    """Arbeitsverzeichnisse abgebrochener Läufe (älter als 1 Tag) entfernen."""
+    if not os.path.isdir(root) or os.path.islink(root):
+        return
+    for n in os.listdir(root):
+        p = os.path.join(root, n)
+        try:
+            if n != keep and not os.path.islink(p) and os.path.isdir(p) and time.time() - os.lstat(p).st_mtime > 86400:
+                shutil.rmtree(p)
+        except OSError:
+            pass
 
 
 def optimize(a):
@@ -5595,6 +5609,12 @@ def optimize(a):
     done, errors = [], []
     total_before = total_after = 0
     backup_root = os.path.join(base, ".plesk-mcp", "image-backups", a["run_id"])
+    # Arbeitskopien ausserhalb der Webordner (nicht per Web erreichbar, auch
+    # in Ordnern ohne Schreibrecht möglich)
+    tmp_root = os.path.join(base, ".plesk-mcp", "tmp")
+    tmp_dir = os.path.join(tmp_root, a["run_id"])
+    os.makedirs(tmp_dir, 0o700, exist_ok=True)
+    clean_tmp(tmp_root, a["run_id"])
     for idx, (full, parts, kind, st) in enumerate(files):
         if time.time() > deadline:
             next_after = "/".join(files[idx - 1][1]) if idx else None
@@ -5609,7 +5629,7 @@ def optimize(a):
             continue
         d, name = os.path.split(full)
         ext = name.rsplit(".", 1)[-1]
-        tmp = os.path.join(d, ".%s.mcp-%s.%s" % (name[:150], os.urandom(4).hex(), ext))
+        tmp = os.path.join(tmp_dir, "%d.%s" % (idx, ext))
         try:
             with open(full, "rb") as f:
                 data = f.read()
@@ -5625,7 +5645,7 @@ def optimize(a):
             else:
                 rc, msg = run_tool([tools[kind], "-quiet", "-o2", "-preserve", tmp], a.get("tool_timeout", 15))
             if rc != 0:
-                raise Bad("werkzeug: " + msg.strip())
+                raise Bad("%s Exit-Code %d: %s" % (os.path.basename(tools[kind]), rc, msg or "keine Ausgabe"))
             new_size = os.path.getsize(tmp)
             if not valid(tmp, kind):
                 raise Bad("ergebnis_ungueltig")
@@ -5649,7 +5669,17 @@ def optimize(a):
                         if e.errno != errno.EXDEV:
                             raise
                         shutil.copy2(full, bpath)
-                os.replace(tmp, full)
+                try:
+                    os.replace(tmp, full)
+                except OSError as e:
+                    if e.errno != errno.EXDEV:
+                        raise
+                    # anderes Dateisystem: erst in den Zielordner kopieren, dann atomar ersetzen
+                    local = os.path.join(d, ".%s.mcp-%s.%s" % (name[:150], os.urandom(4).hex(), ext))
+                    shutil.copyfile(tmp, local)
+                    os.chmod(local, stat.S_IMODE(st.st_mode))
+                    os.replace(local, full)
+                    os.unlink(tmp)
                 os.utime(full, ns=(st.st_atime_ns, st.st_mtime_ns))
             else:
                 os.unlink(tmp)
@@ -5668,6 +5698,7 @@ def optimize(a):
                 os.unlink(tmp)
             except OSError:
                 pass
+    shutil.rmtree(tmp_dir, ignore_errors=True)
     if next_after is None and skipped.get("limit_max_files") and checked:
         next_after = "/".join(files[checked - 1][1])
     done.sort(key=lambda x: x["vorher"] - x["nachher"], reverse=True)

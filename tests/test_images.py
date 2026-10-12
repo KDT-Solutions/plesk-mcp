@@ -130,7 +130,8 @@ def test_dry_run_changes_nothing(vhost):
     res = opt(path="httpdocs/uploads")
     assert res["modus"].startswith("Probelauf") and res["bilder_optimiert"] == 1 and res["ersparnis_bytes"] > 0
     assert f.read_bytes() == before and "backup_run_id" not in res
-    assert not (vhost / ".plesk-mcp").exists()
+    assert not (vhost / ".plesk-mcp/image-backups").exists()
+    assert not any((vhost / ".plesk-mcp/tmp").iterdir())
 
 
 def test_requires_confirm(vhost):
@@ -346,3 +347,41 @@ def test_vhost_ctx_main_docroot(monkeypatch):
     ctx = server._vhost_ctx("example.com")
     assert ctx["main_docroot"] == ["example.com"]
     assert ctx["docroots"] == [["sub.example.com"], ["example.com"]]
+
+
+def test_work_copies_outside_webroot_and_cleaned(vhost, monkeypatch, tmp_path):
+    log = tmp_path / "args.log"
+    spy = tmp_path / "spy"
+    spy.write_text(f"#!/bin/sh\necho \"$@\" >> {log}\n")
+    spy.chmod(0o755)
+    monkeypatch.setattr(server, "_IMG_JPEGOPTIM", str(spy))
+    make_jpeg(vhost / "httpdocs/uploads/a.jpg")
+    res = opt(dry_run=False, confirm=True)
+    arg = log.read_text().split()[-1]
+    assert arg.startswith(str(vhost / ".plesk-mcp/tmp/")) and "/httpdocs/" not in arg
+    assert res["bilder_optimiert"] == 1  # Datenschutzdaten entfernt
+    assert not any((vhost / ".plesk-mcp/tmp").iterdir())
+    assert [p.name for p in (vhost / "httpdocs/uploads").iterdir()] == ["a.jpg"]
+
+
+def test_stale_work_dirs_removed(vhost):
+    old = vhost / ".plesk-mcp/tmp/20200101000000-deadbeef"
+    old.mkdir(parents=True)
+    (old / "x.jpg").write_text("x")
+    os.utime(old, (0, 0))
+    make_jpeg(vhost / "httpdocs/uploads/a.jpg")
+    opt()
+    assert not old.exists()
+
+
+def test_tool_error_message_has_exit_code(vhost, monkeypatch, tmp_path):
+    bad = tmp_path / "bad"
+    bad.write_text("#!/bin/sh\nexit 3\n")
+    bad.chmod(0o755)
+    monkeypatch.setattr(server, "_IMG_JPEGOPTIM", str(bad))
+    make_jpeg(vhost / "httpdocs/uploads/a.jpg")
+    res = opt()
+    assert res["fehler"][0]["fehler"] == "bad Exit-Code 3: keine Ausgabe"
+    bad.write_text("#!/bin/sh\necho 'Not a JPEG file' >&2\nexit 2\n")
+    res = opt()
+    assert res["fehler"][0]["fehler"] == "bad Exit-Code 2: Not a JPEG file"
