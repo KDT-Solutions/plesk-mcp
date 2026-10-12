@@ -618,3 +618,17 @@ os.access = lambda p, m: False if p.endswith("/instagram") and m & os.W_OK else 
                                               "dateien": 2}]
         assert ("auch im echten Lauf" in res["schreibrechte_hinweis"]) == (not kw)
         assert res["bilder_optimiert"] == 1 and _snapshot(ig) == before
+
+
+def test_large_png_uses_o1(vhost, monkeypatch, tmp_path):
+    log = tmp_path / "args.log"
+    monkeypatch.setattr(server, "_IMG_OPTIPNG", _tool(tmp_path, "optipng", f'echo "$@" >> {log}\n'))
+    up = vhost / "httpdocs/uploads"
+    make_png(up / "klein.png")
+    big = Image.frombytes("RGB", (700, 700), os.urandom(700 * 700 * 3))
+    big.save(up / "gross.png", "PNG", compress_level=0)
+    assert (up / "gross.png").stat().st_size >= 1024 * 1024
+    opt()
+    lines = log.read_text().splitlines()
+    assert any("-o1" in l and "-o2" not in l for l in lines) and any("-o2" in l for l in lines)
+    assert len(lines) == 2
