@@ -369,7 +369,7 @@ web_server_settings_update(domain="example.com",
   1. `nginx -t` vorher (schlägt der Test schon vor der Änderung fehl, wird nichts geändert)
   2. Backup des alten Dateistands (`backup_id` für `web_server_settings_rollback`)
   3. Datei atomar schreiben: Temp-Datei im selben Ordner, Besitzer/Rechte wie die bestehende Datei (neu: `root:nginx`, `0600`, wie Plesk sie anlegt), dann `rename`
-  4. `nginx -t` - schlägt das fehl, wird die alte Datei zurückgeschrieben, nichts neu geladen und der Fehler gemeldet
+  4. `nginx -t` - schlägt das fehl, wird die alte Datei zurückgeschrieben, nichts neu geladen und der Fehler gemeldet. Ausnahme: Wird die Datei entfernt (Rollback auf einen Stand ohne Datei), entfällt dieser Test, weil die alte Konfiguration bis zum Reconfigure noch per `include` auf die Datei verweist; geprüft wird dann nach dem Reconfigure.
   5. erst danach `plesk sbin httpdmng --reconfigure-domain <domain>` (übernimmt die Datei in die Plesk-Konfiguration und lädt nginx neu)
   6. Kontrolle: Datei hat den geschriebenen Inhalt, nochmals `nginx -t` (Plesk bindet `vhost_nginx.conf` nur ein, wenn die Datei beim Generieren existiert), Startseite ohne 5xx. Bei einem Fehler: alte Datei zurück, erneut Reconfigure, Fehler melden.
 - Wurde nichts geschrieben (z.B. Schreibfehler, Datei unverändert), läuft kein Rollback; das Ergebnis lautet dann "FEHLER - nichts geändert". Dasselbe gilt für die übrigen Optionen, wenn Plesk eine Änderung ablehnt und nichts übernimmt.
