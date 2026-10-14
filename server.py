@@ -117,7 +117,7 @@ if _HTTP_MODE and not _MCP_API_KEY:
 # Dateien (server.py, Dockerfile, requirements.txt, Workflow) geaendert haben.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.22"
+_VERSION_BASE = "0.23"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -5062,11 +5062,10 @@ _WEB_RULES: dict[str, str] = {
     "nginx-cache-use-stale-4xx": _WEB_BOOL,
     "nginx-cache-use-stale-updating": _WEB_BOOL,
 }
-# Freies Format, geprüft von _web_nginx_check statt per Regex. Plesk setzt den
-# Inhalt per Datei (-nginx-directives <datei>) und zeigt ihn unter einem
-# anderen Namen an.
+# Freies Format, geprüft von _web_nginx_check statt per Regex. Geschrieben wird
+# direkt in vhost_nginx.conf (siehe _web_nginx_change), Plesk zeigt den Inhalt
+# unter "additional nginx settings" an.
 _WEB_NGINX = "nginx-directives"
-_WEB_NGINX_SHOW = "additional nginx settings"
 _WEB_NGINX_MAX = 20000
 _WEB_NGINX_ALLOWED = ("add_header", "expires")
 _WEB_OPTIONS = sorted([*_WEB_RULES, _WEB_NGINX])
@@ -5190,10 +5189,6 @@ def _web_diff(old: str, new: str) -> str:
     return "\n".join(difflib.unified_diff(old.splitlines(), new.splitlines(), "alt", "neu", lineterm=""))
 
 
-def _web_show_key(option: str) -> str:
-    return _WEB_NGINX_SHOW if option == _WEB_NGINX else option
-
-
 def _web_check(key: Any, value: Any) -> tuple[str, str]:
     if not isinstance(key, str) or key.strip() not in _WEB_OPTIONS:
         raise ValueError(f"Option {key!r} ist nicht freigegeben. Erlaubt: {', '.join(_WEB_OPTIONS)}.")
@@ -5246,23 +5241,11 @@ def _web_read(client: paramiko.SSHClient, domain: str) -> dict[str, str]:
 
 
 def _web_write(client: paramiko.SSHClient, domain: str, values: dict[str, str]) -> tuple[int, str]:
-    values = dict(values)
-    directives = values.pop(_WEB_NGINX, None)
     args = " ".join(f"-{k} {shlex.quote(v)}" for k, v in values.items())
-    cmd = f"plesk bin domain --update-web-server-settings {shlex.quote(domain)} {args}".rstrip()
-    stdin_data = None
-    if directives is not None:
-        # Plesk erwartet den Inhalt als Datei: root-only Temp-Datei, danach gelöscht.
-        cmd = (f'umask 077 && f=$(mktemp /tmp/plesk-mcp-nginx.XXXXXX) || exit 1; cat > "$f"; '
-               f'{cmd} -{_WEB_NGINX} "$f"; rc=$?; rm -f -- "$f"; exit $rc')
-        stdin_data = (directives + "\n" if directives else "").encode("utf-8")
-    out, err, rc = _client_exec(client, cmd, timeout=_HOSTING_TIMEOUT, stdin_data=stdin_data)
+    out, err, rc = _client_exec(
+        client, f"plesk bin domain --update-web-server-settings {shlex.quote(domain)} {args}",
+        timeout=_HOSTING_TIMEOUT)
     return rc, (err.strip() or out.strip())[-500:]
-
-
-def _web_nginx_test(client: paramiko.SSHClient) -> tuple[bool, str]:
-    out, err, rc = _client_exec(client, "nginx -t", timeout=_HOSTING_TIMEOUT)
-    return rc == 0, (err.strip() or out.strip())[-500:]
 
 
 def _root_json_write(client: paramiko.SSHClient, bdir: str, backup_id: str, record: dict[str, Any]) -> None:
@@ -5300,19 +5283,9 @@ def _web_change(domain: str, targets_fn, confirm: bool, source: str) -> str:
             before = _web_read(client, d)
             targets = targets_fn(client, d, before)
             for k in targets:
-                if _web_show_key(k) not in before:
+                if k not in before:
                     raise ValueError(f"Option '{k}' wird von Plesk für '{d}' nicht angezeigt - nichts geändert.")
-            cur = {k: before[_web_show_key(k)] for k in targets}
-            if _WEB_NGINX in cur:
-                cur[_WEB_NGINX] = _web_norm(cur[_WEB_NGINX])
-            changes = [{"option": k, "alt": cur[k], "neu": v} for k, v in targets.items() if cur[k] != v]
-            for c in changes:
-                if c["option"] == _WEB_NGINX:
-                    c["diff"] = _web_diff(c["alt"], c["neu"])
-                    removed = [line for line in c["diff"].splitlines()[2:] if line.startswith("-")]
-                    if removed:
-                        c["hinweis"] = (f"{len(removed)} bestehende Zeile(n) werden entfernt bzw. ersetzt "
-                                        "(siehe diff). Nur anhängen: mode=\"append\".")
+            changes = [{"option": k, "alt": before[k], "neu": v} for k, v in targets.items() if before[k] != v]
             result: dict[str, Any] = {"domain": d, "aenderungen": changes}
             if not changes:
                 result["ergebnis"] = "Keine Änderung nötig - alle Werte sind bereits gesetzt."
@@ -5321,39 +5294,26 @@ def _web_change(domain: str, targets_fn, confirm: bool, source: str) -> str:
                 result["ergebnis"] = "Vorschau - nichts geschrieben. Mit confirm=true ausführen."
                 return _json(result)
             todo = {c["option"]: c["neu"] for c in changes}
-            old = {k: cur[k] for k in todo}
-            nginx = _WEB_NGINX in todo
-            if nginx:
-                ok, msg = _web_nginx_test(client)
-                if not ok:
-                    raise ValueError(f"nginx -t schlägt schon vor der Änderung fehl - nichts geändert: {msg}")
+            old = {k: before[k] for k in todo}
             baseline = _phps_http(d)[0]
             backup_id = _phps_new_backup_id(d)
             _root_json_write(client, _WEB_BACKUP_DIR, backup_id, {
                 "id": backup_id, "created": datetime.datetime.now().isoformat(timespec="seconds"),
-                "source": source, "domain": d, "changed": sorted(todo), "settings": before})
+                "source": source, "domain": d, "settings": before})
             result["backup_id"] = backup_id
-
-            def verify(values: dict[str, str]) -> list[str]:
-                now = _web_read(client, d)
-                errs = []
-                for k, v in values.items():
-                    is_ = now.get(_web_show_key(k))
-                    if k == _WEB_NGINX and is_ is not None:
-                        is_ = _web_norm(is_)
-                    if is_ != v:
-                        errs.append(f"{k}: ist {is_!r} statt {v!r}")
-                if nginx:
-                    ok, msg = _web_nginx_test(client)
-                    if not ok:
-                        errs.append(f"nginx -t: {msg}")
-                return errs
-
             failed = []
             rc, msg = _web_write(client, d, todo)
             if rc != 0:
                 failed.append(f"Plesk: Exit-Code {rc}: {msg}")
-            failed += verify(todo)
+            now = _web_read(client, d)
+            if rc != 0 and all(now.get(k) == v for k, v in old.items()):
+                # Plesk hat abgelehnt und nichts übernommen: kein Rollback nötig.
+                result["ergebnis"] = "FEHLER - nichts geändert."
+                result["fehlgeschlagene_pruefungen"] = failed
+                _audit("web_server_settings", domain=d, source=source, changes=changes, backup_id=backup_id,
+                       result="unchanged", failed=failed)
+                return _json(result)
+            failed += [f"{k}: ist {now.get(k)!r} statt {v!r}" for k, v in todo.items() if now.get(k) != v]
             if not failed and baseline is not None and baseline < 500:
                 status, detail = _phps_http(d)
                 if status is not None and status >= 500:
@@ -5364,13 +5324,206 @@ def _web_change(domain: str, targets_fn, confirm: bool, source: str) -> str:
                        result="ok")
                 return _json(result)
             rc, msg = _web_write(client, d, old)
-            rfailed = ([f"Plesk: Exit-Code {rc}: {msg}"] if rc != 0 else []) + verify(old)
+            after = _web_read(client, d)
+            rfailed = ([f"Plesk: Exit-Code {rc}: {msg}"] if rc != 0 else []) + [
+                f"{k}: ist {after.get(k)!r} statt {v!r}" for k, v in old.items() if after.get(k) != v]
             result["ergebnis"] = ("FEHLER - automatisch auf das Backup zurückgestellt." if not rfailed
                                   else "FEHLER - Zurückstellen ebenfalls fehlgeschlagen, bitte sofort prüfen!")
             result["fehlgeschlagene_pruefungen"] = failed
             if rfailed:
                 result["fehler_beim_zurueckstellen"] = rfailed
             _audit("web_server_settings", domain=d, source=source, changes=changes, backup_id=backup_id,
+                   result="rolled_back" if not rfailed else "rollback_failed", failed=failed)
+            return _json(result)
+        finally:
+            client.close()
+    finally:
+        lock.release()
+
+
+# Zusätzliche nginx-Anweisungen: Plesk kann sie per CLI nur anzeigen, nicht
+# setzen. Deshalb wird vhost_nginx.conf direkt geschrieben (atomar per
+# Temp-Datei + rename im selben Ordner) und danach per httpdmng in die
+# Plesk-Konfiguration übernommen. Das Plesk-Template bindet die Datei nur ein,
+# wenn sie beim Generieren existiert - nginx -t läuft deshalb vor UND nach dem
+# Reconfigure.
+
+_WEB_NGINX_ROOT = "/var/www/vhosts/system"
+_WEB_NGINX_FILE = "vhost_nginx.conf"
+_WEB_NGINX_OWNER = "root:nginx"   # so legt Plesk die Datei an
+_WEB_NGINX_MODE = "600"
+_WEB_LABEL_RE = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+_WEB_OWNER_RE = re.compile(r"[a-z_][a-z0-9_-]{0,31}:[a-z_][a-z0-9_-]{0,31}")
+_WEB_MODE_RE = re.compile(r"[0-7]{3,4}")
+
+
+def _web_nginx_paths(domain: str) -> tuple[str, str, str]:
+    """(System-Ordner der Domain, conf-Ordner, vhost_nginx.conf) - nur für
+    strikt gültige Hostnamen."""
+    labels = domain.split(".")
+    if (len(domain) > 253 or len(labels) < 2 or "/" in domain or ".." in domain
+            or not all(_WEB_LABEL_RE.fullmatch(lb) for lb in labels)):
+        raise ValueError(f"Ungültiger Domainname: {domain!r}")
+    base = f"{_WEB_NGINX_ROOT}/{domain}"
+    conf = f"{base}/conf"
+    path = f"{conf}/{_WEB_NGINX_FILE}"
+    if posixpath.normpath(path) != path or posixpath.dirname(path) != conf:
+        raise ValueError(f"Ungültiger Domainname: {domain!r}")
+    return base, conf, path
+
+
+def _web_nginx_read(client: paramiko.SSHClient, domain: str) -> dict[str, Any]:
+    """Aktueller Stand der Datei: exists, owner, mode, content (roh)."""
+    base, conf, path = _web_nginx_paths(domain)
+    q = shlex.quote
+    cmd = (f"b={q(base)}; c={q(conf)}; f={q(path)}; "
+           'if [ -L "$b" ] || [ -L "$c" ] || [ ! -d "$c" ]; then echo "conf-Ordner fehlt oder ist ein Symlink" >&2; exit 3; fi; '
+           'if [ -L "$f" ]; then echo "Datei ist ein Symlink" >&2; exit 4; fi; '
+           'if [ -f "$f" ]; then stat -c "%U:%G %a" -- "$f" && cat -- "$f"; '
+           'elif [ -e "$f" ]; then echo "keine normale Datei" >&2; exit 4; '
+           "else echo ABSENT; fi")
+    out, err, rc = _client_exec(client, cmd)
+    if rc != 0:
+        raise ValueError(f"{path} nicht lesbar - nichts geändert: {(err.strip() or out.strip())[:300]}")
+    head, _, content = out.partition("\n")
+    if head.strip() == "ABSENT":
+        return {"exists": False, "owner": _WEB_NGINX_OWNER, "mode": _WEB_NGINX_MODE, "content": ""}
+    owner, _, mode = head.strip().partition(" ")
+    if not _WEB_OWNER_RE.fullmatch(owner) or not _WEB_MODE_RE.fullmatch(mode):
+        raise ValueError(f"Besitzer/Rechte von {path} nicht lesbar: {head[:100]!r}")
+    return {"exists": True, "owner": owner, "mode": mode, "content": content}
+
+
+def _web_nginx_put(client: paramiko.SSHClient, domain: str, state: dict[str, Any]) -> tuple[int, str]:
+    """Schreibt state (exists/owner/mode/content) atomar; exists=False entfernt die Datei."""
+    _, conf, path = _web_nginx_paths(domain)
+    q = shlex.quote
+    if not state["exists"]:
+        out, err, rc = _client_exec(client, f"f={q(path)}; [ -L \"$f\" ] && exit 4; rm -f -- \"$f\"")
+        return rc, (err.strip() or out.strip())[-500:]
+    owner, mode = state["owner"], state["mode"]
+    if not _WEB_OWNER_RE.fullmatch(owner) or not _WEB_MODE_RE.fullmatch(mode):
+        raise ValueError("Ungültiger Besitzer/Rechte für vhost_nginx.conf.")
+    content = state["content"]
+    data = (content if not content or content.endswith("\n") else content + "\n").encode("utf-8")
+    cmd = (f"c={q(conf)}; f={q(path)}; "
+           'umask 077 && t=$(mktemp "$c/.vhost_nginx.conf.mcp-XXXXXX") || exit 1; '
+           f'if cat > "$t" && chown {q(owner)} "$t" && chmod {q(mode)} "$t" && mv -fT -- "$t" "$f"; '
+           'then exit 0; else rm -f -- "$t"; exit 1; fi')
+    out, err, rc = _client_exec(client, cmd, stdin_data=data)
+    return rc, (err.strip() or out.strip())[-500:]
+
+
+def _web_nginx_test(client: paramiko.SSHClient) -> tuple[bool, str]:
+    out, err, rc = _client_exec(client, "nginx -t", timeout=_HOSTING_TIMEOUT)
+    return rc == 0, (err.strip() or out.strip())[-500:]
+
+
+def _web_reconfigure(client: paramiko.SSHClient, domain: str) -> tuple[int, str]:
+    out, err, rc = _client_exec(client, f"plesk sbin httpdmng --reconfigure-domain {shlex.quote(domain)}",
+                                timeout=_HOSTING_TIMEOUT)
+    return rc, (err.strip() or out.strip())[-500:]
+
+
+def _web_nginx_change(domain: str, target_fn, confirm: bool, source: str) -> str:
+    """target_fn(stand) -> Zielstand {exists, content[, owner, mode]}; Ablauf:
+    Vorschau, nginx -t vorher, Backup, Datei schreiben, nginx -t, Reconfigure,
+    Datei/nginx -t/Startseite prüfen; bei Fehler alter Stand zurück."""
+    d = _hosting_domain(domain)
+    _web_nginx_paths(d)
+    lock = _phps_lock(f"web:{d}", d, "eine Änderung der Webserver-Einstellungen")
+    try:
+        client = _ssh_connect()
+        try:
+            cur = _web_nginx_read(client, d)
+            target = target_fn(cur)
+            old_n, new_n = _web_norm(cur["content"]), _web_norm(target["content"])
+            change: dict[str, Any] = {"option": _WEB_NGINX, "alt": old_n, "neu": new_n,
+                                      "diff": _web_diff(old_n, new_n)}
+            removed = [line for line in change["diff"].splitlines()[2:] if line.startswith("-")]
+            if removed:
+                change["hinweis"] = (f"{len(removed)} bestehende Zeile(n) werden entfernt bzw. ersetzt "
+                                     "(siehe diff). Nur anhängen: mode=\"append\".")
+            result: dict[str, Any] = {"domain": d, "datei": _web_nginx_paths(d)[2], "aenderungen": [change]}
+            if old_n == new_n:
+                result["aenderungen"] = []
+                result["ergebnis"] = "Keine Änderung nötig - der Inhalt ist bereits gesetzt."
+                return _json(result)
+            if not confirm:
+                result["ergebnis"] = "Vorschau - nichts geschrieben. Mit confirm=true ausführen."
+                return _json(result)
+            new_state = {"exists": target["exists"], "content": new_n,
+                         "owner": target.get("owner") or cur["owner"],
+                         "mode": target.get("mode") or cur["mode"]}
+            ok, msg = _web_nginx_test(client)
+            if not ok:
+                raise ValueError(f"nginx -t schlägt schon vor der Änderung fehl - nichts geändert: {msg}")
+            baseline = _phps_http(d)[0]
+            backup_id = _phps_new_backup_id(d)
+            _root_json_write(client, _WEB_BACKUP_DIR, backup_id, {
+                "id": backup_id, "created": datetime.datetime.now().isoformat(timespec="seconds"),
+                "source": source, "domain": d, "changed": [_WEB_NGINX], "nginx_file": cur})
+            result["backup_id"] = backup_id
+
+            def same(state: dict[str, Any], want: dict[str, Any]) -> bool:
+                return state["exists"] == want["exists"] and _web_norm(state["content"]) == _web_norm(want["content"])
+
+            failed: list[str] = []
+            reconfigured = False
+            rc, msg = _web_nginx_put(client, d, new_state)
+            if rc != 0:
+                failed.append(f"Schreiben: Exit-Code {rc}: {msg}")
+                if same(_web_nginx_read(client, d), cur):
+                    result["ergebnis"] = "FEHLER - nichts geändert."
+                    result["fehlgeschlagene_pruefungen"] = failed
+                    _audit("web_server_settings", domain=d, source=source, changes=[change],
+                           backup_id=backup_id, result="unchanged", failed=failed)
+                    return _json(result)
+            if not failed:
+                ok, msg = _web_nginx_test(client)
+                if not ok:
+                    failed.append(f"nginx -t: {msg}")
+            if not failed:
+                rc, msg = _web_reconfigure(client, d)
+                reconfigured = True
+                if rc != 0:
+                    failed.append(f"httpdmng --reconfigure-domain: Exit-Code {rc}: {msg}")
+            if not failed:
+                if not same(_web_nginx_read(client, d), new_state):
+                    failed.append("vhost_nginx.conf hat nach dem Reconfigure nicht den geschriebenen Inhalt")
+                ok, msg = _web_nginx_test(client)
+                if not ok:
+                    failed.append(f"nginx -t nach Reconfigure: {msg}")
+            if not failed and baseline is not None and baseline < 500:
+                status, detail = _phps_http(d)
+                if status is not None and status >= 500:
+                    failed.append(f"Startseite liefert {status} ({detail})")
+            if not failed:
+                result["ergebnis"] = "Geschrieben und kontrolliert."
+                _audit("web_server_settings", domain=d, source=source, changes=[change], backup_id=backup_id,
+                       result="ok")
+                return _json(result)
+
+            rfailed: list[str] = []
+            rc, msg = _web_nginx_put(client, d, cur)
+            if rc != 0:
+                rfailed.append(f"Zurückschreiben: Exit-Code {rc}: {msg}")
+            if reconfigured:
+                rc, msg = _web_reconfigure(client, d)
+                if rc != 0:
+                    rfailed.append(f"httpdmng --reconfigure-domain: Exit-Code {rc}: {msg}")
+            if not same(_web_nginx_read(client, d), cur):
+                rfailed.append("vhost_nginx.conf hat nicht wieder den alten Inhalt")
+            ok, msg = _web_nginx_test(client)
+            if not ok:
+                rfailed.append(f"nginx -t: {msg}")
+            result["ergebnis"] = (("FEHLER - automatisch auf den alten Stand zurückgestellt"
+                                   + ("." if reconfigured else ", nichts neu geladen.")) if not rfailed
+                                  else "FEHLER - Zurückstellen ebenfalls fehlgeschlagen, bitte sofort prüfen!")
+            result["fehlgeschlagene_pruefungen"] = failed
+            if rfailed:
+                result["fehler_beim_zurueckstellen"] = rfailed
+            _audit("web_server_settings", domain=d, source=source, changes=[change], backup_id=backup_id,
                    result="rolled_back" if not rfailed else "rollback_failed", failed=failed)
             return _json(result)
         finally:
@@ -5420,46 +5573,66 @@ def web_server_settings_update(domain: str, settings: dict[str, Any], confirm: b
     nginx-directives: zusätzliche nginx-Anweisungen der Domain (Plesk
     "Zusätzliche nginx-Anweisungen", vhost_nginx.conf), z.B.
     {"nginx-directives": "add_header X-Robots-Tag \"noindex, nofollow\" always;"}.
-    Erlaubt sind nur add_header, expires und location-Blöcke, die nur
-    add_header/expires enthalten, dazu Kommentare und Leerzeilen. mode=
-    "replace" (Standard) ersetzt den kompletten Inhalt, mode="append" hängt
-    den Wert an den bestehenden Inhalt an. Die Vorschau zeigt alt/neu als
-    diff. Nach dem Schreiben wird zusätzlich `nginx -t` geprüft.
+    Nur allein, nicht zusammen mit anderen Optionen. Erlaubt sind nur
+    add_header, expires und location-Blöcke, die nur add_header/expires
+    enthalten, dazu Kommentare und Leerzeilen. mode="replace" (Standard)
+    ersetzt den kompletten Inhalt, mode="append" hängt den Wert an. Die
+    Vorschau zeigt alt/neu als diff. Geschrieben wird direkt in
+    /var/www/vhosts/system/<domain>/conf/vhost_nginx.conf, dann nginx -t,
+    erst danach `plesk sbin httpdmng --reconfigure-domain` (lädt nginx neu).
 
     Ohne confirm=true nur Vorschau (alt/neu). Mit confirm=true: Backup des
-    kompletten Stands (backup_id für web_server_settings_rollback), dann
-    Schreiben und Kontrolle (Werte laut Plesk, nginx -t, Startseite ohne
-    5xx); bei einem Fehler automatisch zurück auf den alten Stand.
+    alten Stands (backup_id für web_server_settings_rollback), dann
+    Schreiben und Kontrolle (Werte, nginx -t, Startseite ohne 5xx); bei
+    einem Fehler automatisch zurück auf den alten Stand.
     """
     if not isinstance(settings, dict) or not settings:
         raise ValueError("settings als Objekt angeben, z.B. {\"web-server-expires\": \"2592000\"}.")
     if mode not in ("replace", "append"):
         raise ValueError("mode muss \"replace\" oder \"append\" sein.")
     checked = dict(_web_check(k, v) for k, v in settings.items())
-    if mode == "append" and _WEB_NGINX not in checked:
+    if _WEB_NGINX in checked:
+        if len(checked) > 1:
+            raise ValueError("\"nginx-directives\" bitte allein setzen, nicht zusammen mit anderen Optionen.")
+        add = checked[_WEB_NGINX]
+
+        def target(cur: dict[str, Any]) -> dict[str, Any]:
+            content = _web_append(_web_norm(cur["content"]), add) if mode == "append" else add
+            return {"exists": True, "content": content}
+
+        return _web_nginx_change(domain, target, confirm, "web_server_settings_update"
+                                 + (":append" if mode == "append" else ""))
+    if mode == "append":
         raise ValueError("mode=\"append\" gilt nur für die Option \"nginx-directives\".")
-
-    def targets(client: paramiko.SSHClient, d: str, before: dict[str, str]) -> dict[str, str]:
-        if mode != "append":
-            return checked
-        out = dict(checked)
-        out[_WEB_NGINX] = _web_append(_web_norm(before.get(_WEB_NGINX_SHOW, "")), checked[_WEB_NGINX])
-        return out
-
-    return _web_change(domain, targets, confirm, "web_server_settings_update"
-                       + (":append" if mode == "append" else ""))
+    return _web_change(domain, lambda client, d, before: checked, confirm, "web_server_settings_update")
 
 
 @mcp.tool()
 def web_server_settings_rollback(domain: str, backup_id: str, confirm: bool = False) -> str:
     """Stellt die freigegebenen Webserver-Einstellungen einer Domain auf den
-    Stand eines Backups von web_server_settings_update zurück (die
-    nginx-Anweisungen nur, wenn dieses Update sie geändert hat). Ohne
-    confirm=true nur Vorschau, mit confirm=true vorher neues Backup und
-    dieselbe Kontrolle wie beim Update.
+    Stand eines Backups von web_server_settings_update zurück. Bei einem
+    Backup einer nginx-directives-Änderung wird vhost_nginx.conf auf den
+    damaligen Stand zurückgeschrieben (gleicher Ablauf mit nginx -t und
+    Reconfigure). Ohne confirm=true nur Vorschau, mit confirm=true vorher
+    neues Backup und dieselbe Kontrolle wie beim Update.
     """
-    def targets(client: paramiko.SSHClient, d: str, before: dict[str, str]) -> dict[str, str]:
+    d = _hosting_domain(domain)
+    client = _ssh_connect()
+    try:
         rec = _root_json_read(client, _WEB_BACKUP_DIR, backup_id, d)
+    finally:
+        client.close()
+    nf = rec.get("nginx_file")
+    if nf is not None:
+        if not (isinstance(nf, dict) and isinstance(nf.get("exists"), bool)
+                and isinstance(nf.get("content"), str)
+                and _WEB_OWNER_RE.fullmatch(str(nf.get("owner", "")))
+                and _WEB_MODE_RE.fullmatch(str(nf.get("mode", "")))):
+            raise ValueError("Backup ist ungültig (nginx_file).")
+        # Keine Whitelist-Prüfung: es ist der damals gelesene Dateistand.
+        return _web_nginx_change(d, lambda cur: dict(nf), confirm, f"web_server_settings_rollback:{backup_id}")
+
+    def targets(client: paramiko.SSHClient, d: str, before: dict[str, str]) -> dict[str, str]:
         old = rec.get("settings")
         if not isinstance(old, dict):
             raise ValueError("Backup ist ungültig (keine Einstellungen).")
@@ -5470,17 +5643,9 @@ def web_server_settings_rollback(domain: str, backup_id: str, confirm: bool = Fa
                 if v and not re.fullmatch(_WEB_RULES[k], v):
                     raise ValueError(f"Backup enthält ungültigen Wert für '{k}'.")
                 out[k] = v
-        # nginx-Anweisungen nur, wenn das Backup-Update sie geändert hat: sonst
-        # würde ein älteres Backup spätere, manuelle Änderungen überschreiben.
-        # Keine Whitelist-Prüfung - es ist der von Plesk gelesene alte Stand.
-        changed = rec.get("changed")
-        v = old.get(_WEB_NGINX_SHOW)
-        if isinstance(changed, list) and _WEB_NGINX in changed and isinstance(v, str) \
-                and _web_norm(v) != _web_norm(before.get(_WEB_NGINX_SHOW, "")):
-            out[_WEB_NGINX] = _web_norm(v)
         return out
 
-    return _web_change(domain, targets, confirm, f"web_server_settings_rollback:{backup_id}")
+    return _web_change(d, targets, confirm, f"web_server_settings_rollback:{backup_id}")
 
 
 # ---------------------------------------------------------------------------

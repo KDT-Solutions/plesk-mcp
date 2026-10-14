@@ -347,6 +347,8 @@ Schlägt eine Prüfung fehl, stellt das Tool automatisch auf das Backup zurück 
 
 - Freigegeben (nur einfache, geprüfte Werte): `web-server-expires` (Sekunden, z.B. `2592000` = 30 Tage), `web-server-expires-static-only`, `nginx-serve-static`, `nginx-cache-enabled`, `nginx-cache-size` (Bytes), `nginx-cache-timeout` (Sekunden), `nginx-cache-bypass-header-nocache`, `nginx-cache-bypass-header-auth`, `nginx-cache-bypass-get-nocache`, `nginx-cache-use-stale-5xx`, `nginx-cache-use-stale-4xx`, `nginx-cache-use-stale-updating` (`true`/`false`). Dazu `nginx-directives` (siehe unten). Nicht freigegeben sind die übrigen Optionen mit freiem Format (Cache-Key, Cookie-Listen, Bypass-Pfade, zusätzliche Apache-Direktiven).
 - Ohne `confirm=true` nur Vorschau. Mit `confirm=true`: Backup des kompletten Stands (root-only unter `WEB_SETTINGS_BACKUP_DIR`, Standard `/root/.plesk-mcp/web-server-backups`), Schreiben, Kontrolle (Werte laut Plesk, Startseite ohne 5xx), bei Fehler automatisch zurück.
+- nginx-Cache nur bei eher statischen Seiten: Bei Shops, Logins oder Warenkörben können veraltete oder fremde Inhalte ausgeliefert werden.
+- Kompression: Brotli ist auf dem Server serverweit über `/etc/nginx/conf.d/brotli.conf` aktiv; das ist nicht Teil dieser Tools.
 
 ### Zusätzliche nginx-Anweisungen (`nginx-directives`)
 
@@ -361,10 +363,17 @@ web_server_settings_update(domain="example.com",
 - Whitelist: erlaubt sind nur `add_header <Name> <Wert> [always];`, `expires [modified] <Zeit>;` und `location`-Blöcke, die ausschliesslich `add_header`/`expires` enthalten (keine verschachtelten `location`), dazu Kommentare und Leerzeilen. Alles andere wird abgelehnt, z.B. `proxy_pass`, `include`, `root`, `alias`, Lua-Direktiven, `return`, `rewrite`, `auth_*`, `ssl_*`. Die Prüfung arbeitet auf nginx-Tokens (Strings in Anführungszeichen, `;`, `{`, `}`), mehrere Anweisungen auf einer Zeile werden also einzeln geprüft.
 - `mode="replace"` (Standard) ersetzt den kompletten Inhalt. `mode="append"` hängt den Wert an den bestehenden Inhalt an; geprüft wird dabei nur der neue Teil, der bestehende Inhalt bleibt unverändert. Ist der Wert dort schon als ganze Zeile(n) enthalten, wird nichts geändert.
 - Bestehender Inhalt wird nie stillschweigend überschrieben: Vorschau und Ergebnis enthalten alt, neu und einen `diff`; entfernt `replace` bestehende Zeilen, steht zusätzlich ein `hinweis` dabei.
-- Ablauf mit `confirm=true`: `nginx -t` vorher (schlägt der Test schon vor der Änderung fehl, wird nichts geändert), Backup (`backup_id` für `web_server_settings_rollback`), Schreiben über `plesk bin domain --update-web-server-settings <domain> -nginx-directives <datei>` (root-only Temp-Datei unter `/tmp`, danach gelöscht), Kontrolle (Inhalt laut Plesk, `nginx -t`, Startseite ohne 5xx). Schlägt eine Prüfung fehl, wird automatisch der alte Stand zurückgeschrieben und der Fehler gemeldet.
-- `web_server_settings_rollback` stellt die nginx-Anweisungen nur zurück, wenn das Update hinter der `backup_id` sie geändert hat - ein älteres Backup überschreibt so keine späteren Änderungen.
-- nginx-Cache nur bei eher statischen Seiten: Bei Shops, Logins oder Warenkörben können veraltete oder fremde Inhalte ausgeliefert werden.
-- Kompression: Brotli ist auf dem Server serverweit über `/etc/nginx/conf.d/brotli.conf` aktiv; das ist nicht Teil dieser Tools.
+- Plesk kann die zusätzlichen nginx-Anweisungen per CLI nur anzeigen, nicht setzen. Das Tool schreibt deshalb direkt in `/var/www/vhosts/system/<domain>/conf/vhost_nginx.conf`. Der Domainname wird strikt geprüft (nur gültige Hostnamen, kein `..`, kein `/`), geschrieben wird nur in diesen `conf`-Ordner, nie durch Symlinks.
+- `nginx-directives` nur allein setzen, nicht zusammen mit anderen Optionen im selben Aufruf.
+- Ablauf mit `confirm=true`:
+  1. `nginx -t` vorher (schlägt der Test schon vor der Änderung fehl, wird nichts geändert)
+  2. Backup des alten Dateistands (`backup_id` für `web_server_settings_rollback`)
+  3. Datei atomar schreiben: Temp-Datei im selben Ordner, Besitzer/Rechte wie die bestehende Datei (neu: `root:nginx`, `0600`, wie Plesk sie anlegt), dann `rename`
+  4. `nginx -t` - schlägt das fehl, wird die alte Datei zurückgeschrieben, nichts neu geladen und der Fehler gemeldet
+  5. erst danach `plesk sbin httpdmng --reconfigure-domain <domain>` (übernimmt die Datei in die Plesk-Konfiguration und lädt nginx neu)
+  6. Kontrolle: Datei hat den geschriebenen Inhalt, nochmals `nginx -t` (Plesk bindet `vhost_nginx.conf` nur ein, wenn die Datei beim Generieren existiert), Startseite ohne 5xx. Bei einem Fehler: alte Datei zurück, erneut Reconfigure, Fehler melden.
+- Wurde nichts geschrieben (z.B. Schreibfehler, Datei unverändert), läuft kein Rollback; das Ergebnis lautet dann "FEHLER - nichts geändert". Dasselbe gilt für die übrigen Optionen, wenn Plesk eine Änderung ablehnt und nichts übernimmt.
+- `web_server_settings_rollback` mit einer `backup_id` einer `nginx-directives`-Änderung schreibt den damaligen Dateistand zurück (gab es die Datei damals nicht, wird sie entfernt), mit demselben Ablauf aus `nginx -t` und Reconfigure.
 
 ## Bilder verlustfrei optimieren
 
