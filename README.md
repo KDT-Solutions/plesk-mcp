@@ -176,7 +176,7 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8422` auf dem Docker-Hos
 | `php_settings_update` | Ändert freigegebene PHP-Werte (Allowlist) - ohne `confirm=true` nur Vorschau, Backup mit `backup_id`, Prüfungen danach mit automatischem Zurückstellen, siehe "PHP-Einstellungen ändern" |
 | `php_settings_rollback` | Stellt einen Stand aus einem `php_settings_update`-Backup wieder her (`backup_id`) - ohne `confirm=true` nur Vorschau |
 | `web_server_settings_show` | Webserver-Einstellungen einer Domain (Expires-Header, nginx-Auslieferung statischer Dateien, nginx-Cache) - read-only |
-| `web_server_settings_update` | Ändert freigegebene Webserver-Einstellungen für Speed (Browser-Caching, nginx-Cache) - ohne `confirm=true` nur Vorschau, Backup, Kontrolle mit automatischem Zurückstellen |
+| `web_server_settings_update` | Ändert freigegebene Webserver-Einstellungen für Speed (Browser-Caching, nginx-Cache) und zusätzliche nginx-Anweisungen (nur `add_header`/`expires`) - ohne `confirm=true` nur Vorschau, Backup, Kontrolle mit automatischem Zurückstellen |
 | `web_server_settings_rollback` | Stellt Webserver-Einstellungen aus einem Backup wieder her |
 | `optimize_images` | Optimiert JPG/PNG einer Domain verlustfrei und entfernt GPS-Daten/Seriennummern - Standard Probelauf, ausführen mit `dry_run=false` und `confirm=true`; `hintergrund=true` startet einen Job für den ganzen Pfad, `dateien=[...]` bearbeitet einzelne Bilder |
 | `image_job` | Status (Fortschritt, Ergebnis mit blätterbaren Listen) und Abbruch eines Hintergrundjobs von `optimize_images` - `cancel` ohne `confirm=true` nur Vorschau |
@@ -345,8 +345,24 @@ Schlägt eine Prüfung fehl, stellt das Tool automatisch auf das Backup zurück 
 
 `web_server_settings_show(domain)`, `web_server_settings_update(domain, settings={...}, confirm=true)` und `web_server_settings_rollback(domain, backup_id, confirm=true)` lesen und ändern die Webserver-Einstellungen einer Domain (Haupt-, Sub- oder Zusatzdomain) über `plesk bin domain --show-web-server-settings` bzw. `--update-web-server-settings <domain> -<option> <wert>`.
 
-- Freigegeben (nur einfache, geprüfte Werte): `web-server-expires` (Sekunden, z.B. `2592000` = 30 Tage), `web-server-expires-static-only`, `nginx-serve-static`, `nginx-cache-enabled`, `nginx-cache-size` (Bytes), `nginx-cache-timeout` (Sekunden), `nginx-cache-bypass-header-nocache`, `nginx-cache-bypass-header-auth`, `nginx-cache-bypass-get-nocache`, `nginx-cache-use-stale-5xx`, `nginx-cache-use-stale-4xx`, `nginx-cache-use-stale-updating` (`true`/`false`). Nicht freigegeben sind Optionen mit freiem Format (Cache-Key, Cookie-Listen, Bypass-Pfade, zusätzliche nginx-/Apache-Direktiven).
+- Freigegeben (nur einfache, geprüfte Werte): `web-server-expires` (Sekunden, z.B. `2592000` = 30 Tage), `web-server-expires-static-only`, `nginx-serve-static`, `nginx-cache-enabled`, `nginx-cache-size` (Bytes), `nginx-cache-timeout` (Sekunden), `nginx-cache-bypass-header-nocache`, `nginx-cache-bypass-header-auth`, `nginx-cache-bypass-get-nocache`, `nginx-cache-use-stale-5xx`, `nginx-cache-use-stale-4xx`, `nginx-cache-use-stale-updating` (`true`/`false`). Dazu `nginx-directives` (siehe unten). Nicht freigegeben sind die übrigen Optionen mit freiem Format (Cache-Key, Cookie-Listen, Bypass-Pfade, zusätzliche Apache-Direktiven).
 - Ohne `confirm=true` nur Vorschau. Mit `confirm=true`: Backup des kompletten Stands (root-only unter `WEB_SETTINGS_BACKUP_DIR`, Standard `/root/.plesk-mcp/web-server-backups`), Schreiben, Kontrolle (Werte laut Plesk, Startseite ohne 5xx), bei Fehler automatisch zurück.
+
+### Zusätzliche nginx-Anweisungen (`nginx-directives`)
+
+Die Option `nginx-directives` setzt den Inhalt von Plesk "Zusätzliche nginx-Anweisungen" einer Domain (Datei `vhost_nginx.conf`). Der Wert ist der komplette Inhalt; `web_server_settings_show` zeigt den aktuellen Stand unter `additional nginx settings`.
+
+```
+web_server_settings_update(domain="example.com",
+    settings={"nginx-directives": "add_header X-Robots-Tag \"noindex, nofollow\" always;"},
+    confirm=true)
+```
+
+- Whitelist: erlaubt sind nur `add_header <Name> <Wert> [always];`, `expires [modified] <Zeit>;` und `location`-Blöcke, die ausschliesslich `add_header`/`expires` enthalten (keine verschachtelten `location`), dazu Kommentare und Leerzeilen. Alles andere wird abgelehnt, z.B. `proxy_pass`, `include`, `root`, `alias`, Lua-Direktiven, `return`, `rewrite`, `auth_*`, `ssl_*`. Die Prüfung arbeitet auf nginx-Tokens (Strings in Anführungszeichen, `;`, `{`, `}`), mehrere Anweisungen auf einer Zeile werden also einzeln geprüft.
+- `mode="replace"` (Standard) ersetzt den kompletten Inhalt. `mode="append"` hängt den Wert an den bestehenden Inhalt an; geprüft wird dabei nur der neue Teil, der bestehende Inhalt bleibt unverändert. Ist der Wert dort schon als ganze Zeile(n) enthalten, wird nichts geändert.
+- Bestehender Inhalt wird nie stillschweigend überschrieben: Vorschau und Ergebnis enthalten alt, neu und einen `diff`; entfernt `replace` bestehende Zeilen, steht zusätzlich ein `hinweis` dabei.
+- Ablauf mit `confirm=true`: `nginx -t` vorher (schlägt der Test schon vor der Änderung fehl, wird nichts geändert), Backup (`backup_id` für `web_server_settings_rollback`), Schreiben über `plesk bin domain --update-web-server-settings <domain> -nginx-directives <datei>` (root-only Temp-Datei unter `/tmp`, danach gelöscht), Kontrolle (Inhalt laut Plesk, `nginx -t`, Startseite ohne 5xx). Schlägt eine Prüfung fehl, wird automatisch der alte Stand zurückgeschrieben und der Fehler gemeldet.
+- `web_server_settings_rollback` stellt die nginx-Anweisungen nur zurück, wenn das Update hinter der `backup_id` sie geändert hat - ein älteres Backup überschreibt so keine späteren Änderungen.
 - nginx-Cache nur bei eher statischen Seiten: Bei Shops, Logins oder Warenkörben können veraltete oder fremde Inhalte ausgeliefert werden.
 - Kompression: Brotli ist auf dem Server serverweit über `/etc/nginx/conf.d/brotli.conf` aktiv; das ist nicht Teil dieser Tools.
 
