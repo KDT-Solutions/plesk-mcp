@@ -117,7 +117,7 @@ if _HTTP_MODE and not _MCP_API_KEY:
 # Dateien (server.py, Dockerfile, requirements.txt, Workflow) geaendert haben.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.23"
+_VERSION_BASE = "0.24"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -5479,7 +5479,10 @@ def _web_nginx_change(domain: str, target_fn, confirm: bool, source: str) -> str
                     _audit("web_server_settings", domain=d, source=source, changes=[change],
                            backup_id=backup_id, result="unchanged", failed=failed)
                     return _json(result)
-            if not failed:
+            if not failed and new_state["exists"]:
+                # Beim Entfernen (Rollback auf "keine Datei") verweist die alte
+                # nginx.conf bis zum Reconfigure noch per include auf die Datei -
+                # nginx -t kann erst danach sinnvoll prüfen.
                 ok, msg = _web_nginx_test(client)
                 if not ok:
                     failed.append(f"nginx -t: {msg}")

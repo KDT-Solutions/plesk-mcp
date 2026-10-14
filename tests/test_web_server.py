@@ -31,7 +31,7 @@ def plesk(monkeypatch):
                      "additional nginx settings": "location /x {\n  return 403;\n}"},
           "fail": False, "ignore": set(), "files": {}, "updates": [], "nginx_ok": [], "nginx_tests": 0,
           "vfile": {"exists": True, "owner": "root:nginx", "mode": "600", "content": OLD_NGINX + "\n"},
-          "put_fail": False, "puts": [], "reconf": [], "reconf_rc": 0, "log": []}
+          "put_fail": False, "puts": [], "reconf": [], "reconf_rc": 0, "log": [], "included": True}
 
     def show():
         return "\n".join(f"[{k}]\n{v}\n" for k, v in st["values"].items())
@@ -68,10 +68,16 @@ def plesk(monkeypatch):
         if cmd == f"plesk sbin httpdmng --reconfigure-domain {DOMAIN}":
             st["log"].append("reconfigure")
             st["reconf"].append(cmd)
-            return ("", "", 0) if st["reconf_rc"] == 0 else ("", "httpdmng failed", st["reconf_rc"])
+            if st["reconf_rc"] != 0:
+                return "", "httpdmng failed", st["reconf_rc"]
+            # wie das Plesk-Template: include nur, wenn die Datei beim Generieren existiert
+            st["included"] = st["vfile"]["exists"]
+            return "", "", 0
         if cmd == "nginx -t":
             st["log"].append("nginx -t")
             st["nginx_tests"] += 1
+            if st["included"] and not st["vfile"]["exists"]:
+                return "", f'nginx: [emerg] open() "{VHOST_FILE}" failed (2: No such file or directory)', 1
             ok = st["nginx_ok"].pop(0) if st["nginx_ok"] else True
             return ("", "nginx: configuration file /etc/nginx/nginx.conf test is successful", 0) if ok \
                 else ("", "nginx: [emerg] unknown directive", 1)
@@ -219,6 +225,7 @@ def test_nginx_write_and_test_ok(plesk):
 
 def test_nginx_new_file(plesk):
     plesk["vfile"] = {"exists": False, "owner": "", "mode": "", "content": ""}
+    plesk["included"] = False
     res = upd({"nginx-directives": ROBOTS}, confirm=True)
     assert res["ergebnis"] == "Geschrieben und kontrolliert."
     assert plesk["vfile"]["content"] == ROBOTS + "\n"
@@ -324,6 +331,12 @@ def test_nginx_rollback(plesk):
 
 def test_nginx_rollback_removes_new_file(plesk):
     plesk["vfile"] = {"exists": False, "owner": "", "mode": "", "content": ""}
+    plesk["included"] = False
     bid = upd({"nginx-directives": ROBOTS}, confirm=True)["backup_id"]
+    assert plesk["included"] is True
+    plesk["log"].clear()
     res = json.loads(server.web_server_settings_rollback(DOMAIN, bid, confirm=True))
     assert res["ergebnis"] == "Geschrieben und kontrolliert." and plesk["vfile"]["exists"] is False
+    # Entfernen: kein nginx -t zwischen rm und Reconfigure (include zeigt noch auf die Datei)
+    assert plesk["log"] == ["nginx -t", "rm", "reconfigure", "nginx -t"]
+    assert plesk["included"] is False
