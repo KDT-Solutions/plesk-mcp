@@ -12,6 +12,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import server  # noqa: E402
 
 DOMAIN = "example.com"
+OLD_NGINX = "location /x {\n  return 403;\n}"
+VHOST_BASE = "/var/www/vhosts/system/example.com"
+VHOST_CONF = VHOST_BASE + "/conf"
+VHOST_FILE = VHOST_CONF + "/vhost_nginx.conf"
 
 
 class FakeClient:
@@ -25,7 +29,9 @@ def plesk(monkeypatch):
                      "nginx-serve-static": "false", "nginx-cache-enabled": "false",
                      "nginx-cache-timeout": "5", "nginx-static-extensions": "css js jpg",
                      "additional nginx settings": "location /x {\n  return 403;\n}"},
-          "fail": False, "ignore": set(), "files": {}, "updates": [], "nginx_ok": [], "nginx_tests": 0}
+          "fail": False, "ignore": set(), "files": {}, "updates": [], "nginx_ok": [], "nginx_tests": 0,
+          "vfile": {"exists": True, "owner": "root:nginx", "mode": "600", "content": OLD_NGINX + "\n"},
+          "put_fail": False, "puts": [], "reconf": [], "reconf_rc": 0, "log": []}
 
     def show():
         return "\n".join(f"[{k}]\n{v}\n" for k, v in st["values"].items())
@@ -33,20 +39,38 @@ def plesk(monkeypatch):
     def exec_(client, cmd, timeout=None, stdin_data=None):
         if cmd.startswith("plesk bin domain --show-web-server-settings"):
             return (show(), "", 0) if cmd.split()[-1] == DOMAIN else ("", "Unable to find domain", 1)
-        if "plesk bin domain --update-web-server-settings" in cmd:
+        if cmd.startswith("plesk bin domain --update-web-server-settings"):
             st["updates"].append(cmd)
             if st["fail"]:
                 return "", "ERROR", 1
-            seg = cmd[cmd.index("plesk bin domain"):].split("; rc=")[0]
-            toks = shlex.split(seg)[5:]
+            toks = shlex.split(cmd)[5:]
             for k, v in zip(toks[0::2], toks[1::2]):
-                if k == "-nginx-directives":
-                    assert v == "$f" and cmd.startswith("umask 077")
-                    k, v = "-additional nginx settings", stdin_data.decode()
                 if k[1:] not in st["ignore"]:
                     st["values"][k[1:]] = v
             return "SUCCESS", "", 0
+        vf = st["vfile"]
+        if cmd.startswith(f"b={VHOST_BASE}; c={VHOST_CONF}; f={VHOST_FILE}; ") and "stat -c" in cmd:
+            if not vf["exists"]:
+                return "ABSENT\n", "", 0
+            return f"{vf['owner']} {vf['mode']}\n{vf['content']}", "", 0
+        if cmd.startswith(f"c={VHOST_CONF}; f={VHOST_FILE}; ") and "mktemp" in cmd:
+            st["log"].append("put")
+            assert "mv -fT" in cmd and "chown root:nginx" in cmd and "chmod 600" in cmd
+            if st["put_fail"]:
+                return "", "mv: cannot move", 1
+            st["puts"].append(stdin_data.decode())
+            st["vfile"] = {"exists": True, "owner": "root:nginx", "mode": "600", "content": stdin_data.decode()}
+            return "", "", 0
+        if cmd.startswith(f"f={VHOST_FILE}; ") and "rm -f" in cmd:
+            st["log"].append("rm")
+            st["vfile"] = {"exists": False, "owner": "", "mode": "", "content": ""}
+            return "", "", 0
+        if cmd == f"plesk sbin httpdmng --reconfigure-domain {DOMAIN}":
+            st["log"].append("reconfigure")
+            st["reconf"].append(cmd)
+            return ("", "", 0) if st["reconf_rc"] == 0 else ("", "httpdmng failed", st["reconf_rc"])
         if cmd == "nginx -t":
+            st["log"].append("nginx -t")
             st["nginx_tests"] += 1
             ok = st["nginx_ok"].pop(0) if st["nginx_ok"] else True
             return ("", "nginx: configuration file /etc/nginx/nginx.conf test is successful", 0) if ok \
@@ -136,7 +160,6 @@ def test_unknown_domain(plesk):
 
 
 ROBOTS = 'add_header X-Robots-Tag "noindex, nofollow" always;'
-OLD_NGINX = "location /x {\n  return 403;\n}"
 
 
 def test_show_lists_nginx_directives(plesk):
@@ -174,20 +197,31 @@ def test_nginx_rejected_check(text):
 
 def test_nginx_preview_shows_diff(plesk):
     prev = upd({"nginx-directives": ROBOTS})
-    assert prev["ergebnis"].startswith("Vorschau") and plesk["updates"] == [] and plesk["nginx_tests"] == 0
+    assert prev["ergebnis"].startswith("Vorschau") and plesk["log"] == [] and plesk["files"] == {}
     c = prev["aenderungen"][0]
+    assert prev["datei"] == VHOST_FILE
     assert c["option"] == "nginx-directives" and c["alt"] == OLD_NGINX and c["neu"] == ROBOTS
     assert "-  return 403;" in c["diff"] and "+" + ROBOTS in c["diff"] and "hinweis" in c
 
 
-def test_nginx_allowed_directive_written(plesk):
-    res = upd({"nginx-directives": ROBOTS + "\n"}, confirm=True)
+def test_nginx_write_and_test_ok(plesk):
+    res = upd({"nginx-directives": ROBOTS}, confirm=True)
     assert res["ergebnis"] == "Geschrieben und kontrolliert." and res["backup_id"]
-    assert plesk["values"]["additional nginx settings"] == ROBOTS + "\n"
-    assert plesk["nginx_tests"] == 2  # vorher und nachher
+    assert plesk["vfile"]["content"] == ROBOTS + "\n"
+    # nginx -t vorher, nach dem Schreiben, nach dem Reconfigure; Reconfigure erst nach bestandenem Test
+    assert plesk["log"] == ["nginx -t", "put", "nginx -t", "reconfigure", "nginx -t"]
+    assert plesk["updates"] == []  # kein plesk bin domain --update-web-server-settings
     backup = json.loads(next(iter(plesk["files"].values())))
-    assert backup["settings"]["additional nginx settings"] == OLD_NGINX and backup["changed"] == ["nginx-directives"]
+    assert backup["nginx_file"] == {"exists": True, "owner": "root:nginx", "mode": "600",
+                                    "content": OLD_NGINX + "\n"}
     assert upd({"nginx-directives": ROBOTS}, confirm=True)["ergebnis"].startswith("Keine")
+
+
+def test_nginx_new_file(plesk):
+    plesk["vfile"] = {"exists": False, "owner": "", "mode": "", "content": ""}
+    res = upd({"nginx-directives": ROBOTS}, confirm=True)
+    assert res["ergebnis"] == "Geschrieben und kontrolliert."
+    assert plesk["vfile"]["content"] == ROBOTS + "\n"
 
 
 def test_nginx_rejected_directive(plesk):
@@ -196,31 +230,55 @@ def test_nginx_rejected_directive(plesk):
     with pytest.raises(ValueError):
         server.web_server_settings_update(DOMAIN, {"nginx-directives": "include /etc/x;"}, confirm=True,
                                           mode="append")
-    assert plesk["updates"] == [] and plesk["files"] == {}
+    assert plesk["log"] == [] and plesk["files"] == {}
 
 
-def test_nginx_test_failure_rolls_back(plesk):
+def test_nginx_test_failure_keeps_file(plesk):
     plesk["nginx_ok"] = [True, False, True]
     res = upd({"nginx-directives": ROBOTS}, confirm=True)
-    assert res["ergebnis"] == "FEHLER - automatisch auf das Backup zurückgestellt."
+    assert res["ergebnis"] == "FEHLER - automatisch auf den alten Stand zurückgestellt, nichts neu geladen."
     assert any(f.startswith("nginx -t") for f in res["fehlgeschlagene_pruefungen"])
-    assert plesk["values"]["additional nginx settings"].rstrip("\n") == OLD_NGINX
-    assert len(plesk["updates"]) == 2
+    assert plesk["vfile"]["content"] == OLD_NGINX + "\n"
+    assert plesk["reconf"] == []  # nichts neu geladen
+    assert "fehler_beim_zurueckstellen" not in res
 
 
 def test_nginx_test_failing_before_changes_nothing(plesk):
     plesk["nginx_ok"] = [False]
     with pytest.raises(ValueError, match="vor der Änderung"):
         upd({"nginx-directives": ROBOTS}, confirm=True)
-    assert plesk["updates"] == [] and plesk["files"] == {}
+    assert plesk["puts"] == [] and plesk["files"] == {}
 
 
-def test_nginx_http_5xx_rolls_back(plesk, monkeypatch):
+def test_nginx_write_error_without_change_no_rollback(plesk):
+    plesk["put_fail"] = True
+    res = upd({"nginx-directives": ROBOTS}, confirm=True)
+    assert res["ergebnis"] == "FEHLER - nichts geändert."
+    assert "fehler_beim_zurueckstellen" not in res
+    assert plesk["log"] == ["nginx -t", "put"] and plesk["reconf"] == []
+    assert plesk["vfile"]["content"] == OLD_NGINX + "\n"
+
+
+def test_plesk_error_without_change_no_rollback(plesk):
+    plesk["fail"] = True
+    res = upd({"nginx-cache-enabled": "true"}, confirm=True)
+    assert res["ergebnis"] == "FEHLER - nichts geändert." and "fehler_beim_zurueckstellen" not in res
+    assert len(plesk["updates"]) == 1  # kein zweiter Aufruf zum Zurückstellen
+
+
+def test_nginx_http_5xx_rolls_back_and_reconfigures(plesk, monkeypatch):
     calls = iter([(200, "a"), (503, "b")])
     monkeypatch.setattr(server, "_phps_http", lambda d: next(calls))
     res = upd({"nginx-directives": ROBOTS}, confirm=True)
-    assert res["ergebnis"].startswith("FEHLER - automatisch")
-    assert plesk["values"]["additional nginx settings"].rstrip("\n") == OLD_NGINX
+    assert res["ergebnis"] == "FEHLER - automatisch auf den alten Stand zurückgestellt."
+    assert plesk["vfile"]["content"] == OLD_NGINX + "\n" and len(plesk["reconf"]) == 2
+
+
+def test_nginx_reconfigure_error_rolls_back(plesk):
+    plesk["reconf_rc"] = 1
+    res = upd({"nginx-directives": ROBOTS}, confirm=True)
+    assert res["ergebnis"].startswith("FEHLER - Zurückstellen ebenfalls")  # 2. Reconfigure scheitert auch
+    assert plesk["vfile"]["content"] == OLD_NGINX + "\n"
 
 
 def test_nginx_append(plesk):
@@ -231,26 +289,41 @@ def test_nginx_append(plesk):
     res = json.loads(server.web_server_settings_update(DOMAIN, {"nginx-directives": ROBOTS}, confirm=True,
                                                        mode="append"))
     assert res["ergebnis"] == "Geschrieben und kontrolliert."
-    assert plesk["values"]["additional nginx settings"] == OLD_NGINX + "\n" + ROBOTS + "\n"
+    assert plesk["vfile"]["content"] == OLD_NGINX + "\n" + ROBOTS + "\n"
     again = json.loads(server.web_server_settings_update(DOMAIN, {"nginx-directives": ROBOTS}, confirm=True,
                                                          mode="append"))
     assert again["ergebnis"].startswith("Keine")
 
 
-@pytest.mark.parametrize("kwargs", [{"mode": "prepend"}, {"mode": "append", "settings": {"nginx-cache-enabled": "true"}}])
-def test_nginx_bad_mode(plesk, kwargs):
+@pytest.mark.parametrize("kwargs", [{"mode": "prepend"},
+                                    {"mode": "append", "settings": {"nginx-cache-enabled": "true"}},
+                                    {"settings": {"nginx-directives": ROBOTS, "nginx-cache-enabled": "true"}}])
+def test_nginx_bad_call(plesk, kwargs):
     settings = kwargs.pop("settings", {"nginx-directives": ROBOTS})
     with pytest.raises(ValueError):
         server.web_server_settings_update(DOMAIN, settings, confirm=True, **kwargs)
+    assert plesk["log"] == []
+
+
+@pytest.mark.parametrize("domain", ["a/b.example.com", "..example.com", "example", "-x.example.com"])
+def test_nginx_paths_reject(domain):
+    with pytest.raises(ValueError):
+        server._web_nginx_paths(domain)
 
 
 def test_nginx_rollback(plesk):
     bid = upd({"nginx-directives": ROBOTS}, confirm=True)["backup_id"]
+    plesk["log"].clear()
+    prev = json.loads(server.web_server_settings_rollback(DOMAIN, bid))
+    assert prev["ergebnis"].startswith("Vorschau") and plesk["log"] == []
     res = json.loads(server.web_server_settings_rollback(DOMAIN, bid, confirm=True))
     assert res["ergebnis"] == "Geschrieben und kontrolliert."
-    assert plesk["values"]["additional nginx settings"].rstrip("\n") == OLD_NGINX
-    # Backup eines Updates ohne nginx-directives fasst die Anweisungen nicht an
-    bid2 = upd({"nginx-cache-enabled": "true"}, confirm=True)["backup_id"]
-    plesk["values"]["additional nginx settings"] = ROBOTS
-    json.loads(server.web_server_settings_rollback(DOMAIN, bid2, confirm=True))
-    assert plesk["values"]["additional nginx settings"] == ROBOTS
+    assert plesk["vfile"]["content"] == OLD_NGINX + "\n"
+    assert plesk["log"] == ["nginx -t", "put", "nginx -t", "reconfigure", "nginx -t"]
+
+
+def test_nginx_rollback_removes_new_file(plesk):
+    plesk["vfile"] = {"exists": False, "owner": "", "mode": "", "content": ""}
+    bid = upd({"nginx-directives": ROBOTS}, confirm=True)["backup_id"]
+    res = json.loads(server.web_server_settings_rollback(DOMAIN, bid, confirm=True))
+    assert res["ergebnis"] == "Geschrieben und kontrolliert." and plesk["vfile"]["exists"] is False
