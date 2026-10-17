@@ -51,7 +51,6 @@ services:
       - PLESK_HELPER_TIMEOUT=${PLESK_HELPER_TIMEOUT:-600}
       - AUDIT_LOG_FILE=${AUDIT_LOG_FILE:-}
       - MCP_API_KEY=${MCP_API_KEY}
-      - MCP_TRANSPORT=http
       - MCP_HOST=0.0.0.0
       - MCP_PORT=8000
     ports:

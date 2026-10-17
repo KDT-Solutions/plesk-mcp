@@ -68,7 +68,6 @@ def vhost(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_helper_session_factory", LocalSession)
     monkeypatch.setattr(server, "_vhost_ctx", lambda d: dict(ctx))
     monkeypatch.setattr(server, "_VHOST_BASE", str(root))
-    monkeypatch.setattr(server, "_HTTP_MODE", True)
     monkeypatch.setattr(server, "_PUBLIC_BASE_URL", "https://upload.example.com")
     monkeypatch.setattr(server, "_UPLOAD_MIN_FREE", 0)
     server._uploads.clear()
