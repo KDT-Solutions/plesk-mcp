@@ -56,7 +56,7 @@ Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven K
 | `MCP_API_KEY` | ja | – | Statisches Bearer-Token zum Schutz des öffentlichen Endpoints. Ohne dieses Token startet der Server nicht (fail-safe) |
 | `MCP_HOST` | nein | `0.0.0.0` | Bind-Adresse des HTTP-Servers *innerhalb* des Containers |
 | `MCP_PORT` | nein | `8000` | Port des HTTP-Servers *innerhalb* des Containers |
-| `MCP_BIND_ADDR` | nein | `127.0.0.1` | Bind-Adresse *auf dem Docker-Host* (docker-compose Port-Mapping) |
+| `MCP_BIND_ADDR` | nein | `0.0.0.0` | Bind-Adresse *auf dem Docker-Host* (docker-compose Port-Mapping) |
 | `MCP_HOST_PORT` | nein | `8422` | Port *auf dem Docker-Host* (docker-compose Port-Mapping) |
 
 ## Image-Build (GitHub Actions → GitHub Container Registry)
@@ -75,10 +75,10 @@ Das Docker-Image wird bei jedem Push auf `main` automatisch per GitHub Actions g
 
 ## Netzwerk / Reverse-Proxy
 
-Der Container bindet standardmässig nur auf `127.0.0.1:8422` auf dem Docker-Host - nicht direkt öffentlich erreichbar. Für den Zugriff aus einer Cloud-Claude-Session braucht es zusätzlich:
+Der Container bindet standardmässig auf `0.0.0.0:8422` auf dem Docker-Host (alle Interfaces, wie bei allen MCP-Stacks); der Zugriff ist durch das Bearer-Token geschützt. Für den Zugriff aus einer Cloud-Claude-Session braucht es zusätzlich:
 
 1. Eine eigene Subdomain (z.B. `plesk-mcp.deine-domain.ch`)
-2. Einen Reverse-Proxy (Plesk/nginx) mit TLS-Zertifikat, der auf `127.0.0.1:8422` weiterleitet (Endpoint-Pfad: `/mcp`)
+2. Einen Reverse-Proxy (Plesk/nginx) mit TLS-Zertifikat, der auf `<Host-IP>:8422` weiterleitet (Endpoint-Pfad: `/mcp`)
 3. In der Cloud-Claude-Session wird der Server dann als Remote-MCP mit `https://plesk-mcp.deine-domain.ch/mcp` und dem `MCP_API_KEY` als Bearer-Token eingebunden - im Connector-Setup **"Keine Anmeldung"** wählen (kein OAuth) und einen Request-Header `Authorization: Bearer <MCP_API_KEY>` hinzufügen
 
 ## Sicherheit
