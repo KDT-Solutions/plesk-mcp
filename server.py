@@ -1,14 +1,3 @@
-#!/usr/bin/env python3
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#   "mcp[cli]>=2.0.0,<3.0.0",
-#   "paramiko>=3.4.0",
-#   "httpx>=0.27.0",
-#   "starlette>=0.27.0",
-#   "uvicorn>=0.23.0",
-# ]
-# ///
 """
 plesk-mcp
 
@@ -50,10 +39,9 @@ wp_option_update/wp_option_rollback einzelne freigegebene WordPress-Optionen
 (keine globale Freischaltung), write_vhost_file und die replace_*-Tools legen
 vor dem Überschreiben automatisch ein Backup der alten Version an.
 
-Transport wird über die Umgebungsvariable MCP_TRANSPORT gesteuert:
-- "stdio" (Standard) - für die lokale Nutzung via uv/Claude Desktop.
-- "http" - startet den Server als HTTP-Dienst (Streamable HTTP) für den Cloud-
-  Einsatz, z.B. hinter einem Reverse-Proxy. Erfordert MCP_API_KEY.
+Läuft ausschliesslich als HTTP-Dienst (Streamable HTTP) im Docker-Container
+hinter einem Reverse-Proxy und erfordert MCP_API_KEY. Ein lokaler Betrieb
+(stdio/uv) ist nicht vorgesehen.
 
 Alle Zugangsdaten (SSH, Plesk-API-Key, MCP_API_KEY) werden ausschliesslich
 über Umgebungsvariablen gesetzt - es sind keine echten Zugangsdaten im Code
@@ -87,30 +75,10 @@ import paramiko
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-# Force UTF-8 on Windows where default may be cp1252
-if sys.platform == "win32":
-    if hasattr(sys.stdin, "reconfigure"):
-        try:
-            sys.stdin.reconfigure(encoding="utf-8")
-        except Exception:
-            pass
-    if hasattr(sys.stdout, "reconfigure"):
-        try:
-            sys.stdout.reconfigure(encoding="utf-8")
-        except Exception:
-            pass
 
-# HTTP mode: MCP_TRANSPORT=http (Cloud/Docker) statt stdio (lokal, Standard)
-_HTTP_MODE = os.environ.get("MCP_TRANSPORT", "stdio").lower() in ("http", "streamable-http")
 _HTTP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
 _HTTP_PORT = int(os.environ.get("MCP_PORT", "8000"))
 _MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
-
-if _HTTP_MODE and not _MCP_API_KEY:
-    raise RuntimeError(
-        "MCP_TRANSPORT=http erfordert MCP_API_KEY (statisches Bearer-Token) - "
-        "aus Sicherheitsgruenden kein Start ohne Token."
-    )
 
 # Version = <Major.Minor>.<Patch>. Major.Minor wird hier von Hand gepflegt, der
 # Patch-Teil zaehlt automatisch: Anzahl Commits, die eine der build-relevanten
@@ -3188,8 +3156,8 @@ def upload_begin(
     """
     if not confirm:
         raise ValueError("confirm=true erforderlich - der Upload schreibt auf dem Produktivserver.")
-    if not _HTTP_MODE or not _PUBLIC_BASE_URL:
-        raise ValueError("Upload nur im HTTP-Modus mit gesetzter PUBLIC_BASE_URL verfügbar.")
+    if not _PUBLIC_BASE_URL:
+        raise ValueError("Upload nur mit gesetzter PUBLIC_BASE_URL verfügbar.")
     limit = _limit_bytes(max_bytes)
     sha = _check_sha(sha256)
     ctx, parts, plan = _prepare_write(domain, path, allow_executable)
@@ -6792,7 +6760,7 @@ def optimize_images(
     groesste_ersparnisse, uebersprungen_details und fehler zeigen höchstens
     50 Einträge; "listen_gesamt" nennt die Gesamtzahl, "gekuerzt" ob gekürzt.
 
-    hintergrund=true (nur HTTP-Modus): kehrt sofort mit "job_id" zurück, der
+    hintergrund=true: kehrt sofort mit "job_id" zurück, der
     ganze Pfad läuft als EIN Job ohne Zeitbudget, ohne max_files und
     weiter_ab, mit EINEM Backup (backup_run_id = job_id) und 300 s pro
     Werkzeugaufruf (IMAGE_OPT_BG_TOOL_TIMEOUT); jpegoptim/optipng laufen mit
@@ -6805,10 +6773,6 @@ def optimize_images(
     if not dry_run and not confirm:
         raise _UserError("Zum Ausführen dry_run=false UND confirm=true setzen - ändert Dateien auf dem "
                          "Produktivserver.")
-    if hintergrund and not _HTTP_MODE:
-        raise _UserError("hintergrund=true ist nur im HTTP-Modus (Docker) verfügbar - im stdio-Modus gibt es "
-                         "keinen langlebigen Serverprozess, der den Job weiterführt. Ohne hintergrund in "
-                         "Teilläufen arbeiten (weiter_ab).")
     if hintergrund and (weiter_ab or "").strip():
         raise _UserError("weiter_ab gilt nur im Vordergrund - ein Hintergrundjob bearbeitet den ganzen Pfad.")
     if not hintergrund and (not isinstance(max_files, int) or not 1 <= max_files <= _IMG_MAX_FILES):
@@ -8076,12 +8040,13 @@ async def _run_http_server() -> None:
 
 
 def main() -> None:
-    if _HTTP_MODE:
-        import asyncio
+    if not _MCP_API_KEY:
+        raise RuntimeError(
+            "MCP_API_KEY (statisches Bearer-Token) fehlt - aus Sicherheitsgruenden kein Start ohne Token."
+        )
+    import asyncio
 
-        asyncio.run(_run_http_server())
-    else:
-        mcp.run(transport="stdio")
+    asyncio.run(_run_http_server())
 
 
 if __name__ == "__main__":

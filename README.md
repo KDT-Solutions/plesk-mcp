@@ -1,40 +1,12 @@
 # Plesk MCP Connector
 
-MCP-Server für Diagnose (und, mit expliziter Bestätigung, gezielte Datei-Edits) auf einem Plesk-Server. Läuft in zwei Betriebsarten:
-
-- **stdio (lokal)** — klassischer lokaler MCP-Server via `uv`/Claude Desktop.
-- **HTTP (Cloud)** — als Docker-Container mit Streamable-HTTP-Transport (z.B. via Portainer), für den Zugriff aus Cloud-Sessions ohne laufenden lokalen Rechner.
+MCP-Server für Diagnose (und, mit expliziter Bestätigung, gezielte Datei-Edits) auf einem Plesk-Server. Läuft ausschliesslich als Docker-Container mit Streamable-HTTP-Transport (z.B. via Portainer) hinter einem Reverse-Proxy. Ein lokaler Betrieb (stdio/`uv`) ist nicht vorgesehen.
 
 Drei Datenquellen: SSH/SFTP (für alles, was nur auf Betriebssystem-Ebene existiert - PHP-FPM-Status, systemd-Journal, OOM-Kills, Disk-Nutzung, Serverlast, Vhost-Dateizugriff - sowie für Plesk-CLI-Befehle), die Plesk-REST-API (für strukturierte Plesk-eigene Daten wie Domains/Subscriptions über das `plesk_api_get`-Tool) und MySQL/MariaDB direkt (`db_list`/`db_query`/`db_search`, read-only, über den Plesk-internen Admin-DB-Zugang - siehe Abschnitt "Sicherheit").
 
 Alle Zugangsdaten (SSH, Plesk-API-Key, Auth-Token) werden ausschliesslich über Umgebungsvariablen konfiguriert - im Code stehen keine Secrets. Dieses Repo ist **öffentlich**: Code, README, Tests und Beispiele enthalten keine echten Hostnamen, IPs, Domains, Tokens oder Kundennamen - nur Platzhalter wie `example.com`, `plesk-mcp.example.com` oder `upload.example.com`. Echte Werte gehören ausschliesslich in die Umgebungsvariablen (z.B. in Portainer), nie ins Repo.
 
 Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven Kommandos (Whitelist + Blacklist in `server.py`), und das `plesk_api_get`-Tool kann nur GET-Requests stellen. Ausnahme: `write_vhost_file`, `replace_in_vhost_file`/`replace_in_vhost_files`, `set_php_handler`, `php_settings_update`/`php_settings_rollback`, `web_server_settings_update`/`web_server_settings_rollback`, `optimize_images`/`image_job`/`image_backups`, `delete_vhost_backup`, `delete_vhost_log`, `dns_add_record`, `dns_delete_record` und `dns_update_record` sowie `imunify_ignore_add`/`imunify_ignore_remove`, `wp_option_update`/`wp_option_rollback` und die Datei-Tools `upload_begin`, `fetch_to_vhost`, `move_vhost_file`, `delete_vhost_file`, `restore_vhost_trash`, `empty_vhost_trash` dürfen schreiben - `write_vhost_file`, die beiden `replace_*`-Tools und `delete_vhost_backup` Dateien innerhalb von `/var/www/vhosts/<domain>/` anlegen/überschreiben/ändern/löschen (Backups), `delete_vhost_log` Logdateien unter `/var/www/vhosts/<domain>/logs/` löschen (rotierte) bzw. auf 0 Bytes leeren (aktive), die drei `dns_*`-Tools DNS-Resource-Records der Domain-Zone anlegen/entfernen/ändern (`dns_update_record` kombiniert Löschen+Neuanlegen für einen bestehenden Record in einem Aufruf), die beiden Imunify-Tools ausschliesslich die Imunify360-Malware-Ignore-Liste, die beiden `wp_option_*`-Tools einzelne freigegebene WordPress-Optionen, `set_php_handler` den PHP-Handler einer Domain (nur auf einen auf dem Server aktivierten Handler), `php_settings_update`/`php_settings_rollback` freigegebene PHP-Werte einer Domain (z.B. `memory_limit`, PHP-FPM-Werte), die Datei-Tools Dateien unter `/var/www/vhosts/<domain>/` hochladen, verschieben, in den Papierkorb legen oder endgültig löschen (siehe "Datei-Upload" und "Dateiverwaltung"). Alle schreibenden Tools erfordern zwingend `confirm=true` pro Aufruf (keine globale Freischaltung), `write_vhost_file` und die `replace_*`-Tools legen vor dem Überschreiben automatisch ein Backup der alten Version an. Details siehe Abschnitt "Sicherheit" unten.
-
-## Lokale Installation (stdio)
-
-Kein `pip install` nötig - `uv` lädt die Dependencies automatisch beim ersten Start (siehe PEP-723-Metadaten am Dateianfang von `server.py`).
-
-### Konfiguration in Claude Desktop (claude_desktop_config.json)
-
-```json
-{
-  "mcpServers": {
-    "plesk": {
-      "command": "uv",
-      "args": ["run", "C:\\Pfad\\zu\\plesk-mcp\\server.py"],
-      "env": {
-        "PLESK_SSH_HOST": "dein-plesk-server.example.com",
-        "PLESK_SSH_PORT": "22",
-        "PLESK_SSH_USER": "root",
-        "PLESK_SSH_PASSWORD": "dein-passwort"
-      }
-    }
-  }
-}
-```
-
-Ohne gesetztes `MCP_TRANSPORT` (oder mit `MCP_TRANSPORT=stdio`) verhält sich der Server als klassischer lokaler MCP-Server - die Cloud/HTTP-Erweiterung ändert am lokalen Betrieb nichts.
 
 ## Umgebungsvariablen
 
@@ -81,8 +53,7 @@ Ohne gesetztes `MCP_TRANSPORT` (oder mit `MCP_TRANSPORT=stdio`) verhält sich de
 | `IMAGE_OPT_BG_TOOL_TIMEOUT` | nein | `300` | Timeout in Sekunden pro Aufruf von `jpegoptim`/`optipng` im Hintergrundmodus (`optimize_images(hintergrund=true)`) |
 | `REPLACE_MAX_BYTES` | nein | `5242880` | Maximale Dateigrösse in Bytes für `replace_in_vhost_file(s)` (Standard 5 MB) |
 | `AUDIT_LOG_FILE` | nein | – | Optionaler Pfad im Container für das Audit-Log (zusätzlich zu stderr) |
-| `MCP_TRANSPORT` | nein | `stdio` | `stdio` = lokal (Standard) / `http` = Cloud-Modus (Streamable HTTP) |
-| `MCP_API_KEY` | ja, nur im HTTP-Modus | – | Statisches Bearer-Token zum Schutz des öffentlichen Endpoints. Ohne dieses Token startet der HTTP-Modus nicht (fail-safe) |
+| `MCP_API_KEY` | ja | – | Statisches Bearer-Token zum Schutz des öffentlichen Endpoints. Ohne dieses Token startet der Server nicht (fail-safe) |
 | `MCP_HOST` | nein | `0.0.0.0` | Bind-Adresse des HTTP-Servers *innerhalb* des Containers |
 | `MCP_PORT` | nein | `8000` | Port des HTTP-Servers *innerhalb* des Containers |
 | `MCP_BIND_ADDR` | nein | `127.0.0.1` | Bind-Adresse *auf dem Docker-Host* (docker-compose Port-Mapping) |
@@ -112,7 +83,7 @@ Der Container bindet standardmässig nur auf `127.0.0.1:8422` auf dem Docker-Hos
 
 ## Sicherheit
 
-- Der HTTP-Modus startet nur, wenn `MCP_API_KEY` gesetzt ist - es gibt also nie einen ungeschützten öffentlichen Endpoint.
+- Der Server startet nur, wenn `MCP_API_KEY` gesetzt ist - es gibt also nie einen ungeschützten öffentlichen Endpoint.
 - Jeder HTTP-Request muss den Header `Authorization: Bearer <MCP_API_KEY>` mitschicken, sonst Antwort `401 unauthorized`.
 - `run_diagnostic` prüft Programmname gegen eine Whitelist und blockt bekannte destruktive Subcommands/Shell-Konstrukte zusätzlich per Blacklist-Substring-Check. Kein Freibrief für beliebige Shell-Befehle.
 - `plesk_api_get` kann nur GET-Requests stellen - schreibender Zugriff auf die Plesk-REST-API ist über dieses Tool nicht möglich.
@@ -230,7 +201,7 @@ Alternativ lädt `fetch_to_vhost(domain, path, url, sha256=None, allow_executabl
 - Rate-Limit pro IP (`UPLOAD_RATE_LIMIT_PER_MIN`, zählt auch fehlgeschlagene Versuche), maximal `UPLOAD_MAX_CONCURRENT` gleichzeitige Uploads (sonst `429`).
 - Fehlerantworten enthalten nur einen Code (`too_large`, `sha256_mismatch`, `no_space`, ...), keine internen Pfade oder Stacktraces.
 - Upload-Registry liegt im Speicher des Containers: Ein Neustart verwirft offene Tokens (Upload neu starten).
-- Nur im HTTP-Modus mit gesetzter `PUBLIC_BASE_URL` verfügbar.
+- Nur mit gesetzter `PUBLIC_BASE_URL` verfügbar.
 
 **SSRF-Schutz `fetch_to_vhost`**: nur `https`, keine Zugangsdaten in der URL, max. 3 Redirects, Timeout `FETCH_TIMEOUT`, Grössenlimit (auch per `Content-Length`). Der Hostname wird aufgelöst, alle Adressen müssen öffentlich sein (Loopback, private Netze, Link-Local inkl. `169.254.169.254`, CGNAT, Multicast, reservierte Bereiche und die IPv6-Entsprechungen inkl. IPv4-mapped werden blockiert). Die Verbindung geht direkt an die geprüfte IP (Host-Header und TLS-SNI/Zertifikatsprüfung auf den Originalnamen), Proxy-Umgebungsvariablen werden ignoriert. Bei jedem Redirect wird das Ziel erneut geprüft und gepinnt (gegen DNS-Rebinding).
 
@@ -406,7 +377,6 @@ Grosse Dateien laufen im Vordergrund in den 15-Sekunden-Timeout, weil ein Aufruf
 - Fortschrittswerte kommen vom Worker, der als Subscription-User läuft; der MCP-Server prüft Typen und Grössen, bevor er sie übernimmt. `job_id` wird wie `run_id` nur nach dem festen Muster akzeptiert und nie in ein Kommando eingesetzt.
 - Jeder Jobstart (`image_job_start`), Abschluss (`image_job_done` bzw. `image_job_failed`) und Abbruch (`image_job_cancel`) steht im Audit-Log; `image_job_done` entfällt beim Probelauf.
 - Im Hintergrund setzt der Worker sich selbst auf `nice 10` (vererbt an `jpegoptim`/`optipng`) und startet die Werkzeuge mit `ionice -c2 -n7` (wenn `/usr/bin/ionice` vorhanden ist; `prioritaet` in der Rückgabe zeigt beides). **CloudLinux LVE**: Der Worker startet per `runuser`, und `pam_lve` ist auf dem Server nur an `su` und `sshd` gebunden (`grep -l pam_lve /etc/pam.d/runuser /etc/pam.d/su /etc/pam.d/sshd` liefert nur `su` und `sshd`). Der Worker läuft deshalb **ausserhalb** der LVE-Limits des Accounts; nice/ionice sind die einzige Bremse, die Last zählt nicht gegen das Kundenkonto. Prüfen lässt sich das während eines Jobs mit `lveps -p` (der Prozess erscheint dann unter keiner LVE-ID).
-- Nur im HTTP-Modus (Docker): im stdio-Modus gibt es keinen langlebigen Serverprozess, `hintergrund=true` wird dort abgelehnt.
 
 Beispiel: `optimize_images(domain="example.com", path="httpdocs/wp-content/uploads", dry_run=false, confirm=true, hintergrund=true)` liefert `job_id` `20260101120000-1a2b3c4d`; `image_job(domain="example.com", action="status", job_id="20260101120000-1a2b3c4d")` zeigt den Fortschritt und später das Ergebnis; Timeouts eines Vordergrundlaufs gezielt nachholen: `optimize_images(domain="example.com", dateien=["httpdocs/wp-content/uploads/2024/gross.png"], dry_run=false, confirm=true, hintergrund=true)`.
 

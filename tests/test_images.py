@@ -667,7 +667,6 @@ def run_local_bg(c, args, job):
 def bg(vhost, monkeypatch):
     audit = []
     monkeypatch.setattr(server, "_img_run_bg", run_local_bg)
-    monkeypatch.setattr(server, "_HTTP_MODE", True)
     monkeypatch.setattr(server, "_audit", lambda action, **f: audit.append((action, f)))
     server._img_jobs.clear()
     yield audit
@@ -823,14 +822,6 @@ def test_bg_max_jobs(vhost, bg, monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="laufen bereits 1 Hintergrundjobs"):
         server.optimize_images("other.example.com", hintergrund=True)
     json.loads(server.image_job(DOMAIN, "cancel", jid, confirm=True))
-
-
-def test_bg_rejected_in_stdio(vhost, bg, monkeypatch):
-    monkeypatch.setattr(server, "_HTTP_MODE", False)
-    make_jpeg(vhost / "httpdocs/uploads/a.jpg")
-    with pytest.raises(ValueError, match="nur im HTTP-Modus"):
-        start()
-    assert not server._img_jobs
 
 
 def test_bg_rejects_weiter_ab(vhost, bg):
