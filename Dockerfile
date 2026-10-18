@@ -19,4 +19,9 @@ ENV GIT_SHA=$GIT_SHA \
 
 EXPOSE 8000
 
+# /healthz ist ohne Auth erreichbar und prüft nur, ob der Prozess antwortet
+# (nicht Plesk/SSH). Kein curl/wget im Image, darum per Python/urllib.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD ["python", "-c", "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.environ.get('MCP_PORT', '8000') + '/healthz', timeout=4)"]
+
 CMD ["python", "server.py"]

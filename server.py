@@ -85,7 +85,7 @@ _MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 # Dateien (server.py, Dockerfile, requirements.txt, Workflow) geaendert haben.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.24"
+_VERSION_BASE = "0.25"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -8017,6 +8017,12 @@ def _build_http_app():
     )
 
     async def app(scope, receive, send):
+        # /healthz: Docker-Healthcheck ohne Auth, nur {"status": "ok"} - keine Version,
+        # keine Konfiguration. Prüft nur, ob der Prozess antwortet, nicht Plesk/SSH
+        # (sonst würde ein Ausfall des Plesk-Servers den Container unhealthy machen).
+        if scope["type"] == "http" and scope["path"] == "/healthz" and scope["method"] in ("GET", "HEAD"):
+            await JSONResponse({"status": "ok"})(scope, receive, send)
+            return
         # /upload/{id}: eigenes Einmal-Token statt MCP_API_KEY (siehe upload_begin),
         # ohne gültiges Token immer 401 - gleich stark wie der MCP-Endpunkt.
         if scope["type"] == "http" and scope["path"].startswith("/upload/"):
