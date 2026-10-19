@@ -7,7 +7,8 @@
   - `mode`: `replace` (Standard) oder `append`; `stylesheet` leer = aktives Theme, sonst Theme-Verzeichnis (Hinweis, wenn es nicht das aktive ist).
   - Ohne `confirm=true` nur Vorschau mit Unified-Diff alt/neu; mit `confirm=true` vorher JSON-Backup des alten CSS unter `/var/www/vhosts/<domain>/.plesk-mcp/wp-custom-css-backups/<backup_id>.json` (0600, Subscription-User), dann Schreiben, erneut Lesen und Kontrolle, danach `wp cache flush` (best effort). Grenzen: 512 KB, kein Nullbyte, kein `</style`.
   - `wp_custom_css_rollback(backup_id)` stellt das damalige komplette CSS wieder her und legt vorher selbst ein Backup an.
-- Tests: `tests/test_wp_custom_css.py` (Validierung ohne Serverzugriff).
+- Neue Tools `wp_comment_list` und `wp_comment_moderate` zur Kommentar-Moderation per WP-CLI (z.B. Spam-Kommentare aus "Bitte moderiere"-Mails erledigen). `wp_comment_list` listet Kommentare nach Status (`hold`/`approve`/`spam`/`trash`/`all`, max. 200, Textsuche, Inhalt auf 300 Zeichen gekürzt) plus Zähler. `wp_comment_moderate` führt `spam`, `trash`, `approve`, `unapprove`, `unspam`, `untrash` oder `delete` (endgültig, `--force`) für 1-200 IDs aus - ohne `confirm=true` nur Vorschau mit Autor/E-Mail/Inhalt/Status, mit `confirm=true` Ausführung als Subscription-User und Statuskontrolle je Kommentar danach; WordPress-Hooks (Akismet) laufen mit.
+- Tests: `tests/test_wp_custom_css.py`, `tests/test_wp_comment.py` (Validierung ohne Serverzugriff).
 
 ## 0.25
 
