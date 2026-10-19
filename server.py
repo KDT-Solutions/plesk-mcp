@@ -4600,6 +4600,459 @@ def wp_comment_moderate(
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+# ---------------------------------------------------------------------------
+# WooCommerce-Gutscheine (Coupons) über die WooCommerce-CLI (wp wc shop_coupon)
+# ---------------------------------------------------------------------------
+
+_WC_COUPON_BACKUP_SUBDIR = ".plesk-mcp/wc-coupon-backups"
+_WC_COUPON_CODE_RE = re.compile(r"^[^\s\x00'\"\\]{1,100}$")
+_WC_DISCOUNT_TYPES = ("percent", "fixed_cart", "fixed_product")
+_WC_COUPON_STATUSES = ("any", "publish", "draft", "pending", "private", "trash")
+# Erlaubte Felder für create/update: Name -> Typ (REST-Schema von WooCommerce)
+_WC_COUPON_FIELDS: dict[str, str] = {
+    "code": "str", "amount": "money", "discount_type": "enum", "description": "str",
+    "date_expires": "date", "individual_use": "bool", "product_ids": "ids",
+    "excluded_product_ids": "ids", "usage_limit": "int", "usage_limit_per_user": "int",
+    "limit_usage_to_x_items": "int", "free_shipping": "bool", "product_categories": "ids",
+    "excluded_product_categories": "ids", "exclude_sale_items": "bool",
+    "minimum_amount": "money", "maximum_amount": "money", "email_restrictions": "emails",
+    "status": "str",
+}
+_WC_COUPON_LIST_FIELDS = (
+    "id,code,amount,discount_type,status,description,date_expires,usage_count,"
+    "usage_limit,usage_limit_per_user,individual_use,free_shipping,minimum_amount,"
+    "maximum_amount,product_ids,excluded_product_ids,product_categories,"
+    "excluded_product_categories,exclude_sale_items,email_restrictions,date_created,date_modified"
+)
+_WC_MONEY_RE = re.compile(r"^\d{1,9}(\.\d{1,4})?$")
+_WC_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2})?$")
+_WC_EMAIL_RE = re.compile(r"^[^@\s'\"\\]{1,64}@[^@\s'\"\\]{1,190}$")
+
+
+def _wc_check_code(code: str) -> str:
+    c = str(code).strip()
+    if not _WC_COUPON_CODE_RE.match(c):
+        raise ValueError(f"Ungültiger Gutscheincode {code!r} (max. 100 Zeichen, keine Leer-/Anführungszeichen).")
+    return c
+
+
+def _wc_check_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    """Validiert Gutschein-Felder gegen die Whitelist und normalisiert die Typen."""
+    if not isinstance(fields, dict) or not fields:
+        raise ValueError("fields muss ein nicht-leeres dict sein.")
+    out: dict[str, Any] = {}
+    for key, val in fields.items():
+        kind = _WC_COUPON_FIELDS.get(key)
+        if kind is None:
+            raise ValueError(f"Unbekanntes Feld {key!r}. Erlaubt: {', '.join(_WC_COUPON_FIELDS)}")
+        if kind == "str":
+            if key == "code":
+                out[key] = _wc_check_code(val)
+                continue
+            if key == "status" and val not in _WC_COUPON_STATUSES[1:]:
+                raise ValueError(f"status muss eines von {', '.join(_WC_COUPON_STATUSES[1:])} sein.")
+            s = "" if val is None else str(val)
+            if "\x00" in s or len(s) > 2000:
+                raise ValueError(f"Ungültiger Wert für {key}.")
+            out[key] = s
+        elif kind == "money":
+            s = "" if val is None else str(val).strip()
+            if s and not _WC_MONEY_RE.match(s):
+                raise ValueError(f"{key} muss ein Betrag wie 10 oder 12.50 sein (oder leer).")
+            out[key] = s
+        elif kind == "enum":
+            if val not in _WC_DISCOUNT_TYPES:
+                raise ValueError(f"discount_type muss eines von {', '.join(_WC_DISCOUNT_TYPES)} sein.")
+            out[key] = val
+        elif kind == "date":
+            s = "" if val is None else str(val).strip()
+            if s and not _WC_DATE_RE.match(s):
+                raise ValueError(f"{key} muss YYYY-MM-DD oder YYYY-MM-DDTHH:MM:SS sein (leer = kein Ablauf).")
+            out[key] = s or None
+        elif kind == "bool":
+            if not isinstance(val, bool):
+                raise ValueError(f"{key} muss true/false sein.")
+            out[key] = val
+        elif kind == "int":
+            if val is None or val == "":
+                out[key] = 0
+            elif isinstance(val, bool) or not isinstance(val, int) or val < 0:
+                raise ValueError(f"{key} muss eine ganze Zahl >= 0 sein (0 = unbegrenzt).")
+            else:
+                out[key] = val
+        elif kind == "ids":
+            if not isinstance(val, list) or any(isinstance(i, bool) or not isinstance(i, int) or i <= 0 for i in val):
+                raise ValueError(f"{key} muss eine Liste positiver IDs sein (leere Liste = keine).")
+            out[key] = list(dict.fromkeys(val))
+        elif kind == "emails":
+            if not isinstance(val, list) or any(not isinstance(e, str) or not _WC_EMAIL_RE.match(e.strip()) for e in val):
+                raise ValueError("email_restrictions muss eine Liste gültiger E-Mail-Adressen sein.")
+            out[key] = [e.strip().lower() for e in val]
+    return out
+
+
+def _wc_cli_args(fields: dict[str, Any]) -> list[str]:
+    """Felder als --key=value für die WooCommerce-CLI (Listen als JSON)."""
+    args = []
+    for key, val in fields.items():
+        if isinstance(val, bool):
+            args.append(f"--{key}={'true' if val else 'false'}")
+        elif isinstance(val, list):
+            args.append(f"--{key}={json.dumps(val)}")
+        elif val is None:
+            args.append(f"--{key}=")
+        else:
+            args.append(f"--{key}={val}")
+    return args
+
+
+def _wc_context(client, ctx, wp_dir: str) -> str:
+    """Prüft WooCommerce und liefert die ID eines Administrators für --user."""
+    _, err, rc = _wp_run_as_user(
+        client, ctx,
+        [ctx["php"], _WP_CLI_PATH, f"--path={wp_dir}", "--no-color", "plugin", "is-active", "woocommerce"],
+        cwd=wp_dir,
+    )
+    if rc != 0:
+        raise ValueError("WooCommerce ist in dieser Installation nicht aktiv.")
+    out = _wp_cli(client, ctx, wp_dir, ["user", "list", "--role=administrator", "--field=ID",
+                                        "--orderby=ID", "--order=ASC", "--number=1"])
+    uid = out.strip().splitlines()[0].strip() if out.strip() else ""
+    if not uid.isdigit():
+        raise ValueError("Kein Administrator-Benutzer gefunden - die WooCommerce-CLI braucht einen (--user).")
+    return uid
+
+
+def _wc_coupon_view(c: dict[str, Any]) -> dict[str, Any]:
+    keys = _WC_COUPON_LIST_FIELDS.split(",")
+    return {k: c.get(k) for k in keys if k in c}
+
+
+def _wc_coupon_find(client, ctx, wp_dir: str, uid: str, coupon: str) -> dict[str, Any] | None:
+    """Gutschein per ID (Ziffern) oder Code; None wenn nicht vorhanden."""
+    c = str(coupon).strip()
+    if c.isdigit():
+        out, err, rc = _wp_run_as_user(
+            client, ctx,
+            [ctx["php"], _WP_CLI_PATH, f"--path={wp_dir}", "--no-color", "wc", "shop_coupon", "get", c,
+             f"--user={uid}", f"--fields={_WC_COUPON_LIST_FIELDS}", "--format=json"],
+            cwd=wp_dir,
+        )
+        if rc != 0:
+            if "invalid" in (err + out).lower() or "not found" in (err + out).lower():
+                return None
+            raise SSHError(f"WP-CLI 'wp wc shop_coupon get' fehlgeschlagen: {(err or out).strip()[-300:]}")
+        data = _wp_json(out)
+        return data if isinstance(data, dict) and data.get("id") else None
+    code = _wc_check_code(c)
+    rows = _wp_json(_wp_cli(client, ctx, wp_dir, [
+        "wc", "shop_coupon", "list", f"--user={uid}", f"--code={code}", "--status=any",
+        f"--fields={_WC_COUPON_LIST_FIELDS}", "--format=json",
+    ]))
+    if not isinstance(rows, list):
+        raise SSHError("Unerwartete Antwort von 'wp wc shop_coupon list'.")
+    exact = [r for r in rows if str(r.get("code", "")).lower() == code.lower()]
+    return exact[0] if exact else None
+
+
+def _wc_coupon_backup(client, ctx, wp_path: str, coupon: dict[str, Any], source: str) -> str:
+    ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    backup_id = f"{ts}-{os.urandom(4).hex()}@{ctx['domain']}"
+    record = {"id": backup_id, "created": datetime.datetime.now().isoformat(timespec="seconds"),
+              "source": source, "domain": ctx["domain"], "wp_path": wp_path, "coupon": coupon}
+    data = json.dumps(record, ensure_ascii=False, indent=2).encode("utf-8")
+    bdir = f"{ctx['home']}/{_WC_COUPON_BACKUP_SUBDIR}"
+    _, err, rc = _wp_run_as_user(
+        client, ctx,
+        ["/bin/sh", "-c", 'umask 077 && mkdir -p "$1" && set -C && cat > "$2"',
+         "sh", bdir, f"{bdir}/{backup_id}.json"],
+        cwd=ctx["home"], stdin_data=data,
+    )
+    if rc != 0:
+        raise SSHError(f"Backup konnte nicht angelegt werden - nichts geändert: {err.strip()}")
+    return backup_id
+
+
+def _wc_open(domain: str, wp_path: str):
+    """SSH + Kontext + WP-Verzeichnis + Admin-User; Aufrufer schliesst client."""
+    d = _wp_domain(domain)
+    client = _ssh_connect()
+    try:
+        ctx = _wp_context(client, d)
+        sftp = client.open_sftp()
+        try:
+            wp_dir = _wp_install_dir(sftp, d, wp_path)
+        finally:
+            sftp.close()
+        uid = _wc_context(client, ctx, wp_dir)
+    except Exception:
+        client.close()
+        raise
+    return client, ctx, wp_dir, uid, d
+
+
+@mcp.tool()
+def wc_coupon_list(
+    domain: str,
+    wp_path: str,
+    search: str = "",
+    status: str = "any",
+    limit: int = 50,
+) -> str:
+    """Listet WooCommerce-Gutscheine (Coupons) einer Installation über die
+    WooCommerce-CLI (`wp wc shop_coupon list`), neueste zuerst.
+
+    domain: z.B. "example.com"; wp_path: WordPress-Verzeichnis relativ zu
+    /var/www/vhosts/<domain>/ (z.B. "httpdocs").
+    search: optional Textsuche (Code/Beschreibung). status: "any" (Standard),
+    "publish", "draft", "pending", "private" oder "trash". limit: 1-100.
+    Rein lesend.
+    """
+    if status not in _WC_COUPON_STATUSES:
+        raise ValueError(f"status muss eines von {', '.join(_WC_COUPON_STATUSES)} sein.")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ValueError("limit muss zwischen 1 und 100 liegen.")
+    q = search.strip()
+    if "\x00" in q or len(q) > 200:
+        raise ValueError("Ungültiger Suchtext.")
+    client, ctx, wp_dir, uid, d = _wc_open(domain, wp_path)
+    try:
+        args = ["wc", "shop_coupon", "list", f"--user={uid}", f"--status={status}",
+                f"--per_page={limit}", "--orderby=date", "--order=desc",
+                f"--fields={_WC_COUPON_LIST_FIELDS}", "--format=json"]
+        if q:
+            args.append(f"--search={q}")
+        rows = _wp_json(_wp_cli(client, ctx, wp_dir, args))
+    finally:
+        client.close()
+    if not isinstance(rows, list):
+        raise SSHError("Unerwartete Antwort von 'wp wc shop_coupon list'.")
+    return json.dumps({"domain": d, "wp_path": wp_dir, "status": status, "anzahl": len(rows),
+                       "gutscheine": [_wc_coupon_view(r) for r in rows]}, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def wc_coupon_get(domain: str, wp_path: str, coupon: str) -> str:
+    """Zeigt einen WooCommerce-Gutschein mit allen Feldern - coupon ist die
+    ID (Ziffern) oder der Gutscheincode. Rein lesend.
+    """
+    client, ctx, wp_dir, uid, d = _wc_open(domain, wp_path)
+    try:
+        data = _wc_coupon_find(client, ctx, wp_dir, uid, coupon)
+    finally:
+        client.close()
+    if data is None:
+        raise ValueError(f"Gutschein {coupon!r} nicht gefunden.")
+    return json.dumps({"domain": d, "wp_path": wp_dir, "gutschein": _wc_coupon_view(data)},
+                      ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def wc_coupon_create(
+    domain: str,
+    wp_path: str,
+    code: str,
+    discount_type: str,
+    amount: str,
+    fields: dict[str, Any] | None = None,
+    confirm: bool = False,
+) -> str:
+    """Legt einen WooCommerce-Gutschein an (`wp wc shop_coupon create`, als
+    Subscription-User, nie root; WooCommerce validiert selbst).
+
+    code: Gutscheincode; discount_type: "percent", "fixed_cart" oder
+    "fixed_product"; amount: Betrag bzw. Prozent als Zahl, z.B. "10" oder
+    "12.50". fields: weitere optionale Felder, z.B. {"description": "...",
+    "date_expires": "2026-12-31", "usage_limit": 100, "usage_limit_per_user": 1,
+    "individual_use": true, "free_shipping": false, "minimum_amount": "50",
+    "product_ids": [12, 34], "email_restrictions": ["a@example.com"],
+    "exclude_sale_items": true}. Erlaubte Feldnamen siehe Fehlermeldung.
+    Ohne confirm=true nur Vorschau (und Prüfung, ob der Code schon existiert).
+    Mit confirm=true wird der Gutschein angelegt und danach zur Kontrolle
+    erneut gelesen.
+    """
+    base = _wc_check_fields({"code": code, "discount_type": discount_type, "amount": amount})
+    extra = _wc_check_fields(fields) if fields else {}
+    for k in ("code", "discount_type", "amount"):
+        extra.pop(k, None)
+    data = {**base, **extra}
+    client, ctx, wp_dir, uid, d = _wc_open(domain, wp_path)
+    try:
+        existing = _wc_coupon_find(client, ctx, wp_dir, uid, data["code"])
+        result: dict[str, Any] = {"domain": d, "wp_path": wp_dir, "felder": data}
+        if existing:
+            result["ergebnis"] = f"Code existiert bereits (ID {existing.get('id')}, Status {existing.get('status')}) - nichts angelegt. Für Änderungen wc_coupon_update verwenden."
+            result["vorhanden"] = _wc_coupon_view(existing)
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        if not confirm:
+            result["ergebnis"] = "Vorschau - nichts angelegt. Mit confirm=true ausführen."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        out = _wp_cli(client, ctx, wp_dir, ["wc", "shop_coupon", "create", f"--user={uid}",
+                                            "--porcelain", *_wc_cli_args(data)])
+        new_id = out.strip().splitlines()[-1].strip() if out.strip() else ""
+        created = _wc_coupon_find(client, ctx, wp_dir, uid, new_id) if new_id.isdigit() else None
+    finally:
+        client.close()
+    if not created:
+        raise SSHError(f"Gutschein angelegt, aber Kontrolle fehlgeschlagen (Ausgabe: {out.strip()[-200:]!r}).")
+    result["ergebnis"] = f"Gutschein angelegt (ID {created['id']}) und kontrolliert."
+    result["gutschein"] = _wc_coupon_view(created)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def _wc_coupon_change(domain: str, wp_path: str, coupon: str, fields: dict[str, Any],
+                      confirm: bool, source: str) -> str:
+    data = _wc_check_fields(fields)
+    client, ctx, wp_dir, uid, d = _wc_open(domain, wp_path)
+    try:
+        before = _wc_coupon_find(client, ctx, wp_dir, uid, coupon)
+        if before is None:
+            raise ValueError(f"Gutschein {coupon!r} nicht gefunden.")
+        changes = {k: {"alt": before.get(k), "neu": v} for k, v in data.items()
+                   if _wc_norm(before.get(k)) != _wc_norm(v)}
+        result: dict[str, Any] = {"domain": d, "wp_path": wp_dir, "id": before["id"],
+                                  "code": before.get("code"), "aenderungen": changes}
+        if not changes:
+            result["ergebnis"] = "Keine Änderung nötig - alle Werte sind bereits gesetzt."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        if not confirm:
+            result["ergebnis"] = "Vorschau - nichts geändert. Mit confirm=true ausführen."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        backup_id = _wc_coupon_backup(client, ctx, wp_path, before, source)
+        _wp_cli(client, ctx, wp_dir, ["wc", "shop_coupon", "update", str(before["id"]),
+                                      f"--user={uid}", *_wc_cli_args({k: data[k] for k in changes})])
+        after = _wc_coupon_find(client, ctx, wp_dir, uid, str(before["id"]))
+    finally:
+        client.close()
+    result["backup_id"] = backup_id
+    result["backup_datei"] = f"{ctx['home']}/{_WC_COUPON_BACKUP_SUBDIR}/{backup_id}.json"
+    mism = [k for k in changes if after is None or _wc_norm(after.get(k)) != _wc_norm(data[k])]
+    if mism:
+        result["ergebnis"] = "Geschrieben, aber Kontrolle weicht ab - Rollback mit backup_id möglich."
+        result["abweichend_nach_kontrolle"] = {k: (after or {}).get(k) for k in mism}
+    else:
+        result["ergebnis"] = "Geschrieben und kontrolliert."
+    if after:
+        result["gutschein"] = _wc_coupon_view(after)
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def wc_coupon_update(
+    domain: str,
+    wp_path: str,
+    coupon: str,
+    fields: dict[str, Any],
+    confirm: bool = False,
+) -> str:
+    """Ändert Felder eines WooCommerce-Gutscheins (`wp wc shop_coupon update`).
+    coupon: ID oder Code. fields: dict Feld -> neuer Wert, dieselben Felder
+    wie bei wc_coupon_create (inkl. "code", "amount", "discount_type",
+    "status" z.B. "draft" zum Deaktivieren, "date_expires": "" = kein Ablauf).
+    Ohne confirm=true nur Vorschau alt/neu je Feld. Mit confirm=true vorher
+    JSON-Backup des alten Stands ausserhalb des Webroots (backup_id für
+    wc_coupon_rollback), dann Schreiben und Kontrolle je Feld.
+    """
+    return _wc_coupon_change(domain, wp_path, coupon, fields, confirm, "wc_coupon_update")
+
+
+def _wc_norm(v: Any) -> Any:
+    """Vergleichsnormalisierung: WooCommerce liefert Beträge als String,
+    Datum als ISO mit Zeit, Listen ggf. in anderer Reihenfolge."""
+    if v is None or v == "":
+        return ""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, list):
+        return sorted(str(x).lower() for x in v)
+    s = str(v).strip()
+    if _WC_MONEY_RE.match(s):
+        return f"{float(s):.4f}"
+    if _WC_DATE_RE.match(s):
+        return s[:10]
+    return s
+
+
+@mcp.tool()
+def wc_coupon_rollback(backup_id: str, confirm: bool = False) -> str:
+    """Stellt die bei wc_coupon_update gesicherten Felder eines Gutscheins
+    wieder her. Ohne confirm=true nur Vorschau; legt vorher selbst ein
+    neues Backup an.
+    """
+    m = _WP_BACKUP_ID_RE.match(backup_id.strip())
+    if not m:
+        raise ValueError(f"Ungültige backup_id: {backup_id!r}")
+    bid = m.group(0)
+    d = _wp_domain(m.group(3))
+    client = _ssh_connect()
+    try:
+        ctx = _wp_context(client, d)
+        out, err, rc = _wp_run_as_user(
+            client, ctx, ["/bin/cat", "--", f"{ctx['home']}/{_WC_COUPON_BACKUP_SUBDIR}/{bid}.json"],
+            cwd=ctx["home"],
+        )
+    finally:
+        client.close()
+    if rc != 0:
+        raise ValueError(f"Backup '{bid}' nicht gefunden: {err.strip()}")
+    try:
+        record = json.loads(out)
+        coupon = record["coupon"]
+        wp_path = record["wp_path"]
+        if record.get("domain") != d or not isinstance(coupon, dict) or not coupon.get("id"):
+            raise ValueError("Inhalt passt nicht zur backup_id")
+    except (ValueError, KeyError, TypeError) as e:
+        raise ValueError(f"Backup '{bid}' ist ungültig: {e}")
+    fields = {k: coupon[k] for k in _WC_COUPON_FIELDS if k in coupon}
+    if "date_expires" in fields and fields["date_expires"]:
+        fields["date_expires"] = str(fields["date_expires"])[:19]
+    for k in ("amount", "minimum_amount", "maximum_amount"):
+        if k in fields and fields[k] is not None:
+            fields[k] = str(fields[k])
+    return _wc_coupon_change(d, wp_path, str(coupon["id"]), fields, confirm, f"wc_coupon_rollback:{bid}")
+
+
+@mcp.tool()
+def wc_coupon_delete(
+    domain: str,
+    wp_path: str,
+    coupon: str,
+    permanent: bool = False,
+    confirm: bool = False,
+) -> str:
+    """Löscht einen WooCommerce-Gutschein (`wp wc shop_coupon delete`):
+    standardmässig in den Papierkorb (in WordPress wiederherstellbar),
+    permanent=true endgültig (--force). coupon: ID oder Code.
+    Ohne confirm=true nur Vorschau. Vor dem Löschen wird ein JSON-Backup
+    des Gutscheins ausserhalb des Webroots abgelegt.
+    """
+    client, ctx, wp_dir, uid, d = _wc_open(domain, wp_path)
+    try:
+        before = _wc_coupon_find(client, ctx, wp_dir, uid, coupon)
+        if before is None:
+            raise ValueError(f"Gutschein {coupon!r} nicht gefunden.")
+        result: dict[str, Any] = {"domain": d, "wp_path": wp_dir, "permanent": permanent,
+                                  "gutschein": _wc_coupon_view(before)}
+        if not confirm:
+            result["ergebnis"] = "Vorschau - nichts gelöscht. Mit confirm=true ausführen."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        backup_id = _wc_coupon_backup(client, ctx, wp_path, before, "wc_coupon_delete")
+        args = ["wc", "shop_coupon", "delete", str(before["id"]), f"--user={uid}"]
+        if permanent:
+            args.append("--force")
+        _wp_cli(client, ctx, wp_dir, args)
+        after = _wc_coupon_find(client, ctx, wp_dir, uid, str(before["id"]))
+    finally:
+        client.close()
+    result["backup_id"] = backup_id
+    if permanent:
+        result["ergebnis"] = "Endgültig gelöscht." if after is None else "Löschen fehlgeschlagen - Gutschein existiert noch."
+    else:
+        st = (after or {}).get("status")
+        result["ergebnis"] = "In den Papierkorb verschoben." if st == "trash" else f"Status nach Löschen: {st!r} (erwartet 'trash')."
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
 @mcp.tool()
 def delete_vhost_log(
     domain: str,
