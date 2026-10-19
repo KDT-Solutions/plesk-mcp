@@ -4380,6 +4380,226 @@ def wp_custom_css_rollback(backup_id: str, confirm: bool = False) -> str:
     return _wp_css_change(d, wp_path, st, old_css, "replace", confirm, f"wp_custom_css_rollback:{bid}")
 
 
+# ---------------------------------------------------------------------------
+# WordPress-Kommentare (Moderation: Spam, Papierkorb, Freigabe, Löschen)
+# ---------------------------------------------------------------------------
+
+_WP_COMMENT_STATUSES = ("hold", "approve", "spam", "trash", "all")
+_WP_COMMENT_ACTIONS = {
+    "spam": ["comment", "spam"],
+    "unspam": ["comment", "unspam"],
+    "trash": ["comment", "trash"],
+    "untrash": ["comment", "untrash"],
+    "approve": ["comment", "approve"],
+    "unapprove": ["comment", "unapprove"],
+    "delete": ["comment", "delete", "--force"],
+}
+# Erwarteter Wert von comment_approved nach der Aktion (None = Kommentar weg)
+_WP_COMMENT_EXPECTED = {
+    "spam": "spam", "unspam": None, "trash": "trash", "untrash": None,
+    "approve": "1", "unapprove": "0", "delete": None,
+}
+_WP_COMMENT_FIELDS = (
+    "comment_ID,comment_post_ID,comment_author,comment_author_email,"
+    "comment_author_url,comment_author_IP,comment_date,comment_approved,comment_content"
+)
+_WP_COMMENT_MAX_IDS = 200
+
+
+def _wp_comment_ids(comment_ids: list[int] | int) -> list[int]:
+    ids = [comment_ids] if isinstance(comment_ids, int) else list(comment_ids or [])
+    if not ids or len(ids) > _WP_COMMENT_MAX_IDS:
+        raise ValueError(f"1 bis {_WP_COMMENT_MAX_IDS} Kommentar-IDs angeben.")
+    out: list[int] = []
+    for i in ids:
+        if isinstance(i, bool) or not isinstance(i, int) or i <= 0:
+            raise ValueError(f"Ungültige Kommentar-ID: {i!r}")
+        if i not in out:
+            out.append(i)
+    return out
+
+
+def _wp_comment_view(c: dict[str, Any], excerpt: int = 300) -> dict[str, Any]:
+    content = str(c.get("comment_content") or "")
+    content = re.sub(r"\s+", " ", content).strip()
+    return {
+        "id": int(c.get("comment_ID") or 0),
+        "post_id": int(c.get("comment_post_ID") or 0),
+        "status": c.get("comment_approved"),
+        "autor": c.get("comment_author"),
+        "email": c.get("comment_author_email"),
+        "url": c.get("comment_author_url"),
+        "ip": c.get("comment_author_IP"),
+        "datum": c.get("comment_date"),
+        "inhalt": content if len(content) <= excerpt else content[:excerpt] + "…",
+    }
+
+
+def _wp_comment_counts(text: str) -> dict[str, int]:
+    """Parst die Ausgabe von `wp comment count` ("approved: 12" je Zeile)."""
+    counts: dict[str, int] = {}
+    for line in text.splitlines():
+        m = re.match(r"^\s*([a-z_]+):\s*(\d+)\s*$", line)
+        if m:
+            counts[m.group(1)] = int(m.group(2))
+    return counts
+
+
+def _wp_comment_fetch(client, ctx, wp_dir: str, ids: list[int]) -> dict[int, dict[str, Any]]:
+    """Kommentare per ID lesen; fehlende IDs fehlen im Ergebnis."""
+    out = _wp_cli(
+        client, ctx, wp_dir,
+        ["comment", "list", f"--comment__in={','.join(str(i) for i in ids)}",
+         f"--fields={_WP_COMMENT_FIELDS}", "--format=json", "--status=all"],
+    )
+    rows = _wp_json(out)
+    if not isinstance(rows, list):
+        raise SSHError("Unerwartete Antwort von 'wp comment list'.")
+    return {int(r["comment_ID"]): r for r in rows if r.get("comment_ID")}
+
+
+@mcp.tool()
+def wp_comment_list(
+    domain: str,
+    wp_path: str,
+    status: str = "hold",
+    limit: int = 50,
+    search: str = "",
+) -> str:
+    """Listet WordPress-Kommentare einer Installation per WP-CLI - z.B. die
+    auf Freigabe wartenden ("Bitte moderiere"-Mails).
+
+    domain: z.B. "example.com"; wp_path: WordPress-Verzeichnis relativ zu
+    /var/www/vhosts/<domain>/ (z.B. "httpdocs").
+    status: "hold" (wartend auf Freigabe, Standard), "approve", "spam",
+    "trash" oder "all". limit: max. Anzahl (1-200), neueste zuerst.
+    search: optional, Textsuche in Autor/E-Mail/URL/Inhalt.
+    Rein lesend; Inhalt wird auf 300 Zeichen gekürzt.
+    """
+    if status not in _WP_COMMENT_STATUSES:
+        raise ValueError(f"status muss eines von {', '.join(_WP_COMMENT_STATUSES)} sein.")
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 200:
+        raise ValueError("limit muss zwischen 1 und 200 liegen.")
+    q = search.strip()
+    if "\x00" in q or len(q) > 200:
+        raise ValueError("Ungültiger Suchtext.")
+    d = _wp_domain(domain)
+    client = _ssh_connect()
+    try:
+        ctx = _wp_context(client, d)
+        sftp = client.open_sftp()
+        try:
+            wp_dir = _wp_install_dir(sftp, d, wp_path)
+        finally:
+            sftp.close()
+        args = ["comment", "list", f"--status={status}", f"--number={limit}",
+                "--orderby=comment_date_gmt", "--order=DESC",
+                f"--fields={_WP_COMMENT_FIELDS}", "--format=json"]
+        if q:
+            args.append(f"--search={q}")
+        rows = _wp_json(_wp_cli(client, ctx, wp_dir, args))
+        counts = _wp_comment_counts(_wp_cli(client, ctx, wp_dir, ["comment", "count"]))
+    finally:
+        client.close()
+    if not isinstance(rows, list):
+        raise SSHError("Unerwartete Antwort von 'wp comment list'.")
+    return json.dumps({
+        "domain": d,
+        "wp_path": wp_dir,
+        "status": status,
+        "anzahl": len(rows),
+        "zaehler": counts,
+        "kommentare": [_wp_comment_view(r) for r in rows],
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def wp_comment_moderate(
+    domain: str,
+    wp_path: str,
+    comment_ids: list[int],
+    action: str,
+    confirm: bool = False,
+) -> str:
+    """Moderiert WordPress-Kommentare per WP-CLI (als System-User der
+    Subscription, nie root): action = "spam", "trash", "approve",
+    "unapprove", "unspam", "untrash" oder "delete" (endgültig löschen,
+    `wp comment delete --force`).
+
+    comment_ids: Liste der Kommentar-IDs (1-200), z.B. aus wp_comment_list
+    oder aus dem "c=<id>"-Parameter der Moderations-Mail.
+    Ohne confirm=true nur Vorschau (zeigt Autor, E-Mail, Inhalt und
+    aktuellen Status je Kommentar, nichts geändert). Mit confirm=true wird
+    die Aktion ausgeführt und der Status danach je Kommentar kontrolliert;
+    WordPress-Hooks (z.B. Akismet-Lernen bei Spam) laufen dabei mit.
+    Spam/Papierkorb sind in WordPress umkehrbar, "delete" nicht.
+    """
+    if action not in _WP_COMMENT_ACTIONS:
+        raise ValueError(f"action muss eines von {', '.join(_WP_COMMENT_ACTIONS)} sein.")
+    ids = _wp_comment_ids(comment_ids)
+    d = _wp_domain(domain)
+    client = _ssh_connect()
+    try:
+        ctx = _wp_context(client, d)
+        sftp = client.open_sftp()
+        try:
+            wp_dir = _wp_install_dir(sftp, d, wp_path)
+        finally:
+            sftp.close()
+        before = _wp_comment_fetch(client, ctx, wp_dir, ids)
+        missing = [i for i in ids if i not in before]
+        result: dict[str, Any] = {
+            "domain": d,
+            "wp_path": wp_dir,
+            "action": action,
+            "system_user": ctx["login"],
+            "kommentare": [_wp_comment_view(before[i]) for i in ids if i in before],
+        }
+        if missing:
+            result["nicht_gefunden"] = missing
+        if not before:
+            result["ergebnis"] = "Keine der angegebenen Kommentar-IDs existiert - nichts zu tun."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        if not confirm:
+            result["ergebnis"] = "Vorschau - nichts geändert. Mit confirm=true ausführen."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+
+        todo = [i for i in ids if i in before]
+        errors: list[str] = []
+        try:
+            _wp_cli(client, ctx, wp_dir, [*_WP_COMMENT_ACTIONS[action], *[str(i) for i in todo]])
+        except SSHError as e:
+            errors.append(str(e))
+        after = _wp_comment_fetch(client, ctx, wp_dir, todo)
+        expected = _WP_COMMENT_EXPECTED[action]
+        ok, failed = [], []
+        for i in todo:
+            now = after.get(i, {}).get("comment_approved") if i in after else None
+            if action == "delete":
+                (ok if i not in after else failed).append(i)
+            elif expected is None:
+                # unspam/untrash: zurück auf den vorherigen Status (0/1)
+                (ok if now in ("0", "1") else failed).append(i)
+            else:
+                (ok if now == expected else failed).append(i)
+    finally:
+        client.close()
+
+    result["erledigt"] = ok
+    if failed or errors:
+        result["ergebnis"] = "Teilweise fehlgeschlagen."
+        if failed:
+            result["abweichend_nach_kontrolle"] = {
+                i: (after.get(i, {}).get("comment_approved") if i in after else "nicht mehr vorhanden")
+                for i in failed
+            }
+        if errors:
+            result["fehler"] = errors
+    else:
+        result["ergebnis"] = f"{len(ok)} Kommentar(e): {action} ausgeführt und kontrolliert."
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
 @mcp.tool()
 def delete_vhost_log(
     domain: str,
