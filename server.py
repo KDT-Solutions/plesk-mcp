@@ -1174,6 +1174,44 @@ def plesk_api_get(path: str, query: str = "") -> str:
     return plesk_api_get_raw(path, params)
 
 
+_LOGIN_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
+
+@mcp.tool()
+def customer_update_email(login: str, email: str, confirm: bool = False) -> str:
+    """Setzt die Kontakt-E-Mail-Adresse eines Plesk-Kundenaccounts (nicht
+    des Admins). Entspricht `plesk bin customer --update <login> -email <mail>`.
+    Den Login liefert plesk_api_get("clients") (Feld "login").
+
+    ACHTUNG - schreibt auf einem Produktivserver (Kundenstammdaten, an diese
+    Adresse gehen Plesk-Benachrichtigungen): erfordert confirm=true als
+    bewusste Bestätigung PRO Aufruf. Ohne confirm wird nur eine Vorschau
+    (aktuelle vs. neue Adresse) zurückgegeben.
+    """
+    lg = login.strip()
+    mail = email.strip()
+    if not _LOGIN_RE.match(lg):
+        raise ValueError(f"Ungültiger Plesk-Login: {login!r}")
+    if lg == "admin":
+        raise ValueError("Der Admin-Account wird über dieses Tool nicht geändert.")
+    if not _EMAIL_RE.match(mail):
+        raise ValueError(f"Ungültige E-Mail-Adresse: {email!r}")
+
+    current = ssh_run(
+        f"plesk bin customer --info {shlex.quote(lg)} | grep -i '^Email'"
+    )
+    if not confirm:
+        return (
+            f"Vorschau (nichts geändert) - Login {lg}: {current} -> neu: {mail}\n"
+            "Zum Ausführen confirm=true setzen."
+        )
+    out = ssh_run(
+        f"plesk bin customer --update {shlex.quote(lg)} -email {shlex.quote(mail)}"
+    )
+    return f"Vorher: {current}\n{out}"
+
+
 @mcp.tool()
 def lve_stats(domain: str) -> str:
     """Sucht die aktuellen LVE-Ressourcenwerte (CPU/IO-Limits und -Faults)
