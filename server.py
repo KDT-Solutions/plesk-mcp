@@ -1302,6 +1302,53 @@ def subscription_delete(domain: str, confirm_domain: str = "", confirm: bool = F
     return f"Vorher:\n{summary}\n\n{out}\n\nKontrolle: Subscription {gone}"
 
 @mcp.tool()
+def customer_delete(login: str, confirm_login: str = "", confirm: bool = False) -> str:
+    """Löscht einen Plesk-Kundenaccount, der KEINE Domains/Subscriptions mehr
+    hat (z.B. alter Kontakt). Entspricht `plesk bin customer --remove <login>`.
+    Kunden mit Domains werden abgelehnt - deren Subscriptions zuerst mit
+    subscription_delete entfernen.
+
+    Zweistufig: ohne confirm nur Vorschau. Ausgeführt wird nur mit
+    confirm=true UND confirm_login = exakt derselbe Login als
+    Rückbestätigung. Vor dem Aufruf mit confirm=true muss der Nutzer im Chat
+    ausdrücklich bestätigt haben.
+    """
+    lg = login.strip()
+    if not _LOGIN_RE.match(lg):
+        raise ValueError(f"Ungültiger Plesk-Login: {login!r}")
+    if lg == "admin":
+        raise ValueError("Der Admin-Account wird über dieses Tool nicht gelöscht.")
+    out, err, code = _ssh_exec(f"plesk bin customer --info {shlex.quote(lg)}")
+    if code != 0:
+        raise ValueError(f"Kein Kundenaccount {lg!r} gefunden.")
+    fields = {}
+    for line in out.splitlines():
+        key, sep, val = line.partition(":")
+        if sep:
+            fields.setdefault(key.strip(), val.strip())
+    domains = fields.get("Domains", "")
+    if domains != "0":
+        raise ValueError(
+            f"Kundenaccount {lg!r} hat noch Domains ({domains or '?'}) - "
+            "zuerst die Subscriptions entfernen, nichts gelöscht."
+        )
+    summary = "\n".join(
+        f"{k}: {fields[k]}" for k in ("Personal name", "Company name", "Email", "Creation date", "Domains")
+        if fields.get(k)
+    )
+    if not confirm:
+        return (
+            f"Vorschau (nichts gelöscht) - Kundenaccount {lg} ENDGÜLTIG löschen:\n{summary}\n"
+            "Zum Ausführen confirm=true und confirm_login=<Login> setzen."
+        )
+    if confirm_login.strip() != lg:
+        raise ValueError(f"Rückbestätigung fehlt: confirm_login muss exakt {lg!r} sein, nichts gelöscht.")
+    res = ssh_run(f"plesk bin customer --remove {shlex.quote(lg)}")
+    _, _, code = _ssh_exec(f"plesk bin customer --info {shlex.quote(lg)}")
+    gone = "gelöscht" if code != 0 else "NOCH VORHANDEN - bitte prüfen"
+    return f"Vorher:\n{summary}\n\n{res}\n\nKontrolle: Kundenaccount {gone}"
+
+@mcp.tool()
 def lve_stats(domain: str) -> str:
     """Sucht die aktuellen LVE-Ressourcenwerte (CPU/IO-Limits und -Faults)
     für die angegebene Domain, z.B. um kurzzeitige Nichterreichbarkeit durch
