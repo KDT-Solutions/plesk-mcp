@@ -74,3 +74,44 @@ def test_delete_with_confirmation(fake_ssh):
     out = server.subscription_delete("example.com", confirm_domain="Example.com", confirm=True)
     assert "plesk bin subscription --remove example.com" in fake_ssh
     assert "NOCH VORHANDEN" in out  # Fake liefert --info weiterhin mit exit 0
+
+
+CUST = (
+    "Personal name:                          Alter Kontakt\n"
+    "Email:                                  alt@example.com\n"
+    "Domains:                                {n}\n"
+)
+
+
+def _fake_customer(monkeypatch, domains="0"):
+    calls = []
+
+    def exec_(cmd, timeout=None):
+        calls.append(cmd)
+        return CUST.format(n=domains), "", 0
+
+    monkeypatch.setattr(server, "_ssh_exec", exec_)
+    monkeypatch.setattr(server, "ssh_run", lambda cmd, timeout=None: calls.append(cmd) or "SUCCESS")
+    return calls
+
+
+def test_customer_delete_rejects_admin():
+    with pytest.raises(ValueError, match="Admin-Account"):
+        server.customer_delete("admin", confirm_login="admin", confirm=True)
+
+
+def test_customer_delete_rejects_with_domains(monkeypatch):
+    calls = _fake_customer(monkeypatch, domains="1")
+    with pytest.raises(ValueError, match="noch Domains"):
+        server.customer_delete("kunde", confirm_login="kunde", confirm=True)
+    assert not any("--remove" in c for c in calls)
+
+
+def test_customer_delete_preview_and_confirm(monkeypatch):
+    calls = _fake_customer(monkeypatch)
+    assert "Vorschau" in server.customer_delete("kunde")
+    with pytest.raises(ValueError, match="Rückbestätigung"):
+        server.customer_delete("kunde", confirm_login="Kunde", confirm=True)
+    assert not any("--remove" in c for c in calls)
+    server.customer_delete("kunde", confirm_login="kunde", confirm=True)
+    assert "plesk bin customer --remove kunde" in calls

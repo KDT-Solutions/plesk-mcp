@@ -12,6 +12,7 @@
 - Neues Tool `customer_update_email(login, email, confirm)`: setzt die Kontakt-E-Mail eines Plesk-Kundenaccounts per `plesk bin customer --update <login> -email <mail>`. Login und Adresse werden strikt validiert, `admin` ist ausgeschlossen, ohne `confirm=true` nur Vorschau (aktuelle vs. neue Adresse).
 - Neue Tools `subscription_suspend(domain, confirm)` und `subscription_activate(domain, confirm)`: sperren bzw. aktivieren eine komplette Subscription per `plesk bin subscription --webspace-off`/`--webspace-on` (z.B. nach Kündigung). Ohne `confirm=true` nur Vorschau mit Inhaber und Status, danach wird der neue Status gelesen und zurückgegeben.
 - Neues Tool `subscription_delete(domain, confirm_domain, confirm)`: löscht eine Subscription endgültig (`plesk bin subscription --remove`). Ohne `confirm=true` Vorschau mit Inhaber, Status, Grösse und Mailboxen; ausgeführt wird nur mit `confirm=true` und `confirm_domain` = exakt derselbe Domainname. Danach Kontrolle, ob die Subscription weg ist. Zusatzdomains ohne eigene Subscription werden abgelehnt.
+- Neues Tool `customer_delete(login, confirm_login, confirm)`: löscht einen Kundenaccount ohne Domains (`plesk bin customer --remove`), z.B. alte Kontakte. Kunden mit Domains und `admin` werden abgelehnt; ausgeführt wird nur mit `confirm=true` und `confirm_login` = exakt derselbe Login, danach Kontrolle.
 - Tests: `tests/test_wp_custom_css.py`, `tests/test_wp_comment.py`, `tests/test_wc_coupon.py`, `tests/test_customer_email.py`, `tests/test_subscription.py` (Validierung ohne Serverzugriff).
 
 ## 0.25
