@@ -1174,6 +1174,180 @@ def plesk_api_get(path: str, query: str = "") -> str:
     return plesk_api_get_raw(path, params)
 
 
+_LOGIN_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
+
+@mcp.tool()
+def customer_update_email(login: str, email: str, confirm: bool = False) -> str:
+    """Setzt die Kontakt-E-Mail-Adresse eines Plesk-Kundenaccounts (nicht
+    des Admins). Entspricht `plesk bin customer --update <login> -email <mail>`.
+    Den Login liefert plesk_api_get("clients") (Feld "login").
+
+    ACHTUNG - schreibt auf einem Produktivserver (Kundenstammdaten, an diese
+    Adresse gehen Plesk-Benachrichtigungen): erfordert confirm=true als
+    bewusste Bestätigung PRO Aufruf. Ohne confirm wird nur eine Vorschau
+    (aktuelle vs. neue Adresse) zurückgegeben.
+    """
+    lg = login.strip()
+    mail = email.strip()
+    if not _LOGIN_RE.match(lg):
+        raise ValueError(f"Ungültiger Plesk-Login: {login!r}")
+    if lg == "admin":
+        raise ValueError("Der Admin-Account wird über dieses Tool nicht geändert.")
+    if not _EMAIL_RE.match(mail):
+        raise ValueError(f"Ungültige E-Mail-Adresse: {email!r}")
+
+    current = ssh_run(
+        f"plesk bin customer --info {shlex.quote(lg)} | grep -i '^Email'"
+    )
+    if not confirm:
+        return (
+            f"Vorschau (nichts geändert) - Login {lg}: {current} -> neu: {mail}\n"
+            "Zum Ausführen confirm=true setzen."
+        )
+    out = ssh_run(
+        f"plesk bin customer --update {shlex.quote(lg)} -email {shlex.quote(mail)}"
+    )
+    return f"Vorher: {current}\n{out}"
+
+
+_SUB_INFO_KEYS = ("Domain name", "Owner's contact name", "Domain status", "Size")
+_SUB_DELETE_KEYS = ("Mailboxes", "Total size")
+
+
+def _subscription_info(domain: str) -> tuple[str, dict[str, list[str]]]:
+    """Liest `plesk bin subscription --info` und liefert den Domainnamen plus
+    die Zeilen "Schlüssel: Wert" (mehrfach vorkommende Schlüssel als Liste).
+    Wirft, wenn die Domain keine Subscription ist (z.B. Zusatzdomain)."""
+    d = _wp_domain(domain)
+    out, err, code = _ssh_exec(f"plesk bin subscription --info {shlex.quote(d)}")
+    if code != 0:
+        msg = (err.strip() or out.strip()).splitlines()
+        raise ValueError(f"Keine Subscription {d!r} gefunden: {msg[0] if msg else f'exit {code}'}")
+    fields: dict[str, list[str]] = {}
+    for line in out.splitlines():
+        key, sep, val = line.partition(":")
+        if sep and val.strip():
+            fields.setdefault(key.strip(), []).append(val.strip())
+    return d, fields
+
+
+def _subscription_summary(fields: dict[str, list[str]], keys: tuple[str, ...]) -> str:
+    return "\n".join(f"{k}: {', '.join(fields[k])}" for k in keys if k in fields)
+
+
+def _subscription_switch(domain: str, flag: str, label: str, confirm: bool) -> str:
+    d, before = _subscription_info(domain)
+    summary = _subscription_summary(before, _SUB_INFO_KEYS)
+    if not confirm:
+        return f"Vorschau (nichts geändert) - {label}:\n{summary}\nZum Ausführen confirm=true setzen."
+    out = ssh_run(f"plesk bin subscription {flag} {shlex.quote(d)}")
+    _, after = _subscription_info(d)
+    status = ", ".join(after.get("Domain status", ["?"]))
+    return f"Vorher:\n{summary}\n\n{out}\n\nStatus jetzt: {status}"
+
+
+@mcp.tool()
+def subscription_suspend(domain: str, confirm: bool = False) -> str:
+    """Sperrt eine komplette Plesk-Subscription (Webseiten, Mail, FTP),
+    z.B. nach Kündigung oder Zahlungsverzug. Entspricht
+    `plesk bin subscription --webspace-off <domain>`. Daten bleiben
+    erhalten, rückgängig mit subscription_activate. domain = Hauptdomain
+    der Subscription.
+
+    ACHTUNG - schreibt auf einem Produktivserver (Kundenseiten offline):
+    erfordert confirm=true als bewusste Bestätigung PRO Aufruf. Ohne
+    confirm nur Vorschau (Inhaber, aktueller Status).
+    """
+    return _subscription_switch(domain, "--webspace-off", "Subscription sperren", confirm)
+
+
+@mcp.tool()
+def subscription_activate(domain: str, confirm: bool = False) -> str:
+    """Aktiviert eine gesperrte Plesk-Subscription wieder. Entspricht
+    `plesk bin subscription --webspace-on <domain>`.
+
+    Erfordert confirm=true PRO Aufruf, ohne confirm nur Vorschau.
+    """
+    return _subscription_switch(domain, "--webspace-on", "Subscription aktivieren", confirm)
+
+
+@mcp.tool()
+def subscription_delete(domain: str, confirm_domain: str = "", confirm: bool = False) -> str:
+    """Löscht eine Plesk-Subscription ENDGÜLTIG mit allen Dateien,
+    Datenbanken und Mailboxen. Entspricht
+    `plesk bin subscription --remove <domain>`. Kein Papierkorb, kein
+    Rollback - vorher ggf. backup_list prüfen.
+
+    Zweistufig: ohne confirm nur Vorschau (Inhaber, Status, Grösse,
+    Mailboxen). Ausgeführt wird nur mit confirm=true UND confirm_domain =
+    exakt derselbe Domainname als Rückbestätigung. Vor dem Aufruf mit
+    confirm=true muss der Nutzer im Chat ausdrücklich bestätigt haben.
+    """
+    d, info = _subscription_info(domain)
+    summary = _subscription_summary(info, _SUB_INFO_KEYS + _SUB_DELETE_KEYS)
+    if not confirm:
+        return (
+            f"Vorschau (nichts gelöscht) - Subscription ENDGÜLTIG löschen:\n{summary}\n"
+            "Zum Ausführen confirm=true und confirm_domain=<Domainname> setzen."
+        )
+    if confirm_domain.strip().lower() != d:
+        raise ValueError(
+            f"Rückbestätigung fehlt: confirm_domain muss exakt {d!r} sein, nichts gelöscht."
+        )
+    out = ssh_run(f"plesk bin subscription --remove {shlex.quote(d)}")
+    _, _, code = _ssh_exec(f"plesk bin subscription --info {shlex.quote(d)}")
+    gone = "gelöscht" if code != 0 else "NOCH VORHANDEN - bitte prüfen"
+    return f"Vorher:\n{summary}\n\n{out}\n\nKontrolle: Subscription {gone}"
+
+@mcp.tool()
+def customer_delete(login: str, confirm_login: str = "", confirm: bool = False) -> str:
+    """Löscht einen Plesk-Kundenaccount, der KEINE Domains/Subscriptions mehr
+    hat (z.B. alter Kontakt). Entspricht `plesk bin customer --remove <login>`.
+    Kunden mit Domains werden abgelehnt - deren Subscriptions zuerst mit
+    subscription_delete entfernen.
+
+    Zweistufig: ohne confirm nur Vorschau. Ausgeführt wird nur mit
+    confirm=true UND confirm_login = exakt derselbe Login als
+    Rückbestätigung. Vor dem Aufruf mit confirm=true muss der Nutzer im Chat
+    ausdrücklich bestätigt haben.
+    """
+    lg = login.strip()
+    if not _LOGIN_RE.match(lg):
+        raise ValueError(f"Ungültiger Plesk-Login: {login!r}")
+    if lg == "admin":
+        raise ValueError("Der Admin-Account wird über dieses Tool nicht gelöscht.")
+    out, err, code = _ssh_exec(f"plesk bin customer --info {shlex.quote(lg)}")
+    if code != 0:
+        raise ValueError(f"Kein Kundenaccount {lg!r} gefunden.")
+    fields = {}
+    for line in out.splitlines():
+        key, sep, val = line.partition(":")
+        if sep:
+            fields.setdefault(key.strip(), val.strip())
+    domains = fields.get("Domains", "")
+    if domains != "0":
+        raise ValueError(
+            f"Kundenaccount {lg!r} hat noch Domains ({domains or '?'}) - "
+            "zuerst die Subscriptions entfernen, nichts gelöscht."
+        )
+    summary = "\n".join(
+        f"{k}: {fields[k]}" for k in ("Personal name", "Company name", "Email", "Creation date", "Domains")
+        if fields.get(k)
+    )
+    if not confirm:
+        return (
+            f"Vorschau (nichts gelöscht) - Kundenaccount {lg} ENDGÜLTIG löschen:\n{summary}\n"
+            "Zum Ausführen confirm=true und confirm_login=<Login> setzen."
+        )
+    if confirm_login.strip() != lg:
+        raise ValueError(f"Rückbestätigung fehlt: confirm_login muss exakt {lg!r} sein, nichts gelöscht.")
+    res = ssh_run(f"plesk bin customer --remove {shlex.quote(lg)}")
+    _, _, code = _ssh_exec(f"plesk bin customer --info {shlex.quote(lg)}")
+    gone = "gelöscht" if code != 0 else "NOCH VORHANDEN - bitte prüfen"
+    return f"Vorher:\n{summary}\n\n{res}\n\nKontrolle: Kundenaccount {gone}"
+
 @mcp.tool()
 def lve_stats(domain: str) -> str:
     """Sucht die aktuellen LVE-Ressourcenwerte (CPU/IO-Limits und -Faults)
