@@ -85,7 +85,7 @@ _MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 # Dateien (server.py, Dockerfile, requirements.txt, Workflow) geaendert haben.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.25"
+_VERSION_BASE = "0.26"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -4086,6 +4086,298 @@ def wp_option_rollback(backup_id: str, confirm: bool = False) -> str:
         key: (e["value"] if e.get("existed") else _WP_MISSING) for key, e in entries.items()
     }
     return _wp_change(d, wp_path, option, mode, targets, confirm, f"wp_option_rollback:{bid}")
+
+
+# ---------------------------------------------------------------------------
+# WordPress Customizer "Zusätzliches CSS" (custom_css-Post je Theme)
+# ---------------------------------------------------------------------------
+
+_WP_CSS_BACKUP_SUBDIR = ".plesk-mcp/wp-custom-css-backups"
+_WP_STYLESHEET_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
+_WP_CSS_MAX_BYTES = 512 * 1024
+
+# Fester PHP-Code für `wp eval` - das CSS selbst kommt NIE in den Code,
+# sondern per stdin; das Stylesheet wird nur nach Regex-Prüfung als
+# einfach-quotiertes Literal eingesetzt (keine Sonderzeichen möglich).
+_WP_CSS_GET_PHP = (
+    '$st = %s; echo json_encode(array("stylesheet" => $st, '
+    '"active" => get_stylesheet(), "css" => (string) wp_get_custom_css($st)));'
+)
+_WP_CSS_SET_PHP = (
+    '$st = %s; $css = stream_get_contents(STDIN); '
+    '$r = wp_update_custom_css_post($css, array("stylesheet" => $st)); '
+    'if (is_wp_error($r)) { fwrite(STDERR, $r->get_error_message()); exit(1); } '
+    'echo json_encode(array("post_id" => $r->ID, "stylesheet" => $st, '
+    '"css" => (string) wp_get_custom_css($st)));'
+)
+
+
+def _wp_check_stylesheet(stylesheet: str) -> str:
+    """Theme-Verzeichnisname (leer = aktives Theme)."""
+    st = stylesheet.strip()
+    if not st:
+        return ""
+    if not _WP_STYLESHEET_RE.match(st) or ".." in st:
+        raise ValueError(
+            f"Ungültiger Theme-Name {stylesheet!r} - erlaubt sind Buchstaben, Ziffern, _, - und Punkt."
+        )
+    return st
+
+
+def _wp_css_php_literal(stylesheet: str) -> str:
+    """Stylesheet als PHP-Ausdruck: Literal nach Regex-Prüfung, sonst get_stylesheet()."""
+    return f"'{stylesheet}'" if stylesheet else "get_stylesheet()"
+
+
+def _wp_check_css(css: str) -> str:
+    if not isinstance(css, str):
+        raise ValueError("css muss ein String sein.")
+    if "\x00" in css:
+        raise ValueError("CSS enthält ein Nullbyte.")
+    if len(css.encode("utf-8")) > _WP_CSS_MAX_BYTES:
+        raise ValueError(f"CSS zu gross (max. {_WP_CSS_MAX_BYTES // 1024} KB).")
+    # WordPress selbst lehnt "</style" ab (wp_update_custom_css_post -> validate)
+    if "</style" in css.lower():
+        raise ValueError("CSS darf kein '</style' enthalten.")
+    return css
+
+
+def _wp_eval(
+    client: paramiko.SSHClient,
+    ctx: dict[str, str],
+    wp_dir: str,
+    php: str,
+    stdin_data: bytes | None = None,
+) -> Any:
+    """`wp eval <php>` als Subscription-User; Rückgabe ist das JSON der Ausgabe."""
+    out, err, rc = _wp_run_as_user(
+        client, ctx,
+        [ctx["php"], _WP_CLI_PATH, f"--path={wp_dir}", "--no-color", "eval", php],
+        cwd=wp_dir, stdin_data=stdin_data,
+    )
+    if rc != 0:
+        msg = "\n".join(line for line in (err.strip() or out.strip()).splitlines()[-5:])
+        raise SSHError(f"WP-CLI 'wp eval' fehlgeschlagen: {msg}")
+    return _wp_json(out)
+
+
+def _wp_css_get(client, ctx, wp_dir: str, stylesheet: str) -> dict[str, Any]:
+    data = _wp_eval(client, ctx, wp_dir, _WP_CSS_GET_PHP % _wp_css_php_literal(stylesheet))
+    if not isinstance(data, dict) or "css" not in data:
+        raise SSHError("Unerwartete Antwort von WordPress beim Lesen des Custom-CSS.")
+    return data
+
+
+def _wp_css_write_backup(client, ctx, wp_dir: str, wp_path: str, stylesheet: str,
+                         old_css: str, source: str) -> str:
+    ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    backup_id = f"{ts}-{os.urandom(4).hex()}@{ctx['domain']}"
+    record = {
+        "id": backup_id,
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "source": source,
+        "domain": ctx["domain"],
+        "wp_path": wp_path,
+        "stylesheet": stylesheet,
+        "old_css": old_css,
+    }
+    data = json.dumps(record, ensure_ascii=False, indent=2).encode("utf-8")
+    bdir = f"{ctx['home']}/{_WP_CSS_BACKUP_SUBDIR}"
+    _, err, rc = _wp_run_as_user(
+        client, ctx,
+        ["/bin/sh", "-c", 'umask 077 && mkdir -p "$1" && set -C && cat > "$2"',
+         "sh", bdir, f"{bdir}/{backup_id}.json"],
+        cwd=ctx["home"], stdin_data=data,
+    )
+    if rc != 0:
+        raise SSHError(f"Backup konnte nicht angelegt werden - nichts geändert: {err.strip()}")
+    return backup_id
+
+
+def _wp_css_diff(old: str, new: str) -> str:
+    import difflib
+    lines = difflib.unified_diff(
+        old.splitlines(), new.splitlines(), "alt", "neu", lineterm="", n=2
+    )
+    text = "\n".join(lines)
+    return text if len(text) <= 20000 else text[:20000] + "\n... (gekürzt)"
+
+
+def _wp_css_change(domain: str, wp_path: str, stylesheet: str, new_css: str,
+                   mode: str, confirm: bool, source: str) -> str:
+    d = _wp_domain(domain)
+    client = _ssh_connect()
+    try:
+        ctx = _wp_context(client, d)
+        sftp = client.open_sftp()
+        try:
+            wp_dir = _wp_install_dir(sftp, d, wp_path)
+        finally:
+            sftp.close()
+        current = _wp_css_get(client, ctx, wp_dir, stylesheet)
+        old_css = current["css"]
+        st = current["stylesheet"]
+        if mode == "append":
+            target = old_css.rstrip("\n") + ("\n\n" if old_css.strip() else "") + new_css
+        else:
+            target = new_css
+        result: dict[str, Any] = {
+            "domain": d,
+            "wp_path": wp_dir,
+            "stylesheet": st,
+            "aktives_theme": current.get("active"),
+            "system_user": ctx["login"],
+            "modus": mode,
+            "zeichen_alt": len(old_css),
+            "zeichen_neu": len(target),
+        }
+        if st != current.get("active"):
+            result["hinweis"] = (
+                "Das CSS gehört zu einem anderen Theme als dem aktiven - es wird "
+                "erst sichtbar, wenn dieses Theme aktiv ist."
+            )
+        if target == old_css:
+            result["ergebnis"] = "Keine Änderung nötig - CSS ist bereits identisch."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        result["diff"] = _wp_css_diff(old_css, target)
+        if not confirm:
+            result["ergebnis"] = "Vorschau - nichts geschrieben. Mit confirm=true ausführen."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+
+        backup_id = _wp_css_write_backup(client, ctx, wp_dir, wp_path, st, old_css, source)
+        written = _wp_eval(
+            client, ctx, wp_dir, _WP_CSS_SET_PHP % _wp_css_php_literal(st),
+            stdin_data=target.encode("utf-8"),
+        )
+        after = _wp_css_get(client, ctx, wp_dir, st)
+        # Objekt-Cache leeren (best effort, z.B. Redis); Seiten-Caches von
+        # Plugins werden durch den WordPress-Hook beim Speichern des Posts
+        # ausgelöst, sonst via delete_vhost_file im Cache-Verzeichnis.
+        cache_note = ""
+        try:
+            _wp_cli(client, ctx, wp_dir, ["cache", "flush"])
+        except SSHError as e:
+            cache_note = str(e)
+    finally:
+        client.close()
+
+    result["backup_id"] = backup_id
+    result["backup_datei"] = f"{ctx['home']}/{_WP_CSS_BACKUP_SUBDIR}/{backup_id}.json"
+    if isinstance(written, dict) and written.get("post_id"):
+        result["post_id"] = written["post_id"]
+    if after["css"] != target:
+        result["ergebnis"] = "Geschrieben, aber Kontrolle weicht ab - Rollback mit backup_id möglich."
+        result["abweichung"] = _wp_css_diff(target, after["css"])
+    else:
+        result["ergebnis"] = "Geschrieben und kontrolliert."
+    if cache_note:
+        result["cache_hinweis"] = cache_note
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def wp_custom_css_show(domain: str, wp_path: str, stylesheet: str = "") -> str:
+    """Zeigt das "Zusätzliche CSS" aus dem WordPress-Customizer (Design >
+    Customizer > Zusätzliches CSS) einer Installation - standardmässig für
+    das aktive Theme, optional für ein anderes Theme (stylesheet =
+    Theme-Verzeichnisname, z.B. "hello-elementor").
+
+    domain: z.B. "example.com"; wp_path: WordPress-Verzeichnis relativ zu
+    /var/www/vhosts/<domain>/ (z.B. "httpdocs"). Rein lesend.
+    """
+    st = _wp_check_stylesheet(stylesheet)
+    d = _wp_domain(domain)
+    client = _ssh_connect()
+    try:
+        ctx = _wp_context(client, d)
+        sftp = client.open_sftp()
+        try:
+            wp_dir = _wp_install_dir(sftp, d, wp_path)
+        finally:
+            sftp.close()
+        data = _wp_css_get(client, ctx, wp_dir, st)
+    finally:
+        client.close()
+    return json.dumps({
+        "domain": d,
+        "wp_path": wp_dir,
+        "stylesheet": data["stylesheet"],
+        "aktives_theme": data.get("active"),
+        "zeichen": len(data["css"]),
+        "css": data["css"],
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def wp_custom_css_update(
+    domain: str,
+    wp_path: str,
+    css: str,
+    mode: str = "replace",
+    stylesheet: str = "",
+    confirm: bool = False,
+) -> str:
+    """Setzt das "Zusätzliche CSS" des WordPress-Customizers (Design >
+    Customizer > Zusätzliches CSS) - genau das, was man dort von Hand
+    eintragen würde, damit es auch im Backend sichtbar und editierbar bleibt.
+
+    css: der CSS-Text. mode: "replace" (Standard, ersetzt den kompletten
+    Inhalt) oder "append" (hängt css an den bestehenden Inhalt an).
+    stylesheet: leer = aktives Theme (Customizer-CSS ist an das Theme
+    gebunden), sonst Theme-Verzeichnisname.
+
+    Läuft über WP-CLI (`wp eval` mit festem Code, CSS per stdin) als
+    System-User der Subscription - nie root; WordPress legt dabei wie im
+    Customizer eine Revision des custom_css-Posts an. Ohne confirm=true nur
+    Vorschau mit Diff alt/neu, nichts geschrieben. Mit confirm=true wird
+    vorher ein JSON-Backup des alten CSS ausserhalb des Webroots angelegt
+    (backup_id für wp_custom_css_rollback), geschrieben, erneut gelesen und
+    kontrolliert; danach `wp cache flush` (Objekt-Cache). Seiten-Caches
+    (z.B. WP Super Cache) ggf. zusätzlich leeren.
+    """
+    if mode not in ("replace", "append"):
+        raise ValueError("mode muss 'replace' oder 'append' sein.")
+    st = _wp_check_stylesheet(stylesheet)
+    text = _wp_check_css(css)
+    if mode == "append" and not text.strip():
+        raise ValueError("Leeres css kann nicht angehängt werden.")
+    return _wp_css_change(domain, wp_path, st, text, mode, confirm, "wp_custom_css_update")
+
+
+@mcp.tool()
+def wp_custom_css_rollback(backup_id: str, confirm: bool = False) -> str:
+    """Spielt ein von wp_custom_css_update angelegtes Backup zurück (das
+    damalige komplette CSS des Themes). Ohne confirm=true nur Vorschau mit
+    Diff. Vor dem Zurückspielen wird der aktuelle Stand selbst wieder als
+    Backup abgelegt (neue backup_id in der Rückgabe).
+    """
+    m = _WP_BACKUP_ID_RE.match(backup_id.strip())
+    if not m:
+        raise ValueError(f"Ungültige backup_id: {backup_id!r}")
+    bid = m.group(0)
+    d = _wp_domain(m.group(3))
+    client = _ssh_connect()
+    try:
+        ctx = _wp_context(client, d)
+        out, err, rc = _wp_run_as_user(
+            client, ctx,
+            ["/bin/cat", "--", f"{ctx['home']}/{_WP_CSS_BACKUP_SUBDIR}/{bid}.json"],
+            cwd=ctx["home"],
+        )
+    finally:
+        client.close()
+    if rc != 0:
+        raise ValueError(f"Backup '{bid}' nicht gefunden: {err.strip()}")
+    try:
+        record = json.loads(out)
+        st = _wp_check_stylesheet(record["stylesheet"])
+        wp_path = record["wp_path"]
+        old_css = record["old_css"]
+        if record.get("domain") != d or not isinstance(old_css, str) or not isinstance(wp_path, str):
+            raise ValueError("Inhalt passt nicht zur backup_id")
+    except (ValueError, KeyError, TypeError) as e:
+        raise ValueError(f"Backup '{bid}' ist ungültig: {e}")
+    return _wp_css_change(d, wp_path, st, old_css, "replace", confirm, f"wp_custom_css_rollback:{bid}")
 
 
 @mcp.tool()

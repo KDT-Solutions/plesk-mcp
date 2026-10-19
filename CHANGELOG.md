@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.26
+
+- Neue Tools `wp_custom_css_show`, `wp_custom_css_update` und `wp_custom_css_rollback` für das "Zusätzliche CSS" des WordPress-Customizers (Design > Customizer > Zusätzliches CSS, `custom_css`-Post je Theme). Damit landet CSS dort, wo es auch im Backend sichtbar und editierbar ist, statt als mu-Plugin oder Theme-Datei.
+  - Läuft wie `wp_option_update` über WP-CLI als System-User der Subscription (nie root): `wp eval` mit festem PHP-Code (`wp_get_custom_css`/`wp_update_custom_css_post`), das CSS wird per stdin übergeben und steht nie im Code; der Theme-Name nur nach Regex-Prüfung als Literal. WordPress legt dabei wie im Customizer eine Revision an.
+  - `mode`: `replace` (Standard) oder `append`; `stylesheet` leer = aktives Theme, sonst Theme-Verzeichnis (Hinweis, wenn es nicht das aktive ist).
+  - Ohne `confirm=true` nur Vorschau mit Unified-Diff alt/neu; mit `confirm=true` vorher JSON-Backup des alten CSS unter `/var/www/vhosts/<domain>/.plesk-mcp/wp-custom-css-backups/<backup_id>.json` (0600, Subscription-User), dann Schreiben, erneut Lesen und Kontrolle, danach `wp cache flush` (best effort). Grenzen: 512 KB, kein Nullbyte, kein `</style`.
+  - `wp_custom_css_rollback(backup_id)` stellt das damalige komplette CSS wieder her und legt vorher selbst ein Backup an.
+- Tests: `tests/test_wp_custom_css.py` (Validierung ohne Serverzugriff).
+
 ## 0.25
 
 - Neuer Endpunkt `GET /healthz` ohne Auth, liefert nur `{"status": "ok"}`. Prüft nur, ob der Prozess antwortet, nicht Plesk oder die SSH-Verbindung. Alle anderen Pfade brauchen weiterhin `MCP_API_KEY` (bzw. `/upload/{id}` das Einmal-Token).
