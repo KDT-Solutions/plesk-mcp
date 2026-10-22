@@ -31,7 +31,9 @@ jobs:
         id: version
         run: |
           base=$(sed -n 's/^_VERSION_BASE = "\(.*\)"$/\1/p' server.py)
-          count=$(git rev-list --count HEAD -- server.py Dockerfile requirements.txt .github/workflows/docker-publish.yml)
+          # Patch = Commits seit dem Commit, der _VERSION_BASE zuletzt geaendert hat
+          base_commit=$(git log -1 --format=%H -G '^_VERSION_BASE = "' -- server.py)
+          count=$(git rev-list --count "${base_commit}..HEAD" -- server.py Dockerfile requirements.txt .github/workflows/docker-publish.yml)
           test -n "$base" && test -n "$count"
           echo "version=${base}.${count}" >> "$GITHUB_OUTPUT"
           echo "Version: ${base}.${count}"
