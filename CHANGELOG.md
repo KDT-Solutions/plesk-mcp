@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.27
+
+- Neue Tools `wp_plugin_list`, `wp_plugin_update` und `wp_plugin_rollback` für WordPress-Plugin-Updates per WP-CLI (als System-User der Subscription, nie root).
+  - `wp_plugin_list` zeigt Status, installierte Version und verfügbares Update je Plugin (`only_updates=true` nur Plugins mit Update).
+  - `wp_plugin_update`: einzelne Plugins (`plugins`, Slugs) oder `all_updates=true` für alle mit verfügbarem Update; optional `version` für genau ein Plugin (auch Downgrade). Must-use-Plugins und Drop-ins werden übersprungen. Ohne `confirm=true` nur Vorschau alt/neu.
+  - Mit `confirm=true` vorher Backup jedes Plugins als tar.gz unter `/var/www/vhosts/<domain>/.plesk-mcp/wp-plugin-backups/<backup_id>/` (0600, mit Manifest), dann `wp plugin update`, danach Kontrolle der Versionen und der Startseite. Liefert die Startseite vorher keinen 5xx-Fehler und danach schon, werden die Plugins automatisch zurückgestellt.
+  - `wp_plugin_rollback(backup_id)` stellt alle oder einzelne Plugins aus dem Backup wieder her und sichert vorher den aktuellen Stand. Datenbank-Änderungen eines Updates werden nicht zurückgestellt.
+  - Neue Umgebungsvariable `WP_PLUGIN_UPDATE_TIMEOUT` (Standard 600 Sekunden).
+- Tests: `tests/test_wp_plugin.py` (Validierung ohne Serverzugriff).
+
 ## 0.26
 
 - Neue Tools `wp_custom_css_show`, `wp_custom_css_update` und `wp_custom_css_rollback` für das "Zusätzliche CSS" des WordPress-Customizers (Design > Customizer > Zusätzliches CSS, `custom_css`-Post je Theme). Damit landet CSS dort, wo es auch im Backend sichtbar und editierbar ist, statt als mu-Plugin oder Theme-Datei.
