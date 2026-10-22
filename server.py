@@ -85,7 +85,7 @@ _MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 # Dateien (server.py, Dockerfile, requirements.txt, Workflow) geaendert haben.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.26"
+_VERSION_BASE = "0.27"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -3935,6 +3935,7 @@ def _wp_run_as_user(
     argv: list[str],
     cwd: str,
     stdin_data: bytes | None = None,
+    timeout: int | None = None,
 ) -> tuple[str, str, int]:
     """Führt argv als System-User der Subscription aus (runuser, leere
     Umgebung, HOME = Subscription-Home) - nie als root."""
@@ -3943,7 +3944,7 @@ def _wp_run_as_user(
         f"env -i HOME={shlex.quote(ctx['home'])} PATH=/usr/bin:/bin "
         + " ".join(shlex.quote(a) for a in argv)
     )
-    return _client_exec(client, cmd, timeout=_WP_CLI_TIMEOUT, stdin_data=stdin_data)
+    return _client_exec(client, cmd, timeout=timeout or _WP_CLI_TIMEOUT, stdin_data=stdin_data)
 
 
 def _wp_cli(
@@ -4771,6 +4772,452 @@ def wp_comment_moderate(
             result["fehler"] = errors
     else:
         result["ergebnis"] = f"{len(ok)} Kommentar(e): {action} ausgeführt und kontrolliert."
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# WordPress-Plugins aktualisieren (wp plugin update) mit Backup und Rollback
+# ---------------------------------------------------------------------------
+#
+# Läuft wie die übrigen wp_*-Tools per WP-CLI als System-User der
+# Subscription (nie root). Vor jedem Update wird jedes betroffene Plugin
+# (Verzeichnis bzw. Einzeldatei) als tar.gz unter
+# <home>/.plesk-mcp/wp-plugin-backups/<backup_id>/ gesichert. Liefert die
+# Startseite vorher keinen 5xx-Fehler und danach schon, werden die Plugins
+# automatisch aus dem Backup zurückgestellt.
+
+_WP_PLUGIN_BACKUP_SUBDIR = ".plesk-mcp/wp-plugin-backups"
+_WP_PLUGIN_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$")
+_WP_PLUGIN_VERSION_RE = re.compile(r"^[0-9][0-9A-Za-z.+-]{0,39}$")
+_WP_PLUGIN_FIELDS = "name,title,status,version,update,update_version"
+_WP_PLUGIN_MAX = 50
+_WP_PLUGIN_UPDATE_TIMEOUT = int(os.environ.get("WP_PLUGIN_UPDATE_TIMEOUT", "600"))
+
+# Backup eines Plugins als Subscription-User: $1 Backup-Ordner, $2 Zieldatei,
+# $3 Plugin-Verzeichnis von WordPress, $4 Eintrag darin (Ordner oder .php)
+_WP_PLUGIN_BACKUP_SH = (
+    'umask 077 && mkdir -p "$1" && [ ! -e "$2" ] && '
+    'tar -czf "$2" -C "$3" -- "$4"'
+)
+# Wiederherstellen: entpacken in einen Temp-Ordner im Plugin-Verzeichnis,
+# dann aktuellen Stand wegschieben und den alten an seine Stelle setzen.
+# $1 Plugin-Verzeichnis, $2 Archiv, $3 Eintrag
+_WP_PLUGIN_RESTORE_SH = (
+    'set -e; cd "$1"; t=$(mktemp -d .plesk-mcp-restore.XXXXXX); '
+    'if ! tar -xzf "$2" -C "$t" --no-same-owner -- "$3" || [ ! -e "$t/$3" ]; then '
+    'rm -rf -- "$t"; exit 3; fi; '
+    'if [ -e "$3" ] || [ -L "$3" ]; then mv -- "$3" "$t/.old"; fi; '
+    'mv -- "$t/$3" "$3"; rm -rf -- "$t"'
+)
+
+
+def _wp_plugin_slugs(plugins: list[str] | str) -> list[str]:
+    items = [plugins] if isinstance(plugins, str) else list(plugins or [])
+    out: list[str] = []
+    for p in items:
+        s = str(p).strip()
+        if not _WP_PLUGIN_SLUG_RE.match(s) or ".." in s:
+            raise ValueError(
+                f"Ungültiger Plugin-Name {p!r} - erwartet wird der Slug (Verzeichnisname), z.B. 'woocommerce'."
+            )
+        if s not in out:
+            out.append(s)
+    if len(out) > _WP_PLUGIN_MAX:
+        raise ValueError(f"Höchstens {_WP_PLUGIN_MAX} Plugins pro Aufruf.")
+    return out
+
+
+def _wp_plugin_check_version(version: str) -> str:
+    v = (version or "").strip()
+    if v and not _WP_PLUGIN_VERSION_RE.match(v):
+        raise ValueError(f"Ungültige Version {version!r}.")
+    return v
+
+
+def _wp_plugin_list(client, ctx, wp_dir: str) -> dict[str, dict[str, Any]]:
+    rows = _wp_json(_wp_cli(
+        client, ctx, wp_dir, ["plugin", "list", f"--fields={_WP_PLUGIN_FIELDS}", "--format=json"]
+    ))
+    if not isinstance(rows, list):
+        raise SSHError("Unerwartete Antwort von 'wp plugin list'.")
+    return {str(r.get("name")): r for r in rows if r.get("name")}
+
+
+def _wp_plugin_view(r: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": r.get("name"),
+        "titel": r.get("title"),
+        "status": r.get("status"),
+        "version": r.get("version"),
+        "update": r.get("update"),
+        "update_version": r.get("update_version") or None,
+    }
+
+
+def _wp_plugin_dir(client, ctx, wp_dir: str, domain: str) -> str:
+    """Plugin-Verzeichnis von WordPress (WP_PLUGIN_DIR), muss im Vhost liegen."""
+    out = _wp_cli(client, ctx, wp_dir, ["plugin", "path"]).strip().splitlines()
+    pdir = posixpath.normpath(out[-1].strip()) if out else ""
+    if not pdir.startswith(f"{_VHOST_BASE}/{domain}/"):
+        raise ValueError(f"Plugin-Verzeichnis {pdir!r} liegt nicht unter dem Vhost von '{domain}'.")
+    sftp = client.open_sftp()
+    try:
+        _assert_real_within_vhost(sftp, pdir, domain)
+    finally:
+        sftp.close()
+    return pdir
+
+
+def _wp_plugin_entry(client, pdir: str, slug: str) -> str:
+    """Ordner <slug> oder Einzeldatei <slug>.php im Plugin-Verzeichnis."""
+    sftp = client.open_sftp()
+    try:
+        for entry, want_dir in ((slug, True), (f"{slug}.php", False)):
+            try:
+                st = sftp.lstat(f"{pdir}/{entry}")
+            except FileNotFoundError:
+                continue
+            if (stat.S_ISDIR(st.st_mode) if want_dir else stat.S_ISREG(st.st_mode)):
+                return entry
+    finally:
+        sftp.close()
+    raise ValueError(f"Plugin '{slug}' nicht als Ordner oder .php-Datei in {pdir} gefunden.")
+
+
+def _wp_plugin_backup(client, ctx, wp_path: str, pdir: str, plugins: dict[str, dict[str, Any]],
+                      source: str) -> str:
+    """Sichert die Plugins als tar.gz und legt manifest.json daneben."""
+    ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    backup_id = f"{ts}-{os.urandom(4).hex()}@{ctx['domain']}"
+    bdir = f"{ctx['home']}/{_WP_PLUGIN_BACKUP_SUBDIR}/{backup_id}"
+    entries: dict[str, Any] = {}
+    for slug, row in plugins.items():
+        entry = _wp_plugin_entry(client, pdir, slug)
+        _, err, rc = _wp_run_as_user(
+            client, ctx,
+            ["/bin/sh", "-c", _WP_PLUGIN_BACKUP_SH, "sh", bdir, f"{bdir}/{slug}.tar.gz", pdir, entry],
+            cwd=ctx["home"], timeout=_WP_PLUGIN_UPDATE_TIMEOUT,
+        )
+        if rc != 0:
+            raise SSHError(f"Backup von '{slug}' fehlgeschlagen - nichts geändert: {err.strip()}")
+        entries[slug] = {"entry": entry, "archive": f"{slug}.tar.gz",
+                         "version": row.get("version"), "status": row.get("status")}
+    record = {
+        "id": backup_id,
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "source": source,
+        "domain": ctx["domain"],
+        "wp_path": wp_path,
+        "plugin_dir": pdir,
+        "plugins": entries,
+    }
+    data = json.dumps(record, ensure_ascii=False, indent=2).encode("utf-8")
+    _, err, rc = _wp_run_as_user(
+        client, ctx,
+        ["/bin/sh", "-c", 'umask 077 && set -C && cat > "$1"', "sh", f"{bdir}/manifest.json"],
+        cwd=ctx["home"], stdin_data=data,
+    )
+    if rc != 0:
+        raise SSHError(f"Backup-Manifest konnte nicht angelegt werden - nichts geändert: {err.strip()}")
+    return backup_id
+
+
+def _wp_plugin_restore(client, ctx, backup_id: str, record: dict[str, Any],
+                       slugs: list[str]) -> list[str]:
+    """Stellt die Plugins aus dem Backup zurück; gibt Fehler je Plugin zurück."""
+    bdir = f"{ctx['home']}/{_WP_PLUGIN_BACKUP_SUBDIR}/{backup_id}"
+    errors = []
+    for slug in slugs:
+        e = record["plugins"][slug]
+        _, err, rc = _wp_run_as_user(
+            client, ctx,
+            ["/bin/sh", "-c", _WP_PLUGIN_RESTORE_SH, "sh",
+             record["plugin_dir"], f"{bdir}/{e['archive']}", e["entry"]],
+            cwd=record["plugin_dir"], timeout=_WP_PLUGIN_UPDATE_TIMEOUT,
+        )
+        if rc != 0:
+            errors.append(f"{slug}: Wiederherstellen fehlgeschlagen ({err.strip() or f'rc={rc}'})")
+    return errors
+
+
+def _wp_plugin_read_backup(client, ctx, backup_id: str) -> dict[str, Any]:
+    out, err, rc = _wp_run_as_user(
+        client, ctx,
+        ["/bin/cat", "--", f"{ctx['home']}/{_WP_PLUGIN_BACKUP_SUBDIR}/{backup_id}/manifest.json"],
+        cwd=ctx["home"],
+    )
+    if rc != 0:
+        raise ValueError(f"Backup '{backup_id}' nicht gefunden: {err.strip()}")
+    try:
+        record = json.loads(out)
+        plugins = record["plugins"]
+        if record.get("domain") != ctx["domain"] or not isinstance(plugins, dict) or not plugins:
+            raise ValueError("Inhalt passt nicht zur backup_id")
+        _wp_plugin_slugs(list(plugins))
+        pdir = posixpath.normpath(str(record["plugin_dir"]))
+        if pdir != record["plugin_dir"] or not pdir.startswith(f"{_VHOST_BASE}/{ctx['domain']}/"):
+            raise ValueError("Plugin-Verzeichnis ungültig")
+        for slug, e in plugins.items():
+            if e.get("entry") not in (slug, f"{slug}.php") or e.get("archive") != f"{slug}.tar.gz":
+                raise ValueError(f"Eintrag für '{slug}' ungültig")
+        if not isinstance(record["wp_path"], str):
+            raise ValueError("wp_path fehlt")
+    except (ValueError, KeyError, TypeError, AttributeError) as e:
+        raise ValueError(f"Backup '{backup_id}' ist ungültig: {e}")
+    return record
+
+
+def _wp_plugin_targets(installed: dict[str, dict[str, Any]], slugs: list[str],
+                       all_updates: bool, version: str) -> tuple[list[str], dict[str, str]]:
+    """Wählt die zu aktualisierenden Plugins; zweiter Wert: übersprungene mit Grund."""
+    skipped: dict[str, str] = {}
+    if all_updates:
+        cand = [n for n, r in installed.items() if r.get("update") == "available"]
+    else:
+        cand = []
+        for s in slugs:
+            r = installed.get(s)
+            if r is None:
+                skipped[s] = "nicht installiert"
+            elif r.get("status") in ("must-use", "dropin"):
+                skipped[s] = f"{r.get('status')} - nicht per WP-CLI aktualisierbar"
+            elif version:
+                if str(r.get("version")) == version:
+                    skipped[s] = f"Version {version} ist bereits installiert"
+                else:
+                    cand.append(s)
+            elif r.get("update") != "available":
+                skipped[s] = f"kein Update verfügbar (update={r.get('update')!r})"
+            else:
+                cand.append(s)
+    return cand, skipped
+
+
+@mcp.tool()
+def wp_plugin_list(domain: str, wp_path: str, only_updates: bool = False) -> str:
+    """Listet die Plugins einer WordPress-Installation per WP-CLI mit Status,
+    installierter Version und verfügbarem Update (`wp plugin list`).
+
+    domain: z.B. "example.com"; wp_path: WordPress-Verzeichnis relativ zu
+    /var/www/vhosts/<domain>/ (z.B. "httpdocs").
+    only_updates=true: nur Plugins mit verfügbarem Update. Rein lesend.
+    """
+    d = _wp_domain(domain)
+    client = _ssh_connect()
+    try:
+        ctx = _wp_context(client, d)
+        sftp = client.open_sftp()
+        try:
+            wp_dir = _wp_install_dir(sftp, d, wp_path)
+        finally:
+            sftp.close()
+        installed = _wp_plugin_list(client, ctx, wp_dir)
+    finally:
+        client.close()
+    rows = [_wp_plugin_view(r) for r in installed.values()
+            if not only_updates or r.get("update") == "available"]
+    return json.dumps({
+        "domain": d,
+        "wp_path": wp_dir,
+        "anzahl": len(rows),
+        "updates_verfuegbar": sum(1 for r in installed.values() if r.get("update") == "available"),
+        "plugins": rows,
+    }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def wp_plugin_update(
+    domain: str,
+    wp_path: str,
+    plugins: list[str] | None = None,
+    all_updates: bool = False,
+    version: str = "",
+    confirm: bool = False,
+) -> str:
+    """Aktualisiert WordPress-Plugins per WP-CLI (`wp plugin update`, als
+    System-User der Subscription, nie root).
+
+    domain: z.B. "example.com"; wp_path: WordPress-Verzeichnis relativ zu
+    /var/www/vhosts/<domain>/ (z.B. "httpdocs").
+    plugins: Liste von Plugin-Slugs (Verzeichnisname, z.B. "woocommerce"),
+    oder all_updates=true für alle Plugins mit verfügbarem Update (nicht
+    beides). version: optional eine bestimmte Version (nur mit genau einem
+    Plugin, auch für ein Downgrade; muss auf wordpress.org verfügbar sein).
+    Ohne confirm=true nur Vorschau (installierte und neue Version je Plugin,
+    nichts geändert). Mit confirm=true: Backup jedes Plugins als tar.gz unter
+    /var/www/vhosts/<domain>/.plesk-mcp/wp-plugin-backups/<backup_id>/, dann
+    Update, danach Kontrolle der Versionen und der Startseite. Liefert die
+    Startseite vorher keinen 5xx-Fehler und danach schon, werden die Plugins
+    automatisch zurückgestellt. Rückgängig machen: wp_plugin_rollback(backup_id).
+    """
+    slugs = _wp_plugin_slugs(plugins or [])
+    v = _wp_plugin_check_version(version)
+    if all_updates and slugs:
+        raise ValueError("Entweder plugins angeben oder all_updates=true, nicht beides.")
+    if not all_updates and not slugs:
+        raise ValueError("plugins angeben oder all_updates=true setzen.")
+    if v and (all_updates or len(slugs) != 1):
+        raise ValueError("version ist nur mit genau einem Plugin möglich.")
+    d = _wp_domain(domain)
+    client = _ssh_connect()
+    try:
+        ctx = _wp_context(client, d)
+        sftp = client.open_sftp()
+        try:
+            wp_dir = _wp_install_dir(sftp, d, wp_path)
+        finally:
+            sftp.close()
+        installed = _wp_plugin_list(client, ctx, wp_dir)
+        targets, skipped = _wp_plugin_targets(installed, slugs, all_updates, v)
+        result: dict[str, Any] = {
+            "domain": d,
+            "wp_path": wp_dir,
+            "system_user": ctx["login"],
+            "updates": [
+                {"name": s, "status": installed[s].get("status"),
+                 "alt": installed[s].get("version"),
+                 "neu": v or installed[s].get("update_version")}
+                for s in targets
+            ],
+        }
+        if skipped:
+            result["uebersprungen"] = skipped
+        if not targets:
+            result["ergebnis"] = "Nichts zu aktualisieren."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        if not confirm:
+            result["ergebnis"] = "Vorschau - nichts geändert. Mit confirm=true ausführen."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+
+        http_before, _ = _phps_http(d)
+        pdir = _wp_plugin_dir(client, ctx, wp_dir, d)
+        backup_id = _wp_plugin_backup(
+            client, ctx, wp_path, pdir, {s: installed[s] for s in targets}, "wp_plugin_update"
+        )
+        args = ["plugin", "update", *targets]
+        if v:
+            args.append(f"--version={v}")
+        out, err, rc = _wp_run_as_user(
+            client, ctx,
+            [ctx["php"], _WP_CLI_PATH, f"--path={wp_dir}", "--no-color", *args],
+            cwd=wp_dir, timeout=_WP_PLUGIN_UPDATE_TIMEOUT,
+        )
+        after = _wp_plugin_list(client, ctx, wp_dir)
+        updated, unchanged = [], {}
+        for s in targets:
+            now = after.get(s, {}).get("version")
+            want = v or installed[s].get("update_version")
+            if now == want or (not want and now != installed[s].get("version")):
+                updated.append(s)
+            else:
+                unchanged[s] = now or "nicht mehr vorhanden"
+        http_after, http_detail = _phps_http(d)
+        restored: list[str] = []
+        restore_errors: list[str] = []
+        if http_before is not None and http_before < 500 and http_after is not None and http_after >= 500:
+            record = _wp_plugin_read_backup(client, ctx, backup_id)
+            restore_errors = _wp_plugin_restore(client, ctx, backup_id, record, targets)
+            restored = [s for s in targets if not any(e.startswith(f"{s}:") for e in restore_errors)]
+            http_after, http_detail = _phps_http(d)
+    finally:
+        client.close()
+
+    result["backup_id"] = backup_id
+    result["backup_ordner"] = f"{ctx['home']}/{_WP_PLUGIN_BACKUP_SUBDIR}/{backup_id}"
+    result["aktualisiert"] = [] if restored else updated
+    result["startseite"] = http_detail
+    if rc != 0:
+        result["wp_cli_fehler"] = "\n".join((err.strip() or out.strip()).splitlines()[-10:])
+    if restored or restore_errors:
+        result["ergebnis"] = (
+            "Startseite lieferte nach dem Update einen 5xx-Fehler - Plugins aus dem Backup zurückgestellt."
+            if not restore_errors else
+            "Startseite lieferte nach dem Update einen 5xx-Fehler - Zurückstellen teilweise fehlgeschlagen!"
+        )
+        result["zurueckgestellt"] = restored
+        if restore_errors:
+            result["fehler"] = restore_errors
+    elif unchanged or rc != 0:
+        result["ergebnis"] = "Teilweise fehlgeschlagen - Rollback mit backup_id möglich."
+        result["nicht_aktualisiert"] = unchanged
+    else:
+        result["ergebnis"] = f"{len(updated)} Plugin(s) aktualisiert und kontrolliert."
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+def wp_plugin_rollback(backup_id: str, plugins: list[str] | None = None, confirm: bool = False) -> str:
+    """Stellt Plugins aus einem Backup von wp_plugin_update wieder her
+    (kompletter damaliger Plugin-Ordner bzw. -Datei).
+
+    plugins: optional nur diese Slugs aus dem Backup, sonst alle.
+    Ohne confirm=true nur Vorschau (Version im Backup vs. aktuell). Vor dem
+    Zurückstellen wird der aktuelle Stand selbst wieder gesichert (neue
+    backup_id in der Rückgabe). Datenbank-Änderungen, die ein Plugin-Update
+    gemacht hat, werden nicht zurückgestellt.
+    """
+    m = _WP_BACKUP_ID_RE.match((backup_id or "").strip())
+    if not m:
+        raise ValueError(f"Ungültige backup_id: {backup_id!r}")
+    only = _wp_plugin_slugs(plugins or [])
+    bid = m.group(0)
+    d = _wp_domain(m.group(3))
+    client = _ssh_connect()
+    try:
+        ctx = _wp_context(client, d)
+        record = _wp_plugin_read_backup(client, ctx, bid)
+        missing = [s for s in only if s not in record["plugins"]]
+        if missing:
+            raise ValueError(f"Nicht im Backup enthalten: {', '.join(missing)}")
+        slugs = only or list(record["plugins"])
+        sftp = client.open_sftp()
+        try:
+            wp_dir = _wp_install_dir(sftp, d, record["wp_path"])
+            _assert_real_within_vhost(sftp, record["plugin_dir"], d)
+        finally:
+            sftp.close()
+        installed = _wp_plugin_list(client, ctx, wp_dir)
+        result: dict[str, Any] = {
+            "domain": d,
+            "wp_path": wp_dir,
+            "backup_id": bid,
+            "plugins": [
+                {"name": s, "version_backup": record["plugins"][s].get("version"),
+                 "version_aktuell": installed.get(s, {}).get("version") or "nicht installiert"}
+                for s in slugs
+            ],
+        }
+        if not confirm:
+            result["ergebnis"] = "Vorschau - nichts geändert. Mit confirm=true ausführen."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+
+        present = {s: installed[s] for s in slugs if s in installed}
+        new_bid = None
+        if present:
+            new_bid = _wp_plugin_backup(
+                client, ctx, record["wp_path"], record["plugin_dir"], present,
+                f"wp_plugin_rollback:{bid}",
+            )
+        errors = _wp_plugin_restore(client, ctx, bid, record, slugs)
+        after = _wp_plugin_list(client, ctx, wp_dir)
+    finally:
+        client.close()
+
+    mismatches = {
+        s: after.get(s, {}).get("version") or "nicht vorhanden"
+        for s in slugs
+        if after.get(s, {}).get("version") != record["plugins"][s].get("version")
+    }
+    if new_bid:
+        result["neues_backup_id"] = new_bid
+    if errors or mismatches:
+        result["ergebnis"] = "Teilweise fehlgeschlagen."
+        if errors:
+            result["fehler"] = errors
+        if mismatches:
+            result["abweichend_nach_kontrolle"] = mismatches
+    else:
+        result["ergebnis"] = f"{len(slugs)} Plugin(s) zurückgestellt und kontrolliert."
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
