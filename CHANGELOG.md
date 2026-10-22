@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.29
+
+- Neue Tools `wc_order_get` und `wc_order_mark_shipped` für WooCommerce-Bestellungen. `wc_order_get` zeigt Status, Betrag, Adressen, Positionen, eingetragene Sendungsverfolgung und die Sendungsnummer eines Label-Plugins (`_spap_tracking`). `wc_order_mark_shipped` trägt die Sendungsnummer über das Shipment-Tracking-Plugin ein (`wc_st_add_tracking_number`, Provider-Standard `swiss-post`, leer = Nummer aus dem Label-Plugin) und setzt den Status auf "Abgeschlossen" (`set_completed=false`: nur Tracking). Fester PHP-Code per `wp eval`, Werte als JSON per stdin, ohne `confirm=true` nur Vorschau, danach Kontrolle. Ersetzt Einmal-PHP-Skripte im Webroot.
+- Tests: `tests/test_wc_order.py`.
+
 ## 0.28
 
 - WP-CLI startet mit dem `memory_limit` der Domain: Alle WP-CLI-Aufrufe (`wp_option_*`, `wp_custom_css_*`, `wp_comment_*`, `wp_plugin_*`, `wp_theme_*`, `wc_coupon_*`) laufen über eine gemeinsame Funktion und rufen die WP-CLI-Phar als `<php der Domain> -d memory_limit=<wert> -d display_errors=stderr <wp-cli> ...` auf. Vorher lief WP-CLI mit dem PHP-CLI-Standard (128M) und brach bei grösseren Installationen (z.B. WooCommerce plus Jetpack) mit "Allowed memory size ... exhausted" ab.

@@ -88,7 +88,7 @@ _MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 # Commit mit einer neuen Basis ergibt also <Basis>.0.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.28"
+_VERSION_BASE = "0.29"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -5946,6 +5946,193 @@ def wc_coupon_delete(
     else:
         st = (after or {}).get("status")
         result["ergebnis"] = "In den Papierkorb verschoben." if st == "trash" else f"Status nach Löschen: {st!r} (erwartet 'trash')."
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# WooCommerce-Bestellungen: lesen und als verschickt markieren (mit Tracking)
+# ---------------------------------------------------------------------------
+
+_WC_TRACKING_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-]{3,49}$")
+_WC_PROVIDER_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,49}$")
+# Meta-Felder, in denen Versand-Plugins die Sendungsnummer ablegen (z.B. das
+# Post-Label-Plugin), als Quelle, wenn keine Sendungsnummer übergeben wird.
+_WC_LABEL_TRACKING_KEYS = ("_spap_tracking",)
+
+# Fester PHP-Code für `wp eval`; alle Werte kommen als JSON per stdin, nie in
+# den Code. Bestellungen über die WooCommerce-API (HPOS-kompatibel).
+_WC_ORDER_VIEW_PHP = r'''
+function plmcp_order_view($o, $label_keys) {
+    $items = array();
+    foreach ($o->get_items() as $it) { $items[] = array("name" => $it->get_name(), "qty" => $it->get_quantity(), "total" => $it->get_total()); }
+    $label = array();
+    foreach ($label_keys as $k) { $v = $o->get_meta($k); if ($v !== "" && $v !== null) { $label[$k] = (string) $v; } }
+    $tr = $o->get_meta("_wc_shipment_tracking_items");
+    return array(
+        "id" => $o->get_id(), "number" => $o->get_order_number(), "status" => $o->get_status(),
+        "total" => $o->get_total(), "currency" => $o->get_currency(),
+        "date_created" => $o->get_date_created() ? $o->get_date_created()->date("c") : null,
+        "billing" => array("name" => trim($o->get_billing_first_name() . " " . $o->get_billing_last_name()), "company" => $o->get_billing_company(), "email" => $o->get_billing_email()),
+        "shipping" => array("name" => trim($o->get_shipping_first_name() . " " . $o->get_shipping_last_name()), "company" => $o->get_shipping_company(), "address" => trim($o->get_shipping_address_1() . " " . $o->get_shipping_address_2()), "postcode" => $o->get_shipping_postcode(), "city" => $o->get_shipping_city(), "country" => $o->get_shipping_country()),
+        "payment_method" => $o->get_payment_method_title(),
+        "items" => $items,
+        "tracking_items" => is_array($tr) ? array_values($tr) : array(),
+        "label_tracking" => $label,
+    );
+}
+$in = json_decode(stream_get_contents(STDIN), true);
+$o = wc_get_order((int) $in["id"]);
+if (!$o || $o->get_type() !== "shop_order") { fwrite(STDERR, "Bestellung nicht gefunden"); exit(1); }
+'''
+
+_WC_ORDER_GET_PHP = _WC_ORDER_VIEW_PHP + r'''
+echo json_encode(array("order" => plmcp_order_view($o, $in["label_keys"]),
+    "tracking_function" => function_exists("wc_st_add_tracking_number")));
+'''
+
+_WC_ORDER_SHIP_PHP = _WC_ORDER_VIEW_PHP + r'''
+$nr = (string) $in["tracking_number"]; $prov = (string) $in["provider"];
+$done = array();
+$exists = false;
+$tr = $o->get_meta("_wc_shipment_tracking_items");
+if (is_array($tr)) { foreach ($tr as $t) { if (isset($t["tracking_number"]) && (string) $t["tracking_number"] === $nr) { $exists = true; } } }
+if (!$exists) {
+    if (!function_exists("wc_st_add_tracking_number")) { fwrite(STDERR, "Kein Shipment-Tracking-Plugin aktiv (wc_st_add_tracking_number fehlt) - nichts geändert"); exit(1); }
+    wc_st_add_tracking_number($o->get_id(), $nr, $prov, current_time("Y-m-d"));
+    $done[] = "tracking_hinzugefuegt";
+} else { $done[] = "tracking_bereits_vorhanden"; }
+$o = wc_get_order($o->get_id());
+$note = "Als verschickt markiert (plesk-mcp), Sendungsnummer " . $nr . ".";
+if ($in["set_completed"] && $o->get_status() !== "completed") {
+    $o->update_status("completed", $note . " ");
+    $done[] = "status_completed";
+} elseif (!$exists) {
+    $o->add_order_note($note);
+}
+$o = wc_get_order($o->get_id());
+echo json_encode(array("done" => $done, "order" => plmcp_order_view($o, $in["label_keys"])));
+'''
+
+
+def _wc_check_order_id(order_id: Any) -> int:
+    if isinstance(order_id, bool):
+        raise ValueError("order_id muss eine Bestellnummer (Ziffern) sein.")
+    s = str(order_id).strip().lstrip("#")
+    if not s.isdigit() or not 0 < int(s) < 10**9:
+        raise ValueError(f"Ungültige Bestellnummer {order_id!r}.")
+    return int(s)
+
+
+def _wc_check_tracking(nr: str) -> str:
+    s = str(nr or "").strip().replace(" ", "")
+    if not _WC_TRACKING_RE.match(s):
+        raise ValueError(f"Ungültige Sendungsnummer {nr!r} (4-50 Zeichen, Buchstaben/Ziffern/Punkt/Bindestrich).")
+    return s
+
+
+def _wc_check_provider(provider: str) -> str:
+    p = str(provider or "").strip().lower()
+    if not _WC_PROVIDER_RE.match(p):
+        raise ValueError(f"Ungültiger Versanddienstleister {provider!r} (Slug wie 'swiss-post').")
+    return p
+
+
+def _wc_order_eval(client, ctx, wp_dir: str, php: str, payload: dict[str, Any]) -> dict[str, Any]:
+    data = _wp_eval(client, ctx, wp_dir, php,
+                    stdin_data=json.dumps({**payload, "label_keys": list(_WC_LABEL_TRACKING_KEYS)}).encode("utf-8"))
+    if not isinstance(data, dict) or "order" not in data:
+        raise SSHError("Unerwartete Antwort beim Lesen der Bestellung.")
+    return data
+
+
+@mcp.tool()
+@_wp_reporting
+def wc_order_get(domain: str, wp_path: str, order_id: str) -> str:
+    """Zeigt eine WooCommerce-Bestellung: Status, Betrag, Rechnungs-/Lieferadresse,
+    Positionen, eingetragene Sendungsverfolgung (Shipment Tracking) und die
+    Sendungsnummer eines Label-Plugins (z.B. Post-Label), falls vorhanden.
+    order_id: Bestellnummer (Ziffern). Rein lesend.
+    """
+    oid = _wc_check_order_id(order_id)
+    client, ctx, wp_dir, uid, d = _wc_open(domain, wp_path)
+    try:
+        data = _wc_order_eval(client, ctx, wp_dir, _WC_ORDER_GET_PHP, {"id": oid})
+    finally:
+        client.close()
+    return json.dumps({"domain": d, "wp_path": wp_dir, **data}, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+@_wp_reporting
+def wc_order_mark_shipped(
+    domain: str,
+    wp_path: str,
+    order_id: str,
+    tracking_number: str = "",
+    provider: str = "swiss-post",
+    set_completed: bool = True,
+    confirm: bool = False,
+) -> str:
+    """Markiert eine WooCommerce-Bestellung als verschickt: trägt die
+    Sendungsnummer über das Shipment-Tracking-Plugin ein
+    (wc_st_add_tracking_number, wie beim manuellen Eintragen im Backend) und
+    setzt den Status auf "Abgeschlossen" (set_completed=false: nur Tracking).
+
+    tracking_number leer = Sendungsnummer aus dem Label-Plugin der Bestellung
+    übernehmen (z.B. _spap_tracking vom Post-Label); fehlt sie dort, Abbruch.
+    provider: Slug des Versanddienstleisters, Standard "swiss-post".
+    Ohne confirm=true nur Vorschau (Bestellung, Sendungsnummer, geplante
+    Änderungen). Mit confirm=true Ausführung als Subscription-User über die
+    WooCommerce-API, danach Kontrolle. Achtung: Der Statuswechsel löst wie im
+    Backend die WooCommerce-Mail "Bestellung abgeschlossen" an den Kunden aus.
+    Ist die Sendungsnummer schon eingetragen, wird sie nicht doppelt angelegt.
+    """
+    oid = _wc_check_order_id(order_id)
+    prov = _wc_check_provider(provider)
+    nr_in = str(tracking_number or "").strip()
+    nr = _wc_check_tracking(nr_in) if nr_in else ""
+    client, ctx, wp_dir, uid, d = _wc_open(domain, wp_path)
+    try:
+        cur = _wc_order_eval(client, ctx, wp_dir, _WC_ORDER_GET_PHP, {"id": oid})
+        order = cur["order"]
+        quelle = "uebergeben"
+        if not nr:
+            label = order.get("label_tracking") or {}
+            found = [v for v in label.values() if v]
+            if not found:
+                raise ValueError("Keine Sendungsnummer übergeben und keine im Label-Plugin der Bestellung gefunden - nichts geändert.")
+            nr = _wc_check_tracking(found[0].split(",")[0])
+            quelle = "label_plugin"
+        exists = any(str(t.get("tracking_number")) == nr for t in order.get("tracking_items") or [] if isinstance(t, dict))
+        geplant = []
+        if not exists:
+            geplant.append(f"Sendungsnummer {nr} ({prov}) eintragen")
+        if set_completed and order.get("status") != "completed":
+            geplant.append(f"Status {order.get('status')!r} -> 'completed' (Mail an Kunden durch WooCommerce)")
+        result: dict[str, Any] = {"domain": d, "wp_path": wp_dir, "bestellung": oid,
+                                  "sendungsnummer": nr, "quelle_sendungsnummer": quelle,
+                                  "provider": prov, "geplant": geplant}
+        if not exists and not cur.get("tracking_function"):
+            raise ValueError("Kein Shipment-Tracking-Plugin aktiv (wc_st_add_tracking_number fehlt) - nichts geändert.")
+        if not geplant:
+            result["ergebnis"] = "Nichts zu tun - Sendungsnummer und Status sind bereits gesetzt."
+            result["order"] = order
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        if not confirm:
+            result["ergebnis"] = "Vorschau - nichts geändert. Mit confirm=true ausführen."
+            result["order"] = order
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        res = _wc_order_eval(client, ctx, wp_dir, _WC_ORDER_SHIP_PHP,
+                             {"id": oid, "tracking_number": nr, "provider": prov,
+                              "set_completed": bool(set_completed)})
+    finally:
+        client.close()
+    after = res["order"]
+    ok_tr = any(str(t.get("tracking_number")) == nr for t in after.get("tracking_items") or [] if isinstance(t, dict))
+    ok_st = (not set_completed) or after.get("status") == "completed"
+    result["ausgefuehrt"] = res.get("done")
+    result["ergebnis"] = "Ausgeführt und kontrolliert." if ok_tr and ok_st else "Ausgeführt, aber Kontrolle weicht ab - bitte Bestellung prüfen."
+    result["order"] = after
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
