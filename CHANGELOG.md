@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.28
+
+- WP-CLI startet mit dem `memory_limit` der Domain: Alle WP-CLI-Aufrufe (`wp_option_*`, `wp_custom_css_*`, `wp_comment_*`, `wp_plugin_*`, `wp_theme_*`, `wc_coupon_*`) laufen über eine gemeinsame Funktion und rufen die WP-CLI-Phar als `<php der Domain> -d memory_limit=<wert> -d display_errors=stderr <wp-cli> ...` auf. Vorher lief WP-CLI mit dem PHP-CLI-Standard (128M) und brach bei grösseren Installationen (z.B. WooCommerce plus Jetpack) mit "Allowed memory size ... exhausted" ab.
+  - Wert aus `plesk bin site --show-php-settings` ("Additional directives" vor den Standardfeldern), mindestens 256M, `-1` bzw. über 2048M wird zu 2048M. Strikte Prüfung (Zahl plus optional K/M/G), kein Shell-Interpolieren.
+  - Nicht ermittelbar: 512M, im Ergebnis als `hinweis_memory_limit` vermerkt. Der verwendete Wert steht als `php_memory_limit` im Ergebnis.
+  - Massgebend ist der Exit-Code: PHP-/WP-CLI-Warnungen (Warning, Notice, Deprecated) werden aus der Ausgabe entfernt, machen einen erfolgreichen Aufruf nicht mehr zum Fehler und stehen separat unter `warnungen`. Fehlermeldungen enthalten die letzten Zeilen ohne diese Warnungen.
+- Neue Tools `wp_theme_list`, `wp_theme_update` und `wp_theme_rollback` analog zu den Plugin-Tools: Vorschau ohne `confirm`, tar.gz-Backup je Theme unter `/var/www/vhosts/<domain>/.plesk-mcp/wp-theme-backups/<backup_id>/`, Kontrolle von Versionen und Startseite, automatisches Zurückstellen bei neuem 5xx (deutlich gemeldet), Hinweis bei aktivem Child-Theme mit aktualisiertem Parent-Theme. Plugin- und Theme-Tools nutzen denselben Unterbau.
+- Version: Der Patch-Teil zählt jetzt die Commits seit der letzten Änderung von `_VERSION_BASE` (lokal und im GitHub-Workflow). Eine neue Basis beginnt damit bei `.0`, diese Version ist `0.28.0`.
+- Tests: `tests/test_wp_cli_memory.py`, `tests/test_wp_theme.py`.
+
 ## 0.27
 
 - Neue Tools `wp_plugin_list`, `wp_plugin_update` und `wp_plugin_rollback` für WordPress-Plugin-Updates per WP-CLI (als System-User der Subscription, nie root).

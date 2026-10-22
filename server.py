@@ -69,6 +69,7 @@ import struct
 import sys
 import threading
 import time
+import contextvars
 from typing import Any
 
 import paramiko
@@ -81,11 +82,13 @@ _HTTP_PORT = int(os.environ.get("MCP_PORT", "8000"))
 _MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 
 # Version = <Major.Minor>.<Patch>. Major.Minor wird hier von Hand gepflegt, der
-# Patch-Teil zaehlt automatisch: Anzahl Commits, die eine der build-relevanten
-# Dateien (server.py, Dockerfile, requirements.txt, Workflow) geaendert haben.
+# Patch-Teil zaehlt automatisch: Anzahl Commits seit dem Commit, der diese
+# Zeile zuletzt geaendert hat, die eine der build-relevanten Dateien
+# (server.py, Dockerfile, requirements.txt, Workflow) geaendert haben. Der
+# Commit mit einer neuen Basis ergibt also <Basis>.0.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.27"
+_VERSION_BASE = "0.28"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -95,10 +98,15 @@ def _read_version() -> str:
         return env_version
     try:
         import subprocess
+        cwd = os.path.dirname(os.path.abspath(__file__))
+        base_commit = subprocess.run(
+            ["git", "log", "-1", "--format=%H", "-G", r'^_VERSION_BASE = "', "--", "server.py"],
+            cwd=cwd, capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
+        rev = f"{base_commit}..HEAD" if base_commit else "HEAD"
         count = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD", "--", *_VERSION_PATHS],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-            capture_output=True, text=True, timeout=5, check=True,
+            ["git", "rev-list", "--count", rev, "--", *_VERSION_PATHS],
+            cwd=cwd, capture_output=True, text=True, timeout=5, check=True,
         ).stdout.strip()
         if count.isdigit():
             return f"{_VERSION_BASE}.{count}"
@@ -3893,8 +3901,107 @@ def _wp_domain(domain: str) -> str:
     return d
 
 
-def _wp_context(client: paramiko.SSHClient, domain: str) -> dict[str, str]:
-    """System-User, Home und PHP-CLI der Domain aus der Plesk-Datenbank."""
+# memory_limit für WP-CLI: Wert der Domain (Plesk-PHP-Einstellungen), auf
+# 256M..2048M begrenzt; ohne ermittelbaren Wert 512M. Der PHP-CLI-Standard
+# (meist 128M) reicht für grössere Installationen (WooCommerce, Jetpack) nicht.
+_WP_MEM_RE = re.compile(r"^(\d{1,10})([KMGkmg]?)$")
+_WP_MEM_ARG_RE = re.compile(r"^\d{1,5}M$")
+_WP_MEM_MIN_MB = 256
+_WP_MEM_MAX_MB = 2048
+_WP_MEM_FALLBACK = "512M"
+# PHP-/WP-CLI-Warnungen in der Ausgabe: kein Fehler, separat gemeldet
+_WP_NOTICE_RE = re.compile(
+    r"^\s*(?:PHP\s+)?(?:Warning|Deprecated|Notice|Strict Standards|"
+    r"User (?:Warning|Deprecated|Notice))\s*:",
+    re.IGNORECASE,
+)
+_WP_NOTICE_MAX = 30
+# Sammelt pro Tool-Aufruf Warnungen und den verwendeten memory_limit
+_wp_report: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
+    "_wp_report", default=None
+)
+
+
+def _wp_memory_limit(raw: Any) -> tuple[str, bool]:
+    """memory_limit für den WP-CLI-Aufruf aus dem Wert der Domain.
+    Rückgabe: (Wert in M, aus der Domain ermittelt?). "-1" -> 2048M,
+    unter 256M -> 256M, über 2048M -> 2048M, ungültig/leer -> 512M."""
+    v = str(raw).strip() if raw is not None else ""
+    if v == "-1":
+        return f"{_WP_MEM_MAX_MB}M", True
+    m = _WP_MEM_RE.match(v)
+    if not m:
+        return _WP_MEM_FALLBACK, False
+    mult = {"": 1, "K": 1024, "M": 1024 ** 2, "G": 1024 ** 3}[m.group(2).upper()]
+    mb = int(m.group(1)) * mult // 1024 ** 2
+    return f"{max(_WP_MEM_MIN_MB, min(_WP_MEM_MAX_MB, mb))}M", True
+
+
+def _wp_domain_memory_limit(client: paramiko.SSHClient, domain: str) -> str | None:
+    """Wirksamer memory_limit der Domain aus `plesk bin site --show-php-settings`
+    (wie hosting_settings/php_settings_show); "Additional directives" haben
+    Vorrang. None, wenn nicht lesbar."""
+    try:
+        out, _, rc = _client_exec(
+            client, f"plesk bin site --show-php-settings {shlex.quote(domain)}", timeout=_HOSTING_TIMEOUT
+        )
+    except Exception:  # noqa: BLE001 - Fallback statt Abbruch
+        return None
+    if rc != 0:
+        return None
+    show = _parse_php_settings(out)
+    value = show.get("Additional directives", {}).get("memory_limit")
+    if value is None:
+        value = next((show[sec]["memory_limit"] for sec in _PHPS_SECTIONS
+                      if "memory_limit" in show.get(sec, {})), None)
+    return value
+
+
+def _wp_notices(text: str) -> list[str]:
+    return [line.strip()[:300] for line in text.splitlines() if _WP_NOTICE_RE.match(line)]
+
+
+def _wp_strip_notices(text: str) -> str:
+    return "\n".join(line for line in text.splitlines() if not _WP_NOTICE_RE.match(line))
+
+
+def _wp_reporting(fn):
+    """Für Tools mit WP-CLI: hängt an das JSON-Ergebnis den verwendeten
+    memory_limit (bei Fallback mit Hinweis) und gesammelte Warnungen an."""
+    @functools.wraps(fn)
+    def wrapper(*a: Any, **kw: Any):
+        token = _wp_report.set({"warnings": [], "memory_limit": None, "from_domain": True})
+        try:
+            out = fn(*a, **kw)
+            rep = _wp_report.get()
+        finally:
+            _wp_report.reset(token)
+        return _wp_annotate(out, rep)
+    return wrapper
+
+
+def _wp_annotate(out: Any, rep: dict[str, Any] | None) -> Any:
+    if not rep or rep.get("memory_limit") is None or not isinstance(out, str):
+        return out
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return out
+    if not isinstance(data, dict):
+        return out
+    data["php_memory_limit"] = rep["memory_limit"]
+    if not rep["from_domain"]:
+        data["hinweis_memory_limit"] = (
+            f"memory_limit der Domain nicht ermittelbar - WP-CLI mit {_WP_MEM_FALLBACK} gestartet."
+        )
+    if rep["warnings"]:
+        data["warnungen"] = rep["warnings"]
+    return json.dumps(data, ensure_ascii=False, indent=2)
+
+
+def _wp_context(client: paramiko.SSHClient, domain: str) -> dict[str, Any]:
+    """System-User, Home und PHP-CLI der Domain aus der Plesk-Datenbank,
+    dazu der memory_limit für WP-CLI."""
     sql = (
         "SELECT s.login, s.home, h.php_handler_id FROM domains d "
         "JOIN hosting h ON h.dom_id = d.id JOIN sys_users s ON s.id = h.sys_user_id "
@@ -3926,7 +4033,13 @@ def _wp_context(client: paramiko.SSHClient, domain: str) -> dict[str, str]:
         raise ValueError(
             f"PHP-CLI für den Handler {handler!r} der Domain '{domain}' nicht gefunden."
         )
-    return {"domain": domain, "login": login, "home": home, "php": php}
+    mem, from_domain = _wp_memory_limit(_wp_domain_memory_limit(client, domain))
+    rep = _wp_report.get()
+    warnings: list[str] = rep["warnings"] if rep else []
+    if rep is not None:
+        rep["memory_limit"], rep["from_domain"] = mem, from_domain
+    return {"domain": domain, "login": login, "home": home, "php": php,
+            "memory_limit": mem, "memory_from_domain": from_domain, "warnings": warnings}
 
 
 def _wp_run_as_user(
@@ -3947,23 +4060,59 @@ def _wp_run_as_user(
     return _client_exec(client, cmd, timeout=timeout or _WP_CLI_TIMEOUT, stdin_data=stdin_data)
 
 
-def _wp_cli(
-    client: paramiko.SSHClient, ctx: dict[str, str], wp_dir: str, args: list[str]
-) -> str:
+def _wp_cli_argv(ctx: dict[str, Any], wp_dir: str, args: list[str]) -> list[str]:
+    """Einziger Ort, an dem der WP-CLI-Aufruf gebaut wird: PHP der Domain mit
+    memory_limit und Fehlerausgabe auf stderr, dann die WP-CLI-Phar direkt."""
+    mem = ctx.get("memory_limit") or _WP_MEM_FALLBACK
+    if not _WP_MEM_ARG_RE.match(mem):
+        raise ValueError(f"Ungültiger memory_limit {mem!r} für WP-CLI.")
+    return [ctx["php"], "-d", f"memory_limit={mem}", "-d", "display_errors=stderr",
+            _WP_CLI_PATH, f"--path={wp_dir}", "--no-color", *args]
+
+
+def _wp_cli_run(
+    client: paramiko.SSHClient,
+    ctx: dict[str, Any],
+    wp_dir: str,
+    args: list[str],
+    stdin_data: bytes | None = None,
+    timeout: int | None = None,
+) -> tuple[str, str, int]:
+    """WP-CLI als Subscription-User. Massgebend ist der Exit-Code; PHP- und
+    WP-CLI-Warnungen werden aus stdout entfernt und in ctx["warnings"]
+    gesammelt."""
     out, err, rc = _wp_run_as_user(
-        client, ctx,
-        [ctx["php"], _WP_CLI_PATH, f"--path={wp_dir}", "--no-color", *args],
-        cwd=wp_dir,
+        client, ctx, _wp_cli_argv(ctx, wp_dir, args),
+        cwd=wp_dir, stdin_data=stdin_data, timeout=timeout,
     )
+    warnings = ctx.setdefault("warnings", [])
+    for w in _wp_notices(err) + _wp_notices(out):
+        if w not in warnings and len(warnings) < _WP_NOTICE_MAX:
+            warnings.append(w)
+    return _wp_strip_notices(out), err, rc
+
+
+def _wp_cli_error(out: str, err: str, lines: int = 5) -> str:
+    """Letzte Zeilen der Fehlerausgabe ohne Warnungen."""
+    text = _wp_strip_notices(err).strip() or _wp_strip_notices(out).strip() or err.strip() or out.strip()
+    return "\n".join(text.splitlines()[-lines:])
+
+
+def _wp_cli(
+    client: paramiko.SSHClient, ctx: dict[str, Any], wp_dir: str, args: list[str]
+) -> str:
+    out, err, rc = _wp_cli_run(client, ctx, wp_dir, args)
     if rc != 0:
-        msg = "\n".join(line for line in (err.strip() or out.strip()).splitlines()[-5:])
-        raise SSHError(f"WP-CLI 'wp {args[0]} {args[1] if len(args) > 1 else ''}' fehlgeschlagen: {msg}")
+        raise SSHError(
+            f"WP-CLI 'wp {args[0]} {args[1] if len(args) > 1 else ''}' fehlgeschlagen: {_wp_cli_error(out, err)}"
+        )
     return out
 
 
 def _wp_json(text: str) -> Any:
-    """JSON aus WP-CLI-Ausgabe; toleriert Zeilen, die Plugins vorneweg ausgeben."""
-    text = text.strip()
+    """JSON aus WP-CLI-Ausgabe; toleriert Zeilen, die Plugins vorneweg ausgeben,
+    und PHP-Warnungen."""
+    text = _wp_strip_notices(text).strip()
     try:
         return json.loads(text)
     except ValueError:
@@ -3983,17 +4132,11 @@ def _wp_get_option(
     client: paramiko.SSHClient, ctx: dict[str, str], wp_dir: str, name: str
 ) -> Any:
     """Aktueller Wert oder _WP_MISSING, falls die Option nicht existiert."""
-    out, err, rc = _wp_run_as_user(
-        client, ctx,
-        [ctx["php"], _WP_CLI_PATH, f"--path={wp_dir}", "--no-color",
-         "option", "get", name, "--format=json"],
-        cwd=wp_dir,
-    )
+    out, err, rc = _wp_cli_run(client, ctx, wp_dir, ["option", "get", name, "--format=json"])
     if rc != 0:
         if "does it exist" in (err + out).lower():
             return _WP_MISSING
-        msg = "\n".join((err.strip() or out.strip()).splitlines()[-5:])
-        raise SSHError(f"WP-CLI 'wp option get' fehlgeschlagen: {msg}")
+        raise SSHError(f"WP-CLI 'wp option get' fehlgeschlagen: {_wp_cli_error(out, err)}")
     return _wp_json(out)
 
 
@@ -4183,6 +4326,7 @@ def _wp_change(
 
 
 @mcp.tool()
+@_wp_reporting
 def wp_option_update(
     domain: str,
     wp_path: str,
@@ -4223,6 +4367,7 @@ def wp_option_update(
 
 
 @mcp.tool()
+@_wp_reporting
 def wp_option_rollback(backup_id: str, confirm: bool = False) -> str:
     """Spielt ein von wp_option_update angelegtes Backup zurück (nur die
     damals geänderten Schlüssel bzw. den Wert; damals fehlende Schlüssel
@@ -4325,14 +4470,9 @@ def _wp_eval(
     stdin_data: bytes | None = None,
 ) -> Any:
     """`wp eval <php>` als Subscription-User; Rückgabe ist das JSON der Ausgabe."""
-    out, err, rc = _wp_run_as_user(
-        client, ctx,
-        [ctx["php"], _WP_CLI_PATH, f"--path={wp_dir}", "--no-color", "eval", php],
-        cwd=wp_dir, stdin_data=stdin_data,
-    )
+    out, err, rc = _wp_cli_run(client, ctx, wp_dir, ["eval", php], stdin_data=stdin_data)
     if rc != 0:
-        msg = "\n".join(line for line in (err.strip() or out.strip()).splitlines()[-5:])
-        raise SSHError(f"WP-CLI 'wp eval' fehlgeschlagen: {msg}")
+        raise SSHError(f"WP-CLI 'wp eval' fehlgeschlagen: {_wp_cli_error(out, err)}")
     return _wp_json(out)
 
 
@@ -4451,6 +4591,7 @@ def _wp_css_change(domain: str, wp_path: str, stylesheet: str, new_css: str,
 
 
 @mcp.tool()
+@_wp_reporting
 def wp_custom_css_show(domain: str, wp_path: str, stylesheet: str = "") -> str:
     """Zeigt das "Zusätzliche CSS" aus dem WordPress-Customizer (Design >
     Customizer > Zusätzliches CSS) einer Installation - standardmässig für
@@ -4484,6 +4625,7 @@ def wp_custom_css_show(domain: str, wp_path: str, stylesheet: str = "") -> str:
 
 
 @mcp.tool()
+@_wp_reporting
 def wp_custom_css_update(
     domain: str,
     wp_path: str,
@@ -4520,6 +4662,7 @@ def wp_custom_css_update(
 
 
 @mcp.tool()
+@_wp_reporting
 def wp_custom_css_rollback(backup_id: str, confirm: bool = False) -> str:
     """Spielt ein von wp_custom_css_update angelegtes Backup zurück (das
     damalige komplette CSS des Themes). Ohne confirm=true nur Vorschau mit
@@ -4634,6 +4777,7 @@ def _wp_comment_fetch(client, ctx, wp_dir: str, ids: list[int]) -> dict[int, dic
 
 
 @mcp.tool()
+@_wp_reporting
 def wp_comment_list(
     domain: str,
     wp_path: str,
@@ -4689,6 +4833,7 @@ def wp_comment_list(
 
 
 @mcp.tool()
+@_wp_reporting
 def wp_comment_moderate(
     domain: str,
     wp_path: str,
@@ -4776,32 +4921,47 @@ def wp_comment_moderate(
 
 
 # ---------------------------------------------------------------------------
-# WordPress-Plugins aktualisieren (wp plugin update) mit Backup und Rollback
+# WordPress-Plugins und -Themes aktualisieren (wp plugin|theme update)
+# mit Backup und Rollback
 # ---------------------------------------------------------------------------
 #
 # Läuft wie die übrigen wp_*-Tools per WP-CLI als System-User der
 # Subscription (nie root). Vor jedem Update wird jedes betroffene Plugin
-# (Verzeichnis bzw. Einzeldatei) als tar.gz unter
-# <home>/.plesk-mcp/wp-plugin-backups/<backup_id>/ gesichert. Liefert die
-# Startseite vorher keinen 5xx-Fehler und danach schon, werden die Plugins
-# automatisch aus dem Backup zurückgestellt.
+# (Verzeichnis bzw. Einzeldatei) bzw. Theme (Verzeichnis) als tar.gz unter
+# <home>/.plesk-mcp/wp-plugin-backups/<backup_id>/ bzw.
+# <home>/.plesk-mcp/wp-theme-backups/<backup_id>/ gesichert. Liefert die
+# Startseite vorher keinen 5xx-Fehler und danach schon, wird automatisch aus
+# dem Backup zurückgestellt.
 
-_WP_PLUGIN_BACKUP_SUBDIR = ".plesk-mcp/wp-plugin-backups"
+_WP_EXT_KINDS: dict[str, dict[str, Any]] = {
+    "plugin": {
+        "subdir": ".plesk-mcp/wp-plugin-backups", "items": "plugins", "dir_key": "plugin_dir",
+        "label": "Plugin", "label_pl": "Plugin(s)", "dir_only": False,
+        "skip_status": ("must-use", "dropin"),
+    },
+    "theme": {
+        "subdir": ".plesk-mcp/wp-theme-backups", "items": "themes", "dir_key": "theme_dir",
+        "label": "Theme", "label_pl": "Theme(s)", "dir_only": True,
+        "skip_status": (),
+    },
+}
+_WP_PLUGIN_BACKUP_SUBDIR = _WP_EXT_KINDS["plugin"]["subdir"]
+_WP_THEME_BACKUP_SUBDIR = _WP_EXT_KINDS["theme"]["subdir"]
 _WP_PLUGIN_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$")
 _WP_PLUGIN_VERSION_RE = re.compile(r"^[0-9][0-9A-Za-z.+-]{0,39}$")
-_WP_PLUGIN_FIELDS = "name,title,status,version,update,update_version"
+_WP_EXT_FIELDS = "name,title,status,version,update,update_version"
 _WP_PLUGIN_MAX = 50
 _WP_PLUGIN_UPDATE_TIMEOUT = int(os.environ.get("WP_PLUGIN_UPDATE_TIMEOUT", "600"))
 
-# Backup eines Plugins als Subscription-User: $1 Backup-Ordner, $2 Zieldatei,
-# $3 Plugin-Verzeichnis von WordPress, $4 Eintrag darin (Ordner oder .php)
+# Backup eines Eintrags als Subscription-User: $1 Backup-Ordner, $2 Zieldatei,
+# $3 Plugin-/Theme-Verzeichnis von WordPress, $4 Eintrag darin
 _WP_PLUGIN_BACKUP_SH = (
     'umask 077 && mkdir -p "$1" && [ ! -e "$2" ] && '
     'tar -czf "$2" -C "$3" -- "$4"'
 )
-# Wiederherstellen: entpacken in einen Temp-Ordner im Plugin-Verzeichnis,
-# dann aktuellen Stand wegschieben und den alten an seine Stelle setzen.
-# $1 Plugin-Verzeichnis, $2 Archiv, $3 Eintrag
+# Wiederherstellen: entpacken in einen Temp-Ordner im Plugin-/Theme-
+# Verzeichnis, dann aktuellen Stand wegschieben und den alten an seine Stelle
+# setzen. $1 Verzeichnis, $2 Archiv, $3 Eintrag
 _WP_PLUGIN_RESTORE_SH = (
     'set -e; cd "$1"; t=$(mktemp -d .plesk-mcp-restore.XXXXXX); '
     'if ! tar -xzf "$2" -C "$t" --no-same-owner -- "$3" || [ ! -e "$t/$3" ]; then '
@@ -4811,20 +4971,29 @@ _WP_PLUGIN_RESTORE_SH = (
 )
 
 
-def _wp_plugin_slugs(plugins: list[str] | str) -> list[str]:
-    items = [plugins] if isinstance(plugins, str) else list(plugins or [])
+def _wp_ext_slugs(items: list[str] | str, label: str = "Plugin") -> list[str]:
+    values = [items] if isinstance(items, str) else list(items or [])
     out: list[str] = []
-    for p in items:
+    for p in values:
         s = str(p).strip()
         if not _WP_PLUGIN_SLUG_RE.match(s) or ".." in s:
             raise ValueError(
-                f"Ungültiger Plugin-Name {p!r} - erwartet wird der Slug (Verzeichnisname), z.B. 'woocommerce'."
+                f"Ungültiger {label}-Name {p!r} - erwartet wird der Slug (Verzeichnisname), z.B. "
+                + ("'woocommerce'." if label == "Plugin" else "'twentytwentyfive'.")
             )
         if s not in out:
             out.append(s)
     if len(out) > _WP_PLUGIN_MAX:
-        raise ValueError(f"Höchstens {_WP_PLUGIN_MAX} Plugins pro Aufruf.")
+        raise ValueError(f"Höchstens {_WP_PLUGIN_MAX} {label}s pro Aufruf.")
     return out
+
+
+def _wp_plugin_slugs(plugins: list[str] | str) -> list[str]:
+    return _wp_ext_slugs(plugins, "Plugin")
+
+
+def _wp_theme_slugs(themes: list[str] | str) -> list[str]:
+    return _wp_ext_slugs(themes, "Theme")
 
 
 def _wp_plugin_check_version(version: str) -> str:
@@ -4834,16 +5003,16 @@ def _wp_plugin_check_version(version: str) -> str:
     return v
 
 
-def _wp_plugin_list(client, ctx, wp_dir: str) -> dict[str, dict[str, Any]]:
+def _wp_ext_list(client, ctx, wp_dir: str, kind: str) -> dict[str, dict[str, Any]]:
     rows = _wp_json(_wp_cli(
-        client, ctx, wp_dir, ["plugin", "list", f"--fields={_WP_PLUGIN_FIELDS}", "--format=json"]
+        client, ctx, wp_dir, [kind, "list", f"--fields={_WP_EXT_FIELDS}", "--format=json"]
     ))
     if not isinstance(rows, list):
-        raise SSHError("Unerwartete Antwort von 'wp plugin list'.")
+        raise SSHError(f"Unerwartete Antwort von 'wp {kind} list'.")
     return {str(r.get("name")): r for r in rows if r.get("name")}
 
 
-def _wp_plugin_view(r: dict[str, Any]) -> dict[str, Any]:
+def _wp_ext_view(r: dict[str, Any]) -> dict[str, Any]:
     return {
         "name": r.get("name"),
         "titel": r.get("title"),
@@ -4854,12 +5023,14 @@ def _wp_plugin_view(r: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _wp_plugin_dir(client, ctx, wp_dir: str, domain: str) -> str:
-    """Plugin-Verzeichnis von WordPress (WP_PLUGIN_DIR), muss im Vhost liegen."""
-    out = _wp_cli(client, ctx, wp_dir, ["plugin", "path"]).strip().splitlines()
+def _wp_ext_dir(client, ctx, wp_dir: str, domain: str, kind: str) -> str:
+    """Plugin- bzw. Theme-Verzeichnis von WordPress, muss im Vhost liegen."""
+    out = _wp_cli(client, ctx, wp_dir, [kind, "path"]).strip().splitlines()
     pdir = posixpath.normpath(out[-1].strip()) if out else ""
     if not pdir.startswith(f"{_VHOST_BASE}/{domain}/"):
-        raise ValueError(f"Plugin-Verzeichnis {pdir!r} liegt nicht unter dem Vhost von '{domain}'.")
+        raise ValueError(
+            f"{_WP_EXT_KINDS[kind]['label']}-Verzeichnis {pdir!r} liegt nicht unter dem Vhost von '{domain}'."
+        )
     sftp = client.open_sftp()
     try:
         _assert_real_within_vhost(sftp, pdir, domain)
@@ -4868,11 +5039,14 @@ def _wp_plugin_dir(client, ctx, wp_dir: str, domain: str) -> str:
     return pdir
 
 
-def _wp_plugin_entry(client, pdir: str, slug: str) -> str:
-    """Ordner <slug> oder Einzeldatei <slug>.php im Plugin-Verzeichnis."""
+def _wp_ext_entry(client, pdir: str, slug: str, kind: str) -> str:
+    """Ordner <slug> oder (nur Plugins) Einzeldatei <slug>.php."""
+    candidates = [(slug, True)]
+    if not _WP_EXT_KINDS[kind]["dir_only"]:
+        candidates.append((f"{slug}.php", False))
     sftp = client.open_sftp()
     try:
-        for entry, want_dir in ((slug, True), (f"{slug}.php", False)):
+        for entry, want_dir in candidates:
             try:
                 st = sftp.lstat(f"{pdir}/{entry}")
             except FileNotFoundError:
@@ -4881,18 +5055,19 @@ def _wp_plugin_entry(client, pdir: str, slug: str) -> str:
                 return entry
     finally:
         sftp.close()
-    raise ValueError(f"Plugin '{slug}' nicht als Ordner oder .php-Datei in {pdir} gefunden.")
+    raise ValueError(f"{_WP_EXT_KINDS[kind]['label']} '{slug}' nicht in {pdir} gefunden.")
 
 
-def _wp_plugin_backup(client, ctx, wp_path: str, pdir: str, plugins: dict[str, dict[str, Any]],
-                      source: str) -> str:
-    """Sichert die Plugins als tar.gz und legt manifest.json daneben."""
+def _wp_ext_backup(client, ctx, kind: str, wp_path: str, pdir: str,
+                   items: dict[str, dict[str, Any]], source: str) -> str:
+    """Sichert die Einträge als tar.gz und legt manifest.json daneben."""
+    k = _WP_EXT_KINDS[kind]
     ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     backup_id = f"{ts}-{os.urandom(4).hex()}@{ctx['domain']}"
-    bdir = f"{ctx['home']}/{_WP_PLUGIN_BACKUP_SUBDIR}/{backup_id}"
+    bdir = f"{ctx['home']}/{k['subdir']}/{backup_id}"
     entries: dict[str, Any] = {}
-    for slug, row in plugins.items():
-        entry = _wp_plugin_entry(client, pdir, slug)
+    for slug, row in items.items():
+        entry = _wp_ext_entry(client, pdir, slug, kind)
         _, err, rc = _wp_run_as_user(
             client, ctx,
             ["/bin/sh", "-c", _WP_PLUGIN_BACKUP_SH, "sh", bdir, f"{bdir}/{slug}.tar.gz", pdir, entry],
@@ -4908,8 +5083,8 @@ def _wp_plugin_backup(client, ctx, wp_path: str, pdir: str, plugins: dict[str, d
         "source": source,
         "domain": ctx["domain"],
         "wp_path": wp_path,
-        "plugin_dir": pdir,
-        "plugins": entries,
+        k["dir_key"]: pdir,
+        k["items"]: entries,
     }
     data = json.dumps(record, ensure_ascii=False, indent=2).encode("utf-8")
     _, err, rc = _wp_run_as_user(
@@ -4922,43 +5097,46 @@ def _wp_plugin_backup(client, ctx, wp_path: str, pdir: str, plugins: dict[str, d
     return backup_id
 
 
-def _wp_plugin_restore(client, ctx, backup_id: str, record: dict[str, Any],
-                       slugs: list[str]) -> list[str]:
-    """Stellt die Plugins aus dem Backup zurück; gibt Fehler je Plugin zurück."""
-    bdir = f"{ctx['home']}/{_WP_PLUGIN_BACKUP_SUBDIR}/{backup_id}"
+def _wp_ext_restore(client, ctx, kind: str, backup_id: str, record: dict[str, Any],
+                    slugs: list[str]) -> list[str]:
+    """Stellt die Einträge aus dem Backup zurück; gibt Fehler je Slug zurück."""
+    k = _WP_EXT_KINDS[kind]
+    bdir = f"{ctx['home']}/{k['subdir']}/{backup_id}"
+    pdir = record[k["dir_key"]]
     errors = []
     for slug in slugs:
-        e = record["plugins"][slug]
+        e = record[k["items"]][slug]
         _, err, rc = _wp_run_as_user(
             client, ctx,
-            ["/bin/sh", "-c", _WP_PLUGIN_RESTORE_SH, "sh",
-             record["plugin_dir"], f"{bdir}/{e['archive']}", e["entry"]],
-            cwd=record["plugin_dir"], timeout=_WP_PLUGIN_UPDATE_TIMEOUT,
+            ["/bin/sh", "-c", _WP_PLUGIN_RESTORE_SH, "sh", pdir, f"{bdir}/{e['archive']}", e["entry"]],
+            cwd=pdir, timeout=_WP_PLUGIN_UPDATE_TIMEOUT,
         )
         if rc != 0:
             errors.append(f"{slug}: Wiederherstellen fehlgeschlagen ({err.strip() or f'rc={rc}'})")
     return errors
 
 
-def _wp_plugin_read_backup(client, ctx, backup_id: str) -> dict[str, Any]:
+def _wp_ext_read_backup(client, ctx, kind: str, backup_id: str) -> dict[str, Any]:
+    k = _WP_EXT_KINDS[kind]
     out, err, rc = _wp_run_as_user(
         client, ctx,
-        ["/bin/cat", "--", f"{ctx['home']}/{_WP_PLUGIN_BACKUP_SUBDIR}/{backup_id}/manifest.json"],
+        ["/bin/cat", "--", f"{ctx['home']}/{k['subdir']}/{backup_id}/manifest.json"],
         cwd=ctx["home"],
     )
     if rc != 0:
         raise ValueError(f"Backup '{backup_id}' nicht gefunden: {err.strip()}")
     try:
         record = json.loads(out)
-        plugins = record["plugins"]
-        if record.get("domain") != ctx["domain"] or not isinstance(plugins, dict) or not plugins:
+        items = record[k["items"]]
+        if record.get("domain") != ctx["domain"] or not isinstance(items, dict) or not items:
             raise ValueError("Inhalt passt nicht zur backup_id")
-        _wp_plugin_slugs(list(plugins))
-        pdir = posixpath.normpath(str(record["plugin_dir"]))
-        if pdir != record["plugin_dir"] or not pdir.startswith(f"{_VHOST_BASE}/{ctx['domain']}/"):
-            raise ValueError("Plugin-Verzeichnis ungültig")
-        for slug, e in plugins.items():
-            if e.get("entry") not in (slug, f"{slug}.php") or e.get("archive") != f"{slug}.tar.gz":
+        _wp_ext_slugs(list(items), k["label"])
+        pdir = posixpath.normpath(str(record[k["dir_key"]]))
+        if pdir != record[k["dir_key"]] or not pdir.startswith(f"{_VHOST_BASE}/{ctx['domain']}/"):
+            raise ValueError(f"{k['label']}-Verzeichnis ungültig")
+        allowed = (lambda s: (s,)) if k["dir_only"] else (lambda s: (s, f"{s}.php"))
+        for slug, e in items.items():
+            if e.get("entry") not in allowed(slug) or e.get("archive") != f"{slug}.tar.gz":
                 raise ValueError(f"Eintrag für '{slug}' ungültig")
         if not isinstance(record["wp_path"], str):
             raise ValueError("wp_path fehlt")
@@ -4967,19 +5145,22 @@ def _wp_plugin_read_backup(client, ctx, backup_id: str) -> dict[str, Any]:
     return record
 
 
-def _wp_plugin_targets(installed: dict[str, dict[str, Any]], slugs: list[str],
-                       all_updates: bool, version: str) -> tuple[list[str], dict[str, str]]:
-    """Wählt die zu aktualisierenden Plugins; zweiter Wert: übersprungene mit Grund."""
+def _wp_ext_targets(installed: dict[str, dict[str, Any]], slugs: list[str],
+                    all_updates: bool, version: str,
+                    skip_status: tuple[str, ...] = ("must-use", "dropin"),
+                    ) -> tuple[list[str], dict[str, str]]:
+    """Wählt die zu aktualisierenden Einträge; zweiter Wert: übersprungene mit Grund."""
     skipped: dict[str, str] = {}
     if all_updates:
-        cand = [n for n, r in installed.items() if r.get("update") == "available"]
+        cand = [n for n, r in installed.items()
+                if r.get("update") == "available" and r.get("status") not in skip_status]
     else:
         cand = []
         for s in slugs:
             r = installed.get(s)
             if r is None:
                 skipped[s] = "nicht installiert"
-            elif r.get("status") in ("must-use", "dropin"):
+            elif r.get("status") in skip_status:
                 skipped[s] = f"{r.get('status')} - nicht per WP-CLI aktualisierbar"
             elif version:
                 if str(r.get("version")) == version:
@@ -4993,15 +5174,22 @@ def _wp_plugin_targets(installed: dict[str, dict[str, Any]], slugs: list[str],
     return cand, skipped
 
 
-@mcp.tool()
-def wp_plugin_list(domain: str, wp_path: str, only_updates: bool = False) -> str:
-    """Listet die Plugins einer WordPress-Installation per WP-CLI mit Status,
-    installierter Version und verfügbarem Update (`wp plugin list`).
+def _wp_plugin_targets(installed, slugs, all_updates, version):
+    return _wp_ext_targets(installed, slugs, all_updates, version)
 
-    domain: z.B. "example.com"; wp_path: WordPress-Verzeichnis relativ zu
-    /var/www/vhosts/<domain>/ (z.B. "httpdocs").
-    only_updates=true: nur Plugins mit verfügbarem Update. Rein lesend.
-    """
+
+def _wp_theme_hint(before: dict[str, dict[str, Any]], updated: list[str]) -> str | None:
+    """Hinweis, wenn ein Child-Theme aktiv ist und sein Parent aktualisiert wurde."""
+    active = next((n for n, r in before.items() if r.get("status") == "active"), None)
+    parents = [s for s in updated if before.get(s, {}).get("status") == "parent"]
+    if active and parents:
+        return (f"Aktiv ist das Child-Theme '{active}'; aktualisiert wurde das Parent-Theme "
+                f"'{', '.join(parents)}'. Anpassungen im Child-Theme (Templates, Hooks) prüfen.")
+    return None
+
+
+def _wp_ext_list_tool(kind: str, domain: str, wp_path: str, only_updates: bool) -> str:
+    k = _WP_EXT_KINDS[kind]
     d = _wp_domain(domain)
     client = _ssh_connect()
     try:
@@ -5011,21 +5199,203 @@ def wp_plugin_list(domain: str, wp_path: str, only_updates: bool = False) -> str
             wp_dir = _wp_install_dir(sftp, d, wp_path)
         finally:
             sftp.close()
-        installed = _wp_plugin_list(client, ctx, wp_dir)
+        installed = _wp_ext_list(client, ctx, wp_dir, kind)
     finally:
         client.close()
-    rows = [_wp_plugin_view(r) for r in installed.values()
+    rows = [_wp_ext_view(r) for r in installed.values()
             if not only_updates or r.get("update") == "available"]
     return json.dumps({
         "domain": d,
         "wp_path": wp_dir,
         "anzahl": len(rows),
         "updates_verfuegbar": sum(1 for r in installed.values() if r.get("update") == "available"),
-        "plugins": rows,
+        k["items"]: rows,
     }, ensure_ascii=False, indent=2)
 
 
+def _wp_ext_update(kind: str, domain: str, wp_path: str, items: list[str] | None,
+                   all_updates: bool, version: str, confirm: bool) -> str:
+    k = _WP_EXT_KINDS[kind]
+    slugs = _wp_ext_slugs(items or [], k["label"])
+    v = _wp_plugin_check_version(version)
+    if all_updates and slugs:
+        raise ValueError(f"Entweder {k['items']} angeben oder all_updates=true, nicht beides.")
+    if not all_updates and not slugs:
+        raise ValueError(f"{k['items']} angeben oder all_updates=true setzen.")
+    if v and (all_updates or len(slugs) != 1):
+        raise ValueError(f"version ist nur mit genau einem {k['label']} möglich.")
+    d = _wp_domain(domain)
+    client = _ssh_connect()
+    try:
+        ctx = _wp_context(client, d)
+        sftp = client.open_sftp()
+        try:
+            wp_dir = _wp_install_dir(sftp, d, wp_path)
+        finally:
+            sftp.close()
+        installed = _wp_ext_list(client, ctx, wp_dir, kind)
+        targets, skipped = _wp_ext_targets(installed, slugs, all_updates, v, k["skip_status"])
+        result: dict[str, Any] = {
+            "domain": d,
+            "wp_path": wp_dir,
+            "system_user": ctx["login"],
+            "updates": [
+                {"name": s, "status": installed[s].get("status"),
+                 "alt": installed[s].get("version"),
+                 "neu": v or installed[s].get("update_version")}
+                for s in targets
+            ],
+        }
+        if skipped:
+            result["uebersprungen"] = skipped
+        if not targets:
+            result["ergebnis"] = "Nichts zu aktualisieren."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        if not confirm:
+            result["ergebnis"] = "Vorschau - nichts geändert. Mit confirm=true ausführen."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+
+        http_before, _ = _phps_http(d)
+        pdir = _wp_ext_dir(client, ctx, wp_dir, d, kind)
+        backup_id = _wp_ext_backup(
+            client, ctx, kind, wp_path, pdir, {s: installed[s] for s in targets}, f"wp_{kind}_update"
+        )
+        args = [kind, "update", *targets]
+        if v:
+            args.append(f"--version={v}")
+        out, err, rc = _wp_cli_run(client, ctx, wp_dir, args, timeout=_WP_PLUGIN_UPDATE_TIMEOUT)
+        after = _wp_ext_list(client, ctx, wp_dir, kind)
+        updated, unchanged = [], {}
+        for s in targets:
+            now = after.get(s, {}).get("version")
+            want = v or installed[s].get("update_version")
+            if now == want or (not want and now != installed[s].get("version")):
+                updated.append(s)
+            else:
+                unchanged[s] = now or "nicht mehr vorhanden"
+        http_after, http_detail = _phps_http(d)
+        restored: list[str] = []
+        restore_errors: list[str] = []
+        if http_before is not None and http_before < 500 and http_after is not None and http_after >= 500:
+            record = _wp_ext_read_backup(client, ctx, kind, backup_id)
+            restore_errors = _wp_ext_restore(client, ctx, kind, backup_id, record, targets)
+            restored = [s for s in targets if not any(e.startswith(f"{s}:") for e in restore_errors)]
+            http_after, http_detail = _phps_http(d)
+    finally:
+        client.close()
+
+    result["backup_id"] = backup_id
+    result["backup_ordner"] = f"{ctx['home']}/{k['subdir']}/{backup_id}"
+    result["aktualisiert"] = [] if restored else updated
+    result["startseite"] = http_detail
+    if rc != 0:
+        result["wp_cli_fehler"] = _wp_cli_error(out, err, lines=10)
+    if restored or restore_errors:
+        result["ergebnis"] = (
+            f"ZURÜCKGESTELLT: Die Startseite lieferte nach dem Update einen 5xx-Fehler - "
+            f"{k['label_pl']} aus dem Backup wiederhergestellt."
+            if not restore_errors else
+            f"ACHTUNG: Die Startseite lieferte nach dem Update einen 5xx-Fehler - "
+            f"Zurückstellen teilweise fehlgeschlagen!"
+        )
+        result["automatisch_zurueckgestellt"] = True
+        result["zurueckgestellt"] = restored
+        if restore_errors:
+            result["fehler"] = restore_errors
+    elif unchanged or rc != 0:
+        result["ergebnis"] = "Teilweise fehlgeschlagen - Rollback mit backup_id möglich."
+        result["nicht_aktualisiert"] = unchanged
+    else:
+        result["ergebnis"] = f"{len(updated)} {k['label_pl']} aktualisiert und kontrolliert."
+    if kind == "theme" and not restored:
+        hint = _wp_theme_hint(installed, updated)
+        if hint:
+            result["hinweis_child_theme"] = hint
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def _wp_ext_rollback(kind: str, backup_id: str, items: list[str] | None, confirm: bool) -> str:
+    k = _WP_EXT_KINDS[kind]
+    m = _WP_BACKUP_ID_RE.match((backup_id or "").strip())
+    if not m:
+        raise ValueError(f"Ungültige backup_id: {backup_id!r}")
+    only = _wp_ext_slugs(items or [], k["label"])
+    bid = m.group(0)
+    d = _wp_domain(m.group(3))
+    client = _ssh_connect()
+    try:
+        ctx = _wp_context(client, d)
+        record = _wp_ext_read_backup(client, ctx, kind, bid)
+        missing = [s for s in only if s not in record[k["items"]]]
+        if missing:
+            raise ValueError(f"Nicht im Backup enthalten: {', '.join(missing)}")
+        slugs = only or list(record[k["items"]])
+        sftp = client.open_sftp()
+        try:
+            wp_dir = _wp_install_dir(sftp, d, record["wp_path"])
+            _assert_real_within_vhost(sftp, record[k["dir_key"]], d)
+        finally:
+            sftp.close()
+        installed = _wp_ext_list(client, ctx, wp_dir, kind)
+        result: dict[str, Any] = {
+            "domain": d,
+            "wp_path": wp_dir,
+            "backup_id": bid,
+            k["items"]: [
+                {"name": s, "version_backup": record[k["items"]][s].get("version"),
+                 "version_aktuell": installed.get(s, {}).get("version") or "nicht installiert"}
+                for s in slugs
+            ],
+        }
+        if not confirm:
+            result["ergebnis"] = "Vorschau - nichts geändert. Mit confirm=true ausführen."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+
+        present = {s: installed[s] for s in slugs if s in installed}
+        new_bid = None
+        if present:
+            new_bid = _wp_ext_backup(
+                client, ctx, kind, record["wp_path"], record[k["dir_key"]], present,
+                f"wp_{kind}_rollback:{bid}",
+            )
+        errors = _wp_ext_restore(client, ctx, kind, bid, record, slugs)
+        after = _wp_ext_list(client, ctx, wp_dir, kind)
+    finally:
+        client.close()
+
+    mismatches = {
+        s: after.get(s, {}).get("version") or "nicht vorhanden"
+        for s in slugs
+        if after.get(s, {}).get("version") != record[k["items"]][s].get("version")
+    }
+    if new_bid:
+        result["neues_backup_id"] = new_bid
+    if errors or mismatches:
+        result["ergebnis"] = "Teilweise fehlgeschlagen."
+        if errors:
+            result["fehler"] = errors
+        if mismatches:
+            result["abweichend_nach_kontrolle"] = mismatches
+    else:
+        result["ergebnis"] = f"{len(slugs)} {k['label_pl']} zurückgestellt und kontrolliert."
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
 @mcp.tool()
+@_wp_reporting
+def wp_plugin_list(domain: str, wp_path: str, only_updates: bool = False) -> str:
+    """Listet die Plugins einer WordPress-Installation per WP-CLI mit Status,
+    installierter Version und verfügbarem Update (`wp plugin list`).
+
+    domain: z.B. "example.com"; wp_path: WordPress-Verzeichnis relativ zu
+    /var/www/vhosts/<domain>/ (z.B. "httpdocs").
+    only_updates=true: nur Plugins mit verfügbarem Update. Rein lesend.
+    """
+    return _wp_ext_list_tool("plugin", domain, wp_path, only_updates)
+
+
+@mcp.tool()
+@_wp_reporting
 def wp_plugin_update(
     domain: str,
     wp_path: str,
@@ -5050,102 +5420,11 @@ def wp_plugin_update(
     Startseite vorher keinen 5xx-Fehler und danach schon, werden die Plugins
     automatisch zurückgestellt. Rückgängig machen: wp_plugin_rollback(backup_id).
     """
-    slugs = _wp_plugin_slugs(plugins or [])
-    v = _wp_plugin_check_version(version)
-    if all_updates and slugs:
-        raise ValueError("Entweder plugins angeben oder all_updates=true, nicht beides.")
-    if not all_updates and not slugs:
-        raise ValueError("plugins angeben oder all_updates=true setzen.")
-    if v and (all_updates or len(slugs) != 1):
-        raise ValueError("version ist nur mit genau einem Plugin möglich.")
-    d = _wp_domain(domain)
-    client = _ssh_connect()
-    try:
-        ctx = _wp_context(client, d)
-        sftp = client.open_sftp()
-        try:
-            wp_dir = _wp_install_dir(sftp, d, wp_path)
-        finally:
-            sftp.close()
-        installed = _wp_plugin_list(client, ctx, wp_dir)
-        targets, skipped = _wp_plugin_targets(installed, slugs, all_updates, v)
-        result: dict[str, Any] = {
-            "domain": d,
-            "wp_path": wp_dir,
-            "system_user": ctx["login"],
-            "updates": [
-                {"name": s, "status": installed[s].get("status"),
-                 "alt": installed[s].get("version"),
-                 "neu": v or installed[s].get("update_version")}
-                for s in targets
-            ],
-        }
-        if skipped:
-            result["uebersprungen"] = skipped
-        if not targets:
-            result["ergebnis"] = "Nichts zu aktualisieren."
-            return json.dumps(result, ensure_ascii=False, indent=2)
-        if not confirm:
-            result["ergebnis"] = "Vorschau - nichts geändert. Mit confirm=true ausführen."
-            return json.dumps(result, ensure_ascii=False, indent=2)
-
-        http_before, _ = _phps_http(d)
-        pdir = _wp_plugin_dir(client, ctx, wp_dir, d)
-        backup_id = _wp_plugin_backup(
-            client, ctx, wp_path, pdir, {s: installed[s] for s in targets}, "wp_plugin_update"
-        )
-        args = ["plugin", "update", *targets]
-        if v:
-            args.append(f"--version={v}")
-        out, err, rc = _wp_run_as_user(
-            client, ctx,
-            [ctx["php"], _WP_CLI_PATH, f"--path={wp_dir}", "--no-color", *args],
-            cwd=wp_dir, timeout=_WP_PLUGIN_UPDATE_TIMEOUT,
-        )
-        after = _wp_plugin_list(client, ctx, wp_dir)
-        updated, unchanged = [], {}
-        for s in targets:
-            now = after.get(s, {}).get("version")
-            want = v or installed[s].get("update_version")
-            if now == want or (not want and now != installed[s].get("version")):
-                updated.append(s)
-            else:
-                unchanged[s] = now or "nicht mehr vorhanden"
-        http_after, http_detail = _phps_http(d)
-        restored: list[str] = []
-        restore_errors: list[str] = []
-        if http_before is not None and http_before < 500 and http_after is not None and http_after >= 500:
-            record = _wp_plugin_read_backup(client, ctx, backup_id)
-            restore_errors = _wp_plugin_restore(client, ctx, backup_id, record, targets)
-            restored = [s for s in targets if not any(e.startswith(f"{s}:") for e in restore_errors)]
-            http_after, http_detail = _phps_http(d)
-    finally:
-        client.close()
-
-    result["backup_id"] = backup_id
-    result["backup_ordner"] = f"{ctx['home']}/{_WP_PLUGIN_BACKUP_SUBDIR}/{backup_id}"
-    result["aktualisiert"] = [] if restored else updated
-    result["startseite"] = http_detail
-    if rc != 0:
-        result["wp_cli_fehler"] = "\n".join((err.strip() or out.strip()).splitlines()[-10:])
-    if restored or restore_errors:
-        result["ergebnis"] = (
-            "Startseite lieferte nach dem Update einen 5xx-Fehler - Plugins aus dem Backup zurückgestellt."
-            if not restore_errors else
-            "Startseite lieferte nach dem Update einen 5xx-Fehler - Zurückstellen teilweise fehlgeschlagen!"
-        )
-        result["zurueckgestellt"] = restored
-        if restore_errors:
-            result["fehler"] = restore_errors
-    elif unchanged or rc != 0:
-        result["ergebnis"] = "Teilweise fehlgeschlagen - Rollback mit backup_id möglich."
-        result["nicht_aktualisiert"] = unchanged
-    else:
-        result["ergebnis"] = f"{len(updated)} Plugin(s) aktualisiert und kontrolliert."
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    return _wp_ext_update("plugin", domain, wp_path, plugins, all_updates, version, confirm)
 
 
 @mcp.tool()
+@_wp_reporting
 def wp_plugin_rollback(backup_id: str, plugins: list[str] | None = None, confirm: bool = False) -> str:
     """Stellt Plugins aus einem Backup von wp_plugin_update wieder her
     (kompletter damaliger Plugin-Ordner bzw. -Datei).
@@ -5156,69 +5435,66 @@ def wp_plugin_rollback(backup_id: str, plugins: list[str] | None = None, confirm
     backup_id in der Rückgabe). Datenbank-Änderungen, die ein Plugin-Update
     gemacht hat, werden nicht zurückgestellt.
     """
-    m = _WP_BACKUP_ID_RE.match((backup_id or "").strip())
-    if not m:
-        raise ValueError(f"Ungültige backup_id: {backup_id!r}")
-    only = _wp_plugin_slugs(plugins or [])
-    bid = m.group(0)
-    d = _wp_domain(m.group(3))
-    client = _ssh_connect()
-    try:
-        ctx = _wp_context(client, d)
-        record = _wp_plugin_read_backup(client, ctx, bid)
-        missing = [s for s in only if s not in record["plugins"]]
-        if missing:
-            raise ValueError(f"Nicht im Backup enthalten: {', '.join(missing)}")
-        slugs = only or list(record["plugins"])
-        sftp = client.open_sftp()
-        try:
-            wp_dir = _wp_install_dir(sftp, d, record["wp_path"])
-            _assert_real_within_vhost(sftp, record["plugin_dir"], d)
-        finally:
-            sftp.close()
-        installed = _wp_plugin_list(client, ctx, wp_dir)
-        result: dict[str, Any] = {
-            "domain": d,
-            "wp_path": wp_dir,
-            "backup_id": bid,
-            "plugins": [
-                {"name": s, "version_backup": record["plugins"][s].get("version"),
-                 "version_aktuell": installed.get(s, {}).get("version") or "nicht installiert"}
-                for s in slugs
-            ],
-        }
-        if not confirm:
-            result["ergebnis"] = "Vorschau - nichts geändert. Mit confirm=true ausführen."
-            return json.dumps(result, ensure_ascii=False, indent=2)
+    return _wp_ext_rollback("plugin", backup_id, plugins, confirm)
 
-        present = {s: installed[s] for s in slugs if s in installed}
-        new_bid = None
-        if present:
-            new_bid = _wp_plugin_backup(
-                client, ctx, record["wp_path"], record["plugin_dir"], present,
-                f"wp_plugin_rollback:{bid}",
-            )
-        errors = _wp_plugin_restore(client, ctx, bid, record, slugs)
-        after = _wp_plugin_list(client, ctx, wp_dir)
-    finally:
-        client.close()
 
-    mismatches = {
-        s: after.get(s, {}).get("version") or "nicht vorhanden"
-        for s in slugs
-        if after.get(s, {}).get("version") != record["plugins"][s].get("version")
-    }
-    if new_bid:
-        result["neues_backup_id"] = new_bid
-    if errors or mismatches:
-        result["ergebnis"] = "Teilweise fehlgeschlagen."
-        if errors:
-            result["fehler"] = errors
-        if mismatches:
-            result["abweichend_nach_kontrolle"] = mismatches
-    else:
-        result["ergebnis"] = f"{len(slugs)} Plugin(s) zurückgestellt und kontrolliert."
-    return json.dumps(result, ensure_ascii=False, indent=2)
+@mcp.tool()
+@_wp_reporting
+def wp_theme_list(domain: str, wp_path: str, only_updates: bool = False) -> str:
+    """Listet die Themes einer WordPress-Installation per WP-CLI mit Status
+    (active/parent/inactive), installierter Version und verfügbarem Update
+    (`wp theme list`).
+
+    domain: z.B. "example.com"; wp_path: WordPress-Verzeichnis relativ zu
+    /var/www/vhosts/<domain>/ (z.B. "httpdocs").
+    only_updates=true: nur Themes mit verfügbarem Update. Rein lesend.
+    """
+    return _wp_ext_list_tool("theme", domain, wp_path, only_updates)
+
+
+@mcp.tool()
+@_wp_reporting
+def wp_theme_update(
+    domain: str,
+    wp_path: str,
+    themes: list[str] | None = None,
+    all_updates: bool = False,
+    version: str = "",
+    confirm: bool = False,
+) -> str:
+    """Aktualisiert WordPress-Themes per WP-CLI (`wp theme update`, als
+    System-User der Subscription, nie root).
+
+    domain: z.B. "example.com"; wp_path: WordPress-Verzeichnis relativ zu
+    /var/www/vhosts/<domain>/ (z.B. "httpdocs").
+    themes: Liste von Theme-Slugs (Verzeichnisname, z.B. "twentytwentyfive"),
+    oder all_updates=true für alle Themes mit verfügbarem Update (nicht
+    beides). version: optional eine bestimmte Version (nur mit genau einem
+    Theme).
+    Ohne confirm=true nur Vorschau (installierte und neue Version je Theme,
+    nichts geändert). Mit confirm=true: Backup jedes Theme-Ordners als tar.gz
+    unter /var/www/vhosts/<domain>/.plesk-mcp/wp-theme-backups/<backup_id>/,
+    dann Update, danach Kontrolle der Versionen und der Startseite. Liefert
+    die Startseite vorher keinen 5xx-Fehler und danach schon, werden die
+    Themes automatisch zurückgestellt. Ist ein Child-Theme aktiv und wurde
+    sein Parent-Theme aktualisiert, enthält das Ergebnis einen Hinweis.
+    Rückgängig machen: wp_theme_rollback(backup_id).
+    """
+    return _wp_ext_update("theme", domain, wp_path, themes, all_updates, version, confirm)
+
+
+@mcp.tool()
+@_wp_reporting
+def wp_theme_rollback(backup_id: str, themes: list[str] | None = None, confirm: bool = False) -> str:
+    """Stellt Themes aus einem Backup von wp_theme_update wieder her
+    (kompletter damaliger Theme-Ordner).
+
+    themes: optional nur diese Slugs aus dem Backup, sonst alle.
+    Ohne confirm=true nur Vorschau (Version im Backup vs. aktuell). Vor dem
+    Zurückstellen wird der aktuelle Stand selbst wieder gesichert (neue
+    backup_id in der Rückgabe).
+    """
+    return _wp_ext_rollback("theme", backup_id, themes, confirm)
 
 
 # ---------------------------------------------------------------------------
@@ -5329,11 +5605,7 @@ def _wc_cli_args(fields: dict[str, Any]) -> list[str]:
 
 def _wc_context(client, ctx, wp_dir: str) -> str:
     """Prüft WooCommerce und liefert die ID eines Administrators für --user."""
-    _, err, rc = _wp_run_as_user(
-        client, ctx,
-        [ctx["php"], _WP_CLI_PATH, f"--path={wp_dir}", "--no-color", "plugin", "is-active", "woocommerce"],
-        cwd=wp_dir,
-    )
+    _, err, rc = _wp_cli_run(client, ctx, wp_dir, ["plugin", "is-active", "woocommerce"])
     if rc != 0:
         raise ValueError("WooCommerce ist in dieser Installation nicht aktiv.")
     out = _wp_cli(client, ctx, wp_dir, ["user", "list", "--role=administrator", "--field=ID",
@@ -5353,16 +5625,13 @@ def _wc_coupon_find(client, ctx, wp_dir: str, uid: str, coupon: str) -> dict[str
     """Gutschein per ID (Ziffern) oder Code; None wenn nicht vorhanden."""
     c = str(coupon).strip()
     if c.isdigit():
-        out, err, rc = _wp_run_as_user(
-            client, ctx,
-            [ctx["php"], _WP_CLI_PATH, f"--path={wp_dir}", "--no-color", "wc", "shop_coupon", "get", c,
-             f"--user={uid}", f"--fields={_WC_COUPON_LIST_FIELDS}", "--format=json"],
-            cwd=wp_dir,
-        )
+        out, err, rc = _wp_cli_run(client, ctx, wp_dir, [
+            "wc", "shop_coupon", "get", c, f"--user={uid}", f"--fields={_WC_COUPON_LIST_FIELDS}", "--format=json",
+        ])
         if rc != 0:
             if "invalid" in (err + out).lower() or "not found" in (err + out).lower():
                 return None
-            raise SSHError(f"WP-CLI 'wp wc shop_coupon get' fehlgeschlagen: {(err or out).strip()[-300:]}")
+            raise SSHError(f"WP-CLI 'wp wc shop_coupon get' fehlgeschlagen: {_wp_cli_error(out, err)[-300:]}")
         data = _wp_json(out)
         return data if isinstance(data, dict) and data.get("id") else None
     code = _wc_check_code(c)
@@ -5413,6 +5682,7 @@ def _wc_open(domain: str, wp_path: str):
 
 
 @mcp.tool()
+@_wp_reporting
 def wc_coupon_list(
     domain: str,
     wp_path: str,
@@ -5453,6 +5723,7 @@ def wc_coupon_list(
 
 
 @mcp.tool()
+@_wp_reporting
 def wc_coupon_get(domain: str, wp_path: str, coupon: str) -> str:
     """Zeigt einen WooCommerce-Gutschein mit allen Feldern - coupon ist die
     ID (Ziffern) oder der Gutscheincode. Rein lesend.
@@ -5469,6 +5740,7 @@ def wc_coupon_get(domain: str, wp_path: str, coupon: str) -> str:
 
 
 @mcp.tool()
+@_wp_reporting
 def wc_coupon_create(
     domain: str,
     wp_path: str,
@@ -5559,6 +5831,7 @@ def _wc_coupon_change(domain: str, wp_path: str, coupon: str, fields: dict[str, 
 
 
 @mcp.tool()
+@_wp_reporting
 def wc_coupon_update(
     domain: str,
     wp_path: str,
@@ -5595,6 +5868,7 @@ def _wc_norm(v: Any) -> Any:
 
 
 @mcp.tool()
+@_wp_reporting
 def wc_coupon_rollback(backup_id: str, confirm: bool = False) -> str:
     """Stellt die bei wc_coupon_update gesicherten Felder eines Gutscheins
     wieder her. Ohne confirm=true nur Vorschau; legt vorher selbst ein
@@ -5634,6 +5908,7 @@ def wc_coupon_rollback(backup_id: str, confirm: bool = False) -> str:
 
 
 @mcp.tool()
+@_wp_reporting
 def wc_coupon_delete(
     domain: str,
     wp_path: str,
