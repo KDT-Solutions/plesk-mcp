@@ -205,14 +205,68 @@ def test_upload_rate_limit(client, vhost, monkeypatch):
     assert codes == [401, 401, 429]
 
 
+def test_upload_rate_limit_counts_only_failures(client, vhost, monkeypatch):
+    """Fehlversuche Dritter (gleicher Proxy-Bucket) blockieren keinen gültigen Upload."""
+    monkeypatch.setattr(server, "_UPLOAD_RATE_LIMIT", 1)
+    info = begin("httpdocs/ok.bin")
+    assert [client.put("/upload/x" * 3, content=b"").status_code for _ in range(3)] == [401, 429, 429]
+    assert put(client, info, b"daten").status_code == 200
+    assert (vhost / "httpdocs/ok.bin").read_bytes() == b"daten"
+    # Ein gültiger Upload zählt nicht zum Limit
+    assert client.put("/upload/x" * 3, content=b"").status_code == 429
+
+
 def test_write_vhost_file_uses_helper(vhost):
     out = server.write_vhost_file(DOMAIN, "httpdocs/neu/a.txt", "hallo", confirm=True)
     assert "Neu erstellt" in out and "Rechte: 0644" in out and "Neu angelegte Ordner" in out
     out = server.write_vhost_file(DOMAIN, "httpdocs/neu/a.txt", "zwei", confirm=True)
     assert "Überschrieben" in out and "Backup der alten Version" in out
     (vhost / "conf/root.conf").write_text("x")
-    with pytest.raises(ValueError, match="root"):
+    with pytest.raises(ValueError, match="geschützt"):
         server.write_vhost_file(DOMAIN, "conf/root.conf", "y", confirm=True)
+    assert (vhost / "conf/root.conf").read_text() == "x"
+
+
+def test_write_vhost_file_protected_paths(vhost):
+    """Dieselbe Schutzkette wie Upload/Move/Delete: .ssh, conf, logs, Dotfiles
+    im Vhost-Root und das Docroot selbst werden abgelehnt."""
+    (vhost / ".ssh").mkdir()
+    for p in (".ssh/authorized_keys", "logs/error_log", "conf/web.conf", ".bash_profile", "httpdocs",
+              "httpdocs/cgi-bin", "sub.example.com", "bin/sh"):
+        with pytest.raises(ValueError, match="geschützt"):
+            server.write_vhost_file(DOMAIN, p, "ssh-ed25519 AAAA angreifer", confirm=True)
+    assert not (vhost / ".ssh/authorized_keys").exists()
+    assert list((vhost / ".ssh").iterdir()) == []
+
+
+def test_write_vhost_file_executable_needs_flag(vhost):
+    for p in ("httpdocs/.htaccess", "httpdocs/shell.php", "httpdocs/.user.ini", "httpdocs/bild.php.jpg",
+              "httpdocs/x.phtml", "httpdocs/run.sh"):
+        with pytest.raises(ValueError, match="allow_executable"):
+            server.write_vhost_file(DOMAIN, p, "x", confirm=True)
+        assert not (vhost / p).exists()
+    out = server.write_vhost_file(DOMAIN, "httpdocs/.htaccess", "RewriteEngine On", confirm=True,
+                                  allow_executable=True)
+    assert "Neu erstellt" in out and (vhost / "httpdocs/.htaccess").read_text() == "RewriteEngine On"
+
+
+def test_write_vhost_file_strict_paths_and_subscription(vhost, monkeypatch):
+    for p in ("../other.example.com/httpdocs/x", "/etc/passwd", "httpdocs/../../x", "httpdocs/*.txt", ""):
+        with pytest.raises(ValueError):
+            server.write_vhost_file(DOMAIN, p, "x", confirm=True)
+    # domain muss eine Subscription sein (_vhost_ctx) - "system" o.ae. wird abgelehnt
+    monkeypatch.setattr(server, "_vhost_ctx",
+                        lambda d: (_ for _ in ()).throw(ValueError(f"Domain '{d}' ist in Plesk nicht als Hosting vorhanden.")))
+    with pytest.raises(ValueError, match="nicht als Hosting"):
+        server.write_vhost_file("system", "httpdocs/x.txt", "x", confirm=True)
+
+
+def test_write_vhost_file_size_limit(vhost, monkeypatch):
+    monkeypatch.setattr(server, "_UPLOAD_MAX_BYTES", 10)
+    with pytest.raises(ValueError, match="UPLOAD_MAX_BYTES"):
+        server.write_vhost_file(DOMAIN, "httpdocs/gross.txt", "x" * 11, confirm=True)
+    assert not (vhost / "httpdocs/gross.txt").exists()
+    assert "Neu erstellt" in server.write_vhost_file(DOMAIN, "httpdocs/klein.txt", "x" * 10, confirm=True)
 
 
 # --- Teil A: SSRF ------------------------------------------------------------

@@ -19,7 +19,10 @@ services:
       - PLESK_SSH_KEY_PATH=${PLESK_SSH_KEY_PATH:-}
       - PLESK_SSH_TIMEOUT=${PLESK_SSH_TIMEOUT:-20}
       - PLESK_SSH_KNOWN_HOSTS=${PLESK_SSH_KNOWN_HOSTS:-}
+      # Pflicht (einer von beiden): ohne gepinnten Host-Key startet der Server nicht
       - PLESK_SSH_HOST_KEY=${PLESK_SSH_HOST_KEY:-}
+      - PLESK_SSH_MAX_RUNTIME=${PLESK_SSH_MAX_RUNTIME:-1800}
+      - DIAG_TIMEOUT=${DIAG_TIMEOUT:-60}
       - PLESK_API_HOST=${PLESK_API_HOST:-}
       - PLESK_API_PORT=${PLESK_API_PORT:-8443}
       - PLESK_API_KEY=${PLESK_API_KEY:-}
@@ -51,6 +54,7 @@ services:
       - PLESK_HELPER_PYTHON=${PLESK_HELPER_PYTHON:-/usr/libexec/platform-python}
       - PLESK_HELPER_TIMEOUT=${PLESK_HELPER_TIMEOUT:-600}
       - AUDIT_LOG_FILE=${AUDIT_LOG_FILE:-}
+      # Mindestens 32 Zeichen, sonst kein Start
       - MCP_API_KEY=${MCP_API_KEY}
       - MCP_HOST=0.0.0.0
       - MCP_PORT=8000

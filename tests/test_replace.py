@@ -42,13 +42,18 @@ def vhost(tmp_path, monkeypatch):
         (base / rel).write_text(content)
         os.chown(base / rel, user.pw_uid, user.pw_gid)
     os.chmod(base / "httpdocs/config.php", 0o600)
+    ctx = {"domain": DOMAIN, "base": str(base), "login": "nobody", "uid": user.pw_uid,
+           "gid": user.pw_gid, "docroots": [["httpdocs"]]}
     monkeypatch.setattr(server, "_helper_session_factory", LocalSession)
+    monkeypatch.setattr(server, "_vhost_ctx", lambda d: dict(ctx))
     monkeypatch.setattr(server, "_VHOST_BASE", str(root))
     monkeypatch.setattr(server, "_UPLOAD_MIN_FREE", 0)
     return base
 
 
 def rep(path, old, new, **kw):
+    # .php-Dateien sind ausfuehrbar - wie bei upload_begin nur mit allow_executable
+    kw.setdefault("allow_executable", path.endswith(".php"))
     return json.loads(server.replace_in_vhost_file(DOMAIN, path, old, new, confirm=True, **kw))
 
 
@@ -161,9 +166,13 @@ def test_size_limit(vhost, monkeypatch):
 
 
 def test_root_owned_outside_httpdocs_rejected(vhost):
+    # Helper-seitige Regel (root-eigene Datei ausserhalb von httpdocs); das
+    # Tool selbst lehnt "conf/" schon vorher als geschuetzten Bereich ab.
     (vhost / "conf/x.conf").write_text("a")
-    with pytest.raises(ValueError, match="root"):
+    with pytest.raises(ValueError, match="geschützt"):
         rep("conf/x.conf", "a", "b")
+    with pytest.raises(ValueError, match="root"):
+        server._replace_run(DOMAIN, "a", "b", False, paths=[["conf", "x.conf"]])
     assert (vhost / "conf/x.conf").read_text() == "a"
 
 
@@ -174,10 +183,38 @@ def test_requires_confirm_and_old_str(vhost):
         rep("httpdocs/config.php", "", "x")
 
 
+def test_executable_needs_flag(vhost):
+    old = (vhost / "httpdocs/config.php").read_text()
+    for p in ("httpdocs/config.php", "httpdocs/.htaccess", "httpdocs/.user.ini"):
+        with pytest.raises(ValueError, match="allow_executable"):
+            rep(p, "false", "true", allow_executable=False)
+    assert (vhost / "httpdocs/config.php").read_text() == old
+    assert baks(vhost / "httpdocs", "config.php") == []
+    with pytest.raises(ValueError, match="allow_executable"):
+        server.replace_in_vhost_files(DOMAIN, "'alt'", "'neu'", paths=["httpdocs/inc/a.php"], confirm=True)
+    with pytest.raises(ValueError, match="allow_executable"):
+        server.replace_in_vhost_files(DOMAIN, "'alt'", "'neu'", glob="httpdocs/inc/*.php", confirm=True)
+    assert (vhost / "httpdocs/inc/a.php").read_text() == "<?php echo 'alt'; ?>\n"
+    assert tmp_leftovers(vhost) == []
+
+
+def test_protected_paths_rejected(vhost):
+    (vhost / ".ssh").mkdir()
+    (vhost / ".ssh/authorized_keys").write_text("ssh-ed25519 AAAA test")
+    (vhost / "logs").mkdir()
+    (vhost / "logs/error_log").write_text("alt")
+    for p in (".ssh/authorized_keys", "conf/x.conf", "logs/error_log", ".bashrc", "httpdocs"):
+        with pytest.raises(ValueError, match="geschützt"):
+            rep(p, "alt", "neu")
+        with pytest.raises(ValueError, match="geschützt"):
+            server.replace_in_vhost_files(DOMAIN, "alt", "neu", paths=[p], confirm=True)
+    assert (vhost / ".ssh/authorized_keys").read_text() == "ssh-ed25519 AAAA test"
+
+
 def test_multi_paths_and_skipped(vhost):
     res = json.loads(server.replace_in_vhost_files(
         DOMAIN, "'alt'", "'neu'", paths=["httpdocs/inc/a.php", "httpdocs/inc/b.php", "httpdocs/inc/c.php"],
-        confirm=True))
+        confirm=True, allow_executable=True))
     assert [f["datei"].rsplit("/", 1)[1] for f in res["geaendert"]] == ["a.php", "b.php"]
     assert res["ohne_treffer"] == ["httpdocs/inc/c.php"] and res["ersetzungen_gesamt"] == 2
     assert (vhost / "httpdocs/inc/a.php").read_text() == "<?php echo 'neu'; ?>\n"
@@ -187,13 +224,13 @@ def test_multi_paths_and_skipped(vhost):
 def test_multi_glob(vhost):
     os.symlink(vhost / "httpdocs/inc/a.php", vhost / "httpdocs/inc/l.php")
     res = json.loads(server.replace_in_vhost_files(DOMAIN, "'alt'", "'neu'", glob="httpdocs/**/*.php",
-                                                   confirm=True))
+                                                   confirm=True, allow_executable=True))
     assert res["ersetzungen_gesamt"] == 2
     assert sorted(res["ohne_treffer"]) == ["httpdocs/config.php", "httpdocs/inc/c.php"]
     assert res["symlinks_uebersprungen"] == ["httpdocs/inc/l.php"]
     # Backups werden von einem weiteren glob nicht erfasst
     res = json.loads(server.replace_in_vhost_files(DOMAIN, "'neu'", "'neuer'", glob="httpdocs/inc/*",
-                                                   confirm=True))
+                                                   confirm=True, allow_executable=True))
     assert res["ersetzungen_gesamt"] == 2 and all(".bak-" not in f["datei"] for f in res["geaendert"])
 
 
@@ -212,11 +249,11 @@ def test_multi_all_or_nothing(vhost):
     (vhost / "httpdocs/inc/bin.php").write_bytes(b"'alt'\x00")
     with pytest.raises(ValueError, match="Nullbytes"):
         server.replace_in_vhost_files(DOMAIN, "'alt'", "'neu'",
-                                      paths=["httpdocs/inc/a.php", "httpdocs/inc/bin.php"], confirm=True)
+                                      paths=["httpdocs/inc/a.php", "httpdocs/inc/bin.php"], confirm=True, allow_executable=True)
     with pytest.raises(ValueError, match="2-mal"):
         (vhost / "httpdocs/inc/b.php").write_text("'alt' 'alt'")
         server.replace_in_vhost_files(DOMAIN, "'alt'", "'neu'",
-                                      paths=["httpdocs/inc/a.php", "httpdocs/inc/b.php"], confirm=True)
+                                      paths=["httpdocs/inc/a.php", "httpdocs/inc/b.php"], confirm=True, allow_executable=True)
     assert (vhost / "httpdocs/inc/a.php").read_text() == "<?php echo 'alt'; ?>\n"
     assert baks(vhost / "httpdocs/inc", "a.php") == [] and tmp_leftovers(vhost) == []
 
@@ -229,6 +266,6 @@ def test_multi_rollback_on_write_error(vhost):
         (vhost / f"httpdocs/inc/b.php.bak-{s}").write_text("x")
     with pytest.raises(ValueError, match="existiert"):
         server.replace_in_vhost_files(DOMAIN, "'alt'", "'neu'",
-                                      paths=["httpdocs/inc/a.php", "httpdocs/inc/b.php"], confirm=True)
+                                      paths=["httpdocs/inc/a.php", "httpdocs/inc/b.php"], confirm=True, allow_executable=True)
     assert (vhost / "httpdocs/inc/a.php").read_text() == "<?php echo 'alt'; ?>\n"
     assert baks(vhost / "httpdocs/inc", "a.php") == [] and tmp_leftovers(vhost) == []
