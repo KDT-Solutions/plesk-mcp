@@ -7,8 +7,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server.py ./
 
+# Nicht als root laufen (wie infra-mcp, UID 10001). Der Container braucht
+# keine Root-Rechte: nur ausgehende SSH-/HTTPS-Verbindungen und Port 8000.
+# Gemountete Secrets (PLESK_SSH_KEY_PATH, PLESK_SSH_KNOWN_HOSTS) und ein
+# AUDIT_LOG_FILE muessen fuer UID 10001 lesbar bzw. schreibbar sein.
+RUN useradd --system --no-create-home --uid 10001 mcp
+USER mcp
+
 ENV MCP_HOST=0.0.0.0 \
-    MCP_PORT=8000
+    MCP_PORT=8000 \
+    PYTHONUNBUFFERED=1
 
 # Git-Commit und Version des Builds (von GitHub Actions gesetzt) - get_version
 # gibt beides zurueck, damit nach einem Redeploy pruefbar ist, welcher Stand wirklich laeuft.

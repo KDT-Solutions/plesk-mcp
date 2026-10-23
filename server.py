@@ -88,7 +88,7 @@ _MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 # Commit mit einer neuen Basis ergibt also <Basis>.0.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.29"
+_VERSION_BASE = "0.30"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -167,13 +167,28 @@ _SSH_TIMEOUT = int(os.environ.get("PLESK_SSH_TIMEOUT", "20"))
 #   PLESK_SSH_KNOWN_HOSTS: Pfad zu einer known_hosts-Datei (gemountet).
 #   PLESK_SSH_HOST_KEY:    ein known_hosts-/authorized_keys-Zeilenrest, also
 #                          "<typ> <base64>" (z.B. "ssh-ed25519 AAAAC3Nza...").
-# Ist einer von beiden gesetzt, wird der Host-Key strikt geprueft (RejectPolicy
-# bei unbekanntem Key). Ist keiner gesetzt, wird der Key beim ersten Connect
-# automatisch akzeptiert (AutoAdd) - bequem, aber ohne MITM-Schutz; es wird
-# einmalig auf stderr gewarnt.
+# Einer von beiden ist Pflicht: Der Host-Key wird immer strikt geprueft
+# (RejectPolicy bei unbekanntem Key). Ohne gepinnten Key startet der Server
+# nicht (siehe _check_startup_config) - ein automatisches Akzeptieren beim
+# ersten Connect (AutoAddPolicy) gibt es nicht mehr, weil damit bei
+# Passwort-Authentifizierung ein MITM das Root-Passwort abgreifen koennte.
 _SSH_KNOWN_HOSTS = os.environ.get("PLESK_SSH_KNOWN_HOSTS", "").strip()
 _SSH_HOST_KEY = os.environ.get("PLESK_SSH_HOST_KEY", "").strip()
-_ssh_hostkey_warned = False
+# Mindestlaenge des statischen Bearer-Tokens (MCP_API_KEY): 32 Zeichen, also
+# mindestens 128 Bit bei Hex bzw. ~190 Bit bei base64/urlsafe-Zufall.
+_MCP_API_KEY_MIN_LEN = 32
+# Ausgabe-Obergrenze pro SSH-Kommando (stdout und stderr je) - danach wird der
+# Kanal geschlossen und die Ausgabe als gekuerzt markiert. Schuetzt den
+# Container vor OOM durch z.B. "cat" auf riesige Dateien.
+_SSH_MAX_OUTPUT = 4 * 1024 * 1024
+# Harte Gesamtlaufzeit pro SSH-Kommando (Sekunden), unabhaengig davon, ob
+# Ausgabe fliesst (der paramiko-Timeout ist nur ein Inaktivitaets-Timeout).
+# Lang laufende Tools (Helper, WP-CLI, Bildoptimierung) uebergeben ihren
+# eigenen Wert; der Standard ist nur ein Sicherheitsnetz.
+_SSH_MAX_RUNTIME = int(os.environ.get("PLESK_SSH_MAX_RUNTIME", "1800"))
+# Laufzeitlimit fuer run_diagnostic: wird dem Remote-Kommando als
+# "timeout <s>" vorangestellt und gilt zusaetzlich als harte Deadline.
+_DIAG_TIMEOUT = int(os.environ.get("DIAG_TIMEOUT", "60"))
 
 # Kommandos, die der generische Diagnose-Tool (run_diagnostic) ausführen darf
 # (read-only). Jeder Eintrag ist ein erlaubtes erstes Wort (Programm) des
@@ -247,22 +262,15 @@ FORBIDDEN_FIND_PRIMARIES = {
 }
 
 # Positive Allowlist der erlaubten Subcommands/ersten Argumente je Programm,
-# das schreibende Unterbefehle kennt. Nur lesende Operationen. Fuer Programme,
-# die hier NICHT auftauchen (grep, tail, cat, du, df, ...), gilt weiter nur die
-# generische Wort-Blacklist. Eine Positiv-Liste ist hier noetig, weil eine
-# Blacklist bei "plesk"/"systemctl" die Schreib-Subcommands nicht dicht
-# bekommt (plesk db/login/bin extension --install-url, systemctl mask/disable
-# /poweroff/isolate ...).
+# das schreibende Unterbefehle kennt. Nur lesende Operationen. Eine
+# Positiv-Liste ist hier noetig, weil eine Blacklist bei "plesk"/"systemctl"
+# die Schreib-Subcommands nicht dicht bekommt (plesk db/login/bin extension
+# --install-url, systemctl mask/disable/poweroff/isolate ...).
 SAFE_SUBCOMMANDS = {
-    "systemctl": {
-        "status", "show", "show-environment", "list-units", "list-unit-files",
-        "list-timers", "list-sockets", "list-dependencies", "list-jobs",
-        "is-active", "is-enabled", "is-failed", "is-system-running",
-        "cat", "get-default",
-    },
-    # plesk: nur die lesenden CLI-Familien. Innerhalb davon fangen die
-    # generische Blacklist (add/del/set/...) und FORBIDDEN_SUBFLAGS die
-    # schreibenden Aktionen ab.
+    "systemctl": {"status", "is-active", "list-units", "show", "cat"},
+    # plesk: nur die lesenden CLI-Familien; innerhalb davon gilt zusaetzlich
+    # die Positiv-Liste der Aktionen in _check_plesk (nur -i/--info, -l/--list,
+    # --show-*), siehe dort.
     "plesk": {"version", "bin", "ext"},
 }
 
@@ -280,7 +288,86 @@ FORBIDDEN_SUBCOMMANDS = {
 FORBIDDEN_SUBFLAGS = {
     "install", "install-url", "create", "enable", "disable", "repair",
     "exec", "execute", "uninstall", "upgrade", "activate", "deactivate",
+    "wp-cli",
 }
+
+# --- Positiv-Listen je Utility fuer run_diagnostic -------------------------
+#
+# plesk bin <utility> <aktion> [optionen]: Die Aktion (erstes Argument nach dem
+# Utility) muss lesend sein. Plesk-CLI-Konvention: Langaktionen "--xxx",
+# Kurzaktionen "-x", Optionen danach als "-name wert". Kurzaktionen sind je
+# Utility verschieden belegt ("-i" ist bei "domain" --info, bei "extension"
+# aber --install), darum sind -c/-u/-r/-i/-e grundsaetzlich gesperrt und "-i"
+# nur bei den Utilities erlaubt, bei denen es --info bedeutet.
+_PLESK_UTIL_RE = re.compile(r"^[a-z0-9_-]{1,64}$")
+_PLESK_READ_ACTIONS = {"--info", "--list", "-l"}
+# "-i" == "--info" bei diesen Utilities
+_PLESK_INFO_SHORT_UTILS = {
+    "domain", "subscription", "customer", "reseller", "site", "subdomain",
+    "domain_alias", "dns", "mail", "database", "service_plan", "service_plan_addon",
+}
+# "-s" == "--show" (server_pref)
+_PLESK_SHOW_SHORT_UTILS = {"server_pref"}
+# Kurzoptionen, die bei plesk bin/ext nie erlaubt sind (-c=--create,
+# -u=--update, -r=--remove, -i=--install bei extension, -e=--enable).
+_PLESK_FORBIDDEN_SHORT = {"-c", "-u", "-r", "-i", "-e"}
+# "--show-*" ist lesend - ausser --show-password (gibt das Admin-Passwort aus).
+_PLESK_FORBIDDEN_SHOW = {"--show-password"}
+_PLESK_EXT_READ_ACTIONS = {"--list", "-l", "--info"}
+
+# journalctl: Optionen, die Journal-Dateien loeschen/rotieren/schreiben oder
+# nie enden (-f/--follow). Vergleich auf dem Namen ohne Bindestriche, vor "=".
+_JOURNALCTL_FORBIDDEN = {
+    "vacuum-size", "vacuum-time", "vacuum-files", "rotate", "flush", "sync",
+    "relinquish-var", "smart-relinquish-var", "setup-keys", "force",
+    "cursor-file", "follow", "f",
+}
+_JOURNALCTL_SHORT_WITH_ARG = set("upSUnotDMgFc")
+
+# dmesg: -C/-c/--clear/--read-clear loeschen den Ring-Buffer, -n/-D/-E aendern
+# das Konsolen-Logging, -w/-W warten endlos.
+_DMESG_FORBIDDEN = {
+    "clear", "read-clear", "console-level", "console-off", "console-on",
+    "follow", "follow-new", "C", "c", "n", "D", "E", "w", "W",
+}
+_DMESG_SHORT_WITH_ARG = set("Ffls")
+
+# tail: -f/-F/--follow/--pid/--retry enden nie (bzw. nur mit --pid).
+_TAIL_FORBIDDEN = {"follow", "pid", "retry", "f", "F"}
+_TAIL_SHORT_WITH_ARG = set("ncs")
+
+# du: Symlinks nie verfolgen (sonst fuehrt ein Link aus den erlaubten Pfaden
+# heraus), keine Pfadlisten aus Dateien.
+_DU_FORBIDDEN = {"dereference", "dereference-args", "files0-from", "L", "D", "H"}
+_DU_SHORT_WITH_ARG = set("BdtX")
+_DU_LONG_WITH_ARG = {"block-size", "max-depth", "threshold", "exclude-from", "exclude", "time-style"}
+
+# find: -L/-H/-follow verfolgen Symlinks (siehe du), dazu die Aktions-Primitive
+# aus FORBIDDEN_FIND_PRIMARIES.
+_FIND_FORBIDDEN = {"L", "H", "follow"} | FORBIDDEN_FIND_PRIMARIES
+
+# grep/zgrep: -r/--recursive nur mit explizitem Pfad in den erlaubten Basen;
+# -R/--dereference-recursive folgt allen Symlinks und ist gesperrt.
+_GREP_RECURSIVE = {"recursive", "r"}
+_GREP_FORBIDDEN = {"dereference-recursive", "R"}
+_GREP_SHORT_WITH_ARG = set("ABCmefdD")
+_GREP_LONG_WITH_ARG = {
+    "regexp", "file", "max-count", "context", "after-context", "before-context",
+    "binary-files", "color", "colour", "devices", "directories", "exclude",
+    "exclude-from", "exclude-dir", "include", "label",
+}
+
+# Basispfade, unterhalb derer find/du/grep -r suchen duerfen (absolut, ohne
+# Shell-Expansionen). Alles andere waere ein Scan des ganzen Servers.
+_DIAG_PATH_BASES = ("/var/www/vhosts", "/var/log", "/etc/nginx", "/etc/httpd", "/usr/local/psa")
+# Zeichen in Pfadargumenten, die die Remote-Shell noch expandieren wuerde und
+# damit den Prefix-Check aushebeln koennten ("/var/log/${X:-..}/..", "{..,x}").
+_DIAG_PATH_BAD_CHARS = set("$`{}~")
+# Geraete/Pseudodateien, die endlos liefern oder den Kernelspeicher ausgeben.
+_DIAG_FORBIDDEN_PATHS = (
+    "/dev/zero", "/dev/urandom", "/dev/random", "/dev/mem", "/dev/kmem", "/dev/port",
+    "/proc/kcore", "/proc/kmsg",
+)
 
 
 class SSHError(ToolError, RuntimeError):
@@ -289,10 +376,9 @@ class SSHError(ToolError, RuntimeError):
 
 
 def _configure_host_keys(client: paramiko.SSHClient) -> None:
-    """Konfiguriert die Host-Key-Verifikation aus den Umgebungsvariablen.
-    Mit PLESK_SSH_KNOWN_HOSTS/PLESK_SSH_HOST_KEY: strikte Pruefung
-    (RejectPolicy). Ohne beides: AutoAdd mit einmaliger Warnung."""
-    global _ssh_hostkey_warned
+    """Konfiguriert die Host-Key-Verifikation aus den Umgebungsvariablen
+    PLESK_SSH_KNOWN_HOSTS/PLESK_SSH_HOST_KEY: immer strikte Pruefung
+    (RejectPolicy). Ohne gepinnten Key wird keine Verbindung aufgebaut."""
     pinned = False
 
     if _SSH_KNOWN_HOSTS:
@@ -331,17 +417,12 @@ def _configure_host_keys(client: paramiko.SSHClient) -> None:
         client.get_host_keys().add(host_entry, keytype, key)
         pinned = True
 
-    if pinned:
-        client.set_missing_host_key_policy(paramiko.RejectPolicy())
-    else:
-        if not _ssh_hostkey_warned:
-            print(
-                "WARNUNG: PLESK_SSH_KNOWN_HOSTS/PLESK_SSH_HOST_KEY nicht gesetzt "
-                "- SSH-Host-Key wird nicht geprueft (kein MITM-Schutz).",
-                file=sys.stderr, flush=True,
-            )
-            _ssh_hostkey_warned = True
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    if not pinned:
+        raise SSHError(
+            "PLESK_SSH_HOST_KEY oder PLESK_SSH_KNOWN_HOSTS ist nicht gesetzt - ohne "
+            "gepinnten Host-Key wird keine SSH-Verbindung aufgebaut (kein MITM-Schutz)."
+        )
+    client.set_missing_host_key_policy(paramiko.RejectPolicy())
 
 
 def _key_fingerprint(key: paramiko.PKey) -> str:
@@ -402,25 +483,104 @@ def _ssh_connect() -> paramiko.SSHClient:
     return client
 
 
-def _ssh_exec(command: str, timeout: int | None = None) -> tuple[str, str, int]:
+def _read_channel(
+    chan: paramiko.Channel,
+    timeout: int,
+    max_runtime: int,
+    limit: int | None = None,
+) -> tuple[bytes, bytes, bool, int]:
+    """Liest stdout/stderr eines Kanals chunkweise mit Inaktivitaets-Timeout,
+    harter Gesamt-Deadline und Ausgabe-Obergrenze (je Strom). Bei Ueberschreitung
+    der Obergrenze wird der Kanal geschlossen (Remote-Prozess bekommt SIGPIPE)
+    und truncated=True gemeldet. Rueckgabe: (stdout, stderr, truncated, exit_code);
+    exit_code ist -1, wenn keiner gemeldet wurde (z.B. nach dem Abbruch)."""
+    import select
+
+    limit = limit or _SSH_MAX_OUTPUT
+    out, err = bytearray(), bytearray()
+    truncated = False
+    start = last = time.monotonic()
+    while True:
+        now = time.monotonic()
+        if now - start > max_runtime:
+            chan.close()
+            raise SSHError(
+                f"Kommando nach {max_runtime} s Gesamtlaufzeit abgebrochen (harte Deadline)."
+            )
+        if now - last > timeout:
+            chan.close()
+            raise socket.timeout(f"keine Ausgabe seit {timeout} s")
+        got = False
+        while chan.recv_ready():
+            data = chan.recv(65536)
+            if not data:
+                break
+            got = True
+            out += data
+            if len(out) > limit:
+                truncated = True
+                break
+        while not truncated and chan.recv_stderr_ready():
+            data = chan.recv_stderr(65536)
+            if not data:
+                break
+            got = True
+            err += data
+            if len(err) > limit:
+                truncated = True
+                break
+        if truncated:
+            chan.close()
+            break
+        if got:
+            last = now
+            continue
+        if chan.eof_received and not chan.recv_ready() and not chan.recv_stderr_ready():
+            break
+        if chan.closed:
+            break
+        # Nichts anliegend: auf Daten/EOF warten (max. 0.5 s, dann erneut
+        # Deadline und Inaktivitaet pruefen).
+        try:
+            select.select([chan], [], [], 0.5)
+        except (OSError, ValueError):
+            time.sleep(0.05)
+    exit_code = -1
+    if chan.status_event.wait(0 if truncated else min(timeout, 10)):
+        exit_code = chan.recv_exit_status()
+    return bytes(out[:limit]), bytes(err[:limit]), truncated, exit_code
+
+
+_TRUNCATED_NOTE = f"\n[Ausgabe gekürzt auf {_SSH_MAX_OUTPUT // (1024 * 1024)} MB - Kommando abgebrochen]"
+
+
+def _ssh_exec(
+    command: str, timeout: int | None = None, max_runtime: int | None = None
+) -> tuple[str, str, int]:
     """Führt ein Kommando aus und liefert (stdout, stderr, exit_code) getrennt
-    zurück - für Tools, die stdout selbst parsen (z.B. JSON der Imunify-CLI)."""
+    zurück - für Tools, die stdout selbst parsen (z.B. JSON der Imunify-CLI).
+    timeout: Inaktivitaets-Timeout, max_runtime: harte Gesamtlaufzeit; die
+    Ausgabe ist je Strom auf _SSH_MAX_OUTPUT begrenzt (Hinweis am Ende)."""
     client = _ssh_connect()
     try:
         stdin, stdout, stderr = client.exec_command(command, timeout=timeout or _SSH_TIMEOUT)
-        out = stdout.read().decode("utf-8", errors="replace")
-        err = stderr.read().decode("utf-8", errors="replace")
-        exit_code = stdout.channel.recv_exit_status()
+        raw_out, raw_err, truncated, exit_code = _read_channel(
+            stdout.channel, timeout or _SSH_TIMEOUT, max_runtime or _SSH_MAX_RUNTIME
+        )
     finally:
         client.close()
+    out = raw_out.decode("utf-8", errors="replace")
+    err = raw_err.decode("utf-8", errors="replace")
+    if truncated:
+        out += _TRUNCATED_NOTE
     return out, err, exit_code
 
 
-def ssh_run(command: str, timeout: int | None = None) -> str:
+def ssh_run(command: str, timeout: int | None = None, max_runtime: int | None = None) -> str:
     """Führt ein Kommando ungeprüft aus (nur für die fest verdrahteten Tools,
     NICHT für Nutzereingaben ohne Whitelist-Check - dafür ssh_run_whitelisted).
     """
-    out, err, exit_code = _ssh_exec(command, timeout=timeout)
+    out, err, exit_code = _ssh_exec(command, timeout=timeout, max_runtime=max_runtime)
 
     result = out
     if err.strip():
@@ -430,10 +590,136 @@ def ssh_run(command: str, timeout: int | None = None) -> str:
     return result.strip() or "(keine Ausgabe)"
 
 
+def _split_options(
+    args: list[str], short_with_arg: set[str] = frozenset(), long_with_arg: set[str] = frozenset()
+) -> tuple[list[tuple[str, str]], list[str]]:
+    """Zerlegt eine Argumentliste GNU-artig in Optionen und positionale
+    Argumente. Optionen kommen als (name, wert) ohne Bindestriche zurueck -
+    Kurzoptionen einzeln aus Clustern ("-rn" -> r, n), wobei eine Kurzoption
+    mit Argument den Rest des Clusters bzw. das naechste Token als Wert nimmt
+    ("-efoo", "-e foo"). Nach "--" ist alles positional."""
+    opts: list[tuple[str, str]] = []
+    pos: list[str] = []
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok == "--":
+            pos.extend(args[i + 1:])
+            break
+        if tok.startswith("--"):
+            name, eq, val = tok[2:].partition("=")
+            if not eq and name in long_with_arg and i + 1 < len(args):
+                i += 1
+                val = args[i]
+            opts.append((name, val))
+        elif tok.startswith("-") and len(tok) > 1:
+            letters = tok[1:]
+            j = 0
+            while j < len(letters):
+                ch = letters[j]
+                if ch in short_with_arg:
+                    val = letters[j + 1:]
+                    if not val and i + 1 < len(args):
+                        i += 1
+                        val = args[i]
+                    opts.append((ch, val))
+                    break
+                opts.append((ch, ""))
+                j += 1
+        else:
+            pos.append(tok)
+        i += 1
+    return opts, pos
+
+
+def _reject_options(program: str, opts: list[tuple[str, str]], forbidden: set[str]) -> None:
+    for name, _ in opts:
+        if name in forbidden or name.lower() in forbidden:
+            dash = "-" if len(name) == 1 else "--"
+            raise SSHError(
+                f"Option '{dash}{name}' ist bei '{program}' nicht erlaubt "
+                "(schreibend, endlos oder folgt Symlinks). Dieses Tool ist read-only."
+            )
+
+
+def _check_diag_paths(program: str, paths: list[str]) -> None:
+    """find/du/grep -r: mindestens ein Pfad, jeder absolut, ohne
+    Shell-Expansionen und (normalisiert) unterhalb von _DIAG_PATH_BASES."""
+    if not paths:
+        raise SSHError(
+            f"'{program}' braucht einen expliziten Pfad unterhalb von "
+            f"{', '.join(_DIAG_PATH_BASES)} (kein Scan des ganzen Servers)."
+        )
+    for p in paths:
+        if not p.startswith("/") or _DIAG_PATH_BAD_CHARS & set(p):
+            raise SSHError(
+                f"Pfad {p!r} ist nicht erlaubt - absoluter Pfad ohne Shell-Expansionen "
+                f"($, ~, {{}}) unterhalb von {', '.join(_DIAG_PATH_BASES)} angeben."
+            )
+        n = posixpath.normpath(p)
+        if not any(n == b or n.startswith(b + "/") for b in _DIAG_PATH_BASES):
+            raise SSHError(
+                f"Pfad {p!r} liegt ausserhalb der erlaubten Basispfade "
+                f"({', '.join(_DIAG_PATH_BASES)})."
+            )
+
+
+def _check_plesk(args: list[str]) -> None:
+    """plesk version | plesk bin <util> <lese-aktion> [optionen] |
+    plesk ext <name> --list|--info [optionen]. Nur eine Aktion, keine
+    weiteren Langoptionen, keine der gesperrten Kurzoptionen."""
+    if not args:
+        raise SSHError("'plesk' erfordert ein Subcommand. Erlaubt (read-only): bin, ext, version")
+    sub = args[0].lower()
+    if sub in ("version", "--version", "-v"):
+        if len(args) > 1:
+            raise SSHError("'plesk version' nimmt keine weiteren Argumente.")
+        return
+    if sub not in ("bin", "ext") or len(args) < 3:
+        raise SSHError(
+            "Erlaubt sind nur 'plesk version', 'plesk bin <utility> -i|--info|-l|--list|--show-*' "
+            "und 'plesk ext <name> --list|--info' (read-only)."
+        )
+    util = args[1].lower()
+    action = args[2]
+    if not _PLESK_UTIL_RE.match(util):
+        raise SSHError(f"Ungültiger Plesk-Utility-Name {args[1]!r}.")
+    action_l = action.lower()
+    if sub == "bin":
+        ok = (
+            action_l in _PLESK_READ_ACTIONS
+            or (action_l.startswith("--show-") and action_l not in _PLESK_FORBIDDEN_SHOW)
+            or (action_l == "-i" and util in _PLESK_INFO_SHORT_UTILS)
+            or (action_l == "-s" and util in _PLESK_SHOW_SHORT_UTILS)
+        )
+        allowed = "-i/--info (nur bei Domain-/Kunden-Utilities), -l/--list, --show-*"
+    else:
+        ok = action_l in _PLESK_EXT_READ_ACTIONS
+        allowed = "--list, -l, --info"
+    if not ok:
+        raise SSHError(
+            f"Aktion '{action}' ist bei 'plesk {sub} {util}' nicht erlaubt. "
+            f"Erlaubt (read-only): {allowed}. Schreibende Plesk-Aktionen laufen nur "
+            "über die dafür vorgesehenen Tools (dns_*, php_settings_*, wp_* ...)."
+        )
+    for tok in args[3:]:
+        if not tok.startswith("-"):
+            continue
+        low = tok.lower()
+        if low in _PLESK_FORBIDDEN_SHORT or low.startswith("--"):
+            raise SSHError(
+                f"Option '{tok}' ist nach der Aktion '{action}' nicht erlaubt - pro Aufruf "
+                "genau eine lesende Aktion, Optionen nur als '-name wert'."
+            )
+        if low.lstrip("-").split("=", 1)[0] in FORBIDDEN_SUBFLAGS:
+            raise SSHError(f"Option '{tok}' ist schreibend und nicht erlaubt.")
+
+
 def _check_segment(seg: list[str]) -> None:
     """Prueft ein einzelnes Pipe-Segment (Token-Liste) read-only-tauglich:
     erlaubtes Programm, erlaubtes Subcommand (Positiv-Liste, wo noetig),
-    keine schreibenden Optionsflags, keine gefaehrlichen find-Primitive."""
+    keine schreibenden Optionsflags, je Utility die Positiv-/Sperrlisten
+    (plesk-Aktionen, journalctl/dmesg/tail/du/find/grep-Optionen, Pfade)."""
     if not seg:
         raise SSHError("Leeres Pipe-Segment im Kommando.")
     program = seg[0]
@@ -443,6 +729,13 @@ def _check_segment(seg: list[str]) -> None:
             f"Erlaubt sind: {', '.join(sorted(ALLOWED_COMMAND_PREFIXES))}"
         )
     args = seg[1:]
+
+    # 0) Geraete/Pseudodateien, die endlos liefern oder Kernelspeicher ausgeben
+    #    (auch als Optionswert wie --file=/dev/zero; normalisiert gegen /dev/./zero).
+    for tok in args:
+        n = posixpath.normpath(tok)
+        if any(f in n for f in _DIAG_FORBIDDEN_PATHS):
+            raise SSHError(f"Pfad '{tok}' ist nicht erlaubt (Gerät/Pseudodatei).")
 
     # 1) Erstes echtes Subcommand (erstes Argument, das nicht mit '-' beginnt).
     first_sub = next((a for a in args if not a.startswith("-")), None)
@@ -478,16 +771,50 @@ def _check_segment(seg: list[str]) -> None:
                 "Dieses Tool ist read-only für Diagnosezwecke."
             )
 
-    # 3) find-Aktions-Primitive (fuehren Kommandos aus / schreiben Dateien).
-    if program == "find":
+    # 3) Positiv-/Sperrlisten je Utility.
+    if program == "plesk":
+        _check_plesk(args)
+    elif program == "hostname":
+        if args:
+            raise SSHError("'hostname' ist nur ohne Argumente erlaubt (setzt sonst den Hostnamen).")
+    elif program == "journalctl":
+        opts, _ = _split_options(args, _JOURNALCTL_SHORT_WITH_ARG)
+        _reject_options(program, opts, _JOURNALCTL_FORBIDDEN)
+    elif program == "dmesg":
+        opts, _ = _split_options(args, _DMESG_SHORT_WITH_ARG)
+        _reject_options(program, opts, _DMESG_FORBIDDEN)
+    elif program == "tail":
+        opts, _ = _split_options(args, _TAIL_SHORT_WITH_ARG)
+        _reject_options(program, opts, _TAIL_FORBIDDEN)
+    elif program == "du":
+        opts, paths = _split_options(args, _DU_SHORT_WITH_ARG, _DU_LONG_WITH_ARG)
+        _reject_options(program, opts, _DU_FORBIDDEN)
+        _check_diag_paths(program, paths)
+    elif program == "find":
+        # find [-H|-L|-P] [-D opts] [-O level] <pfad...> [ausdruck]: Startpunkte
+        # sind die Tokens vor dem ersten Ausdrucks-Token (-name, "(", "!" ...).
+        rest = list(args)
+        while rest and (rest[0] in ("-P", "-D") or rest[0].startswith("-O")):
+            rest = rest[2:] if rest[0] == "-D" else rest[1:]
+        paths: list[str] = []
+        while rest and not rest[0].startswith(("-", "(", "!", ",")):
+            paths.append(rest.pop(0))
         for tok in args:
-            if not tok.startswith("-"):
-                continue
-            if tok.lstrip("-").lower() in FORBIDDEN_FIND_PRIMARIES:
+            name = tok.lstrip("-")
+            if tok.startswith("-") and (name in _FIND_FORBIDDEN or name.lower() in FORBIDDEN_FIND_PRIMARIES):
                 raise SSHError(
-                    f"find-Primitiv '{tok}' ist nicht erlaubt "
-                    "(kann Kommandos ausfuehren oder Dateien schreiben)."
+                    f"find-Option '{tok}' ist nicht erlaubt "
+                    "(führt Kommandos aus, schreibt Dateien oder folgt Symlinks)."
                 )
+        _check_diag_paths(program, paths)
+    elif program in ("grep", "zgrep"):
+        opts, pos = _split_options(args, _GREP_SHORT_WITH_ARG, _GREP_LONG_WITH_ARG)
+        _reject_options(program, opts, _GREP_FORBIDDEN)
+        if any(name in _GREP_RECURSIVE for name, _ in opts):
+            # Ohne -e/-f ist das erste positionale Argument das Muster.
+            if not any(name in ("e", "f", "regexp", "file") for name, _ in opts):
+                pos = pos[1:]
+            _check_diag_paths(f"{program} -r", pos)
 
 
 def ssh_run_whitelisted(command: str, timeout: int | None = None) -> str:
@@ -495,8 +822,10 @@ def ssh_run_whitelisted(command: str, timeout: int | None = None) -> str:
     1. Keine Shell-Chaining-Konstrukte (;, &&, ||, `, $(, >, <, &, Newline)
     2. Keine verbotenen Wörter (restart/stop/kill/rm/... als eigenständiges Wort)
     3. Jedes Pipe-Segment: erlaubtes Programm, erlaubtes Subcommand
-       (Positiv-Liste für plesk/systemctl), keine schreibenden Flags, keine
-       gefährlichen find-Primitive.
+       (Positiv-Liste für plesk/systemctl), keine schreibenden Flags, je
+       Utility die Positiv-/Sperrlisten (siehe _check_segment).
+    Das Kommando läuft auf dem Server unter "timeout <DIAG_TIMEOUT>" und mit
+    harter Deadline; die Ausgabe ist auf _SSH_MAX_OUTPUT begrenzt.
     """
     stripped = command.strip()
     if not stripped:
@@ -524,7 +853,13 @@ def ssh_run_whitelisted(command: str, timeout: int | None = None) -> str:
         )
 
     try:
-        tokens = shlex.split(stripped)
+        # punctuation_chars="|": ein unquotiertes "|" wird auch ohne Leerzeichen
+        # ("cat x|plesk ...") zum eigenen Token, ein quotiertes ('err|warn')
+        # bleibt Teil des Musters - sonst wuerde das zweite Programm der Pipe
+        # nicht als eigenes Segment geprueft.
+        lex = shlex.shlex(stripped, posix=True, punctuation_chars="|")
+        lex.whitespace_split = True
+        tokens = list(lex)
     except ValueError as e:
         raise SSHError(f"Kommando konnte nicht geparst werden: {e}")
     if not tokens:
@@ -543,7 +878,12 @@ def ssh_run_whitelisted(command: str, timeout: int | None = None) -> str:
     for seg in segments:
         _check_segment(seg)
 
-    return ssh_run(stripped, timeout=timeout)
+    # Gesamte Pipeline unter "timeout" (eigene Prozessgruppe, SIGTERM an alle
+    # Kinder, nach 5 s SIGKILL) - dazu auf unserer Seite Inaktivitaets-Timeout
+    # und harte Deadline etwas darueber als Backstop.
+    limit = timeout or _DIAG_TIMEOUT
+    remote = f"timeout -k 5 {int(limit)} sh -c {shlex.quote(stripped)}"
+    return ssh_run(remote, timeout=limit + 10, max_runtime=limit + 20)
 
 
 def _domain_arg(domain: str) -> str:
@@ -620,15 +960,20 @@ def _client_exec(
     command: str,
     timeout: int | None = None,
     stdin_data: bytes | None = None,
+    max_runtime: int | None = None,
 ) -> tuple[str, str, int]:
     """Wie _ssh_exec, aber auf einer bereits offenen SSH-Verbindung."""
     stdin, stdout, stderr = client.exec_command(command, timeout=timeout or _SSH_TIMEOUT)
     if stdin_data is not None:
         stdin.write(stdin_data)
     stdin.channel.shutdown_write()
-    out = stdout.read().decode("utf-8", errors="replace")
-    err = stderr.read().decode("utf-8", errors="replace")
-    return out, err, stdout.channel.recv_exit_status()
+    raw_out, raw_err, truncated, exit_code = _read_channel(
+        stdout.channel, timeout or _SSH_TIMEOUT, max_runtime or _SSH_MAX_RUNTIME
+    )
+    out = raw_out.decode("utf-8", errors="replace")
+    if truncated:
+        out += _TRUNCATED_NOTE
+    return out, raw_err.decode("utf-8", errors="replace"), exit_code
 
 
 # ---------------------------------------------------------------------------
@@ -648,6 +993,10 @@ _API_VERIFY_SSL = os.environ.get("PLESK_API_VERIFY_SSL", "true").strip().lower()
     "false", "0", "no",
 )
 _API_TIMEOUT = int(os.environ.get("PLESK_API_TIMEOUT", "20"))
+# Pfad unterhalb von /api/v2/: nur [A-Za-z0-9_/-], kein "..", "?" oder "#" -
+# httpx wuerde ".."-Segmente normalisieren und so Requests ausserhalb von
+# /api/v2/ auf das Plesk-Panel erlauben.
+_API_PATH_RE = re.compile(r"^[A-Za-z0-9_/-]{1,512}$")
 
 
 def plesk_api_get_raw(path: str, params: dict[str, str] | None = None) -> str:
@@ -661,7 +1010,13 @@ def plesk_api_get_raw(path: str, params: dict[str, str] | None = None) -> str:
     if not _API_KEY:
         raise RuntimeError("PLESK_API_KEY ist nicht gesetzt (Umgebungsvariable fehlt).")
 
-    clean_path = path.strip().lstrip("/")
+    clean_path = path.strip().strip("/")
+    if not clean_path or not _API_PATH_RE.match(clean_path) or ".." in clean_path.split("/"):
+        raise ValueError(
+            f"Ungültiger API-Pfad {path!r}: erlaubt sind nur Buchstaben, Ziffern, '_', '-' und '/' "
+            "(z.B. 'domains' oder 'domains/1/status'), kein '..', '?' oder '#' - "
+            "Query-Parameter über den Parameter query angeben."
+        )
     url = f"https://{_API_HOST}:{_API_PORT}/api/v2/{clean_path}"
     resp = httpx.get(
         url,
@@ -711,20 +1066,6 @@ _DB_SYSTEM_SCHEMAS = {
     "information_schema", "mysql", "performance_schema", "sys",
     "psa", "phpmyadmin", "roundcube", "horde",
 }
-
-
-def _db_admin_password() -> str:
-    """Liest das Plesk-Admin-DB-Passwort aus /etc/psa/.psa.shadow (root-only,
-    lesbar da wir ohnehin als root per SSH verbunden sind)."""
-    out = ssh_run(f"cat {_DB_SHADOW_PATH} 2>&1")
-    pw = out.strip()
-    if not pw or "No such file" in pw or "Permission denied" in pw or "\n" in pw:
-        raise RuntimeError(
-            f"Konnte das Plesk-DB-Admin-Passwort nicht aus {_DB_SHADOW_PATH} lesen "
-            f"(Ausgabe: {pw!r}). Ist dies ein Plesk-Server mit lokaler MySQL/"
-            "MariaDB-Installation und root-SSH-Zugang?"
-        )
-    return pw
 
 
 def _quote_ident(name: str) -> str:
@@ -794,10 +1135,13 @@ def _mysql_exec(
     timeout: int | None = None,
     skip_column_names: bool = False,
 ) -> str:
-    """Führt sql via `mysql`-CLI als Plesk-Admin-User aus. Passwort wird über
-    die Umgebungsvariable MYSQL_PWD übergeben (nicht als -p-Flag), damit es
-    nicht in `ps aux` für andere lokale User auf dem Server sichtbar ist."""
-    pw = _db_admin_password()
+    """Führt sql via `mysql`-CLI als Plesk-Admin-User aus. Das Passwort wird
+    erst auf dem Server aus /etc/psa/.psa.shadow in die Umgebungsvariable
+    MYSQL_PWD des mysql-Prozesses gelesen ("$(cat ...)" im Prefix-Assignment):
+    Es steht damit weder in der Kommandozeile der Remote-Shell
+    (/proc/<pid>/cmdline, fuer alle lokalen User lesbar) noch im mysql-argv,
+    und es verlaesst den Server nie. /proc/<pid>/environ ist nur fuer root
+    lesbar."""
     db_part = f" {shlex.quote(database)}" if database else ""
     # --binary-mode: deaktiviert die mysql-CLI-eigenen Kommandos (\!, \., system,
     # source, tee ...) und behandelt Backslashes als literal. Ohne dieses Flag
@@ -807,10 +1151,16 @@ def _mysql_exec(
     if skip_column_names:
         flags += " -N"
     cmd = (
-        f"MYSQL_PWD={shlex.quote(pw)} mysql -u{_DB_ADMIN_USER} {flags}"
+        f'MYSQL_PWD="$(cat {shlex.quote(_DB_SHADOW_PATH)})" mysql -u{_DB_ADMIN_USER} {flags}'
         f"{db_part} -e {shlex.quote(sql)}"
     )
-    return ssh_run(cmd, timeout=timeout)
+    out = ssh_run(cmd, timeout=timeout)
+    if "Access denied" in out or _DB_SHADOW_PATH in out:
+        raise RuntimeError(
+            f"MySQL-Anmeldung als '{_DB_ADMIN_USER}' fehlgeschlagen - ist {_DB_SHADOW_PATH} "
+            "vorhanden und ist dies ein Plesk-Server mit lokaler MySQL/MariaDB-Installation?"
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1403,6 +1753,19 @@ def fpm_journal(domain: str, since: str = "-2h", until: str = "") -> str:
     return ssh_run(cmd)
 
 
+_LOG_LINES_MAX = 5000
+
+
+def _clamp_lines(lines: Any) -> int:
+    """lines fuer tail -n auf 1..5000 klemmen (negativ/0 = ganze Datei bei
+    tail, riesige Werte = unbegrenzte Ausgabe)."""
+    try:
+        n = int(lines)
+    except (TypeError, ValueError):
+        raise ValueError("lines muss eine Zahl sein.")
+    return max(1, min(_LOG_LINES_MAX, n))
+
+
 @mcp.tool()
 def search_log(
     domain: str,
@@ -1412,8 +1775,8 @@ def search_log(
     include_rotated: bool = False,
 ) -> str:
     """Durchsucht ein Vhost-Log der Domain nach einem optionalen Muster
-    (regex, an grep -E übergeben) und gibt die letzten `lines` Treffer zurück.
-    log_type: proxy_error_log | error_log | access_log
+    (regex, an grep -E übergeben) und gibt die letzten `lines` Treffer zurück
+    (1..5000). log_type: proxy_error_log | error_log | access_log
     Pfad: /var/www/vhosts/<domain>/logs/<log_type>
     include_rotated: zusätzlich die rotierten, gzip-komprimierten Logs
     (<log_type>-YYYYMMDD.gz im selben Verzeichnis) mit durchsuchen - nötig
@@ -1423,6 +1786,7 @@ def search_log(
     allowed_logs = {"proxy_error_log", "error_log", "access_log"}
     if log_type not in allowed_logs:
         raise ValueError(f"log_type muss einer von {allowed_logs} sein.")
+    lines = _clamp_lines(lines)
 
     log_dir = f"/var/www/vhosts/{d}/logs"
     path = f"{log_dir}/{log_type}"
@@ -1462,6 +1826,7 @@ def search_main_nginx_log(
     """
     if log not in {"access", "error"}:
         raise ValueError("log muss 'access' oder 'error' sein.")
+    lines = _clamp_lines(lines)
 
     if include_rotated:
         cmd = (
@@ -1544,11 +1909,18 @@ def write_vhost_file(
     content: str,
     confirm: bool = False,
     encoding: str = "text",
+    allow_executable: bool = False,
 ) -> str:
     """Schreibt/überschreibt eine Datei im Vhost-Verzeichnis der Domain
     (/var/www/vhosts/<domain>/<path>) - legt auch fehlende Zwischenordner an.
     encoding: "text" (content ist Klartext, UTF-8 - Standard) oder "base64"
     (content ist base64-kodiert, für Binärdateien wie Bilder/ZIPs).
+
+    Dieselben Regeln wie upload_begin/fetch_to_vhost: domain muss die
+    Hauptdomain einer Subscription sein, path relativ ohne "..", geschützte
+    Bereiche (conf, logs, .ssh, Dotfiles im Vhost-Root, Docroot selbst, ...)
+    werden abgelehnt, ausführbare Dateien (.php, .htaccess, .user.ini, ...)
+    nur mit allow_executable=true. Grössenlimit UPLOAD_MAX_BYTES.
 
     ACHTUNG - schreibt auf einem Produktivserver: erfordert confirm=true als
     bewusste Bestätigung PRO Aufruf (keine globale Freischaltung). Existiert
@@ -1577,12 +1949,6 @@ def write_vhost_file(
     if encoding not in {"text", "base64"}:
         raise ValueError("encoding muss 'text' oder 'base64' sein.")
 
-    full = _vhost_path(domain, path)
-    base = f"{_VHOST_BASE}/{_domain_arg(domain)}"
-    if full == base:
-        raise ValueError("path muss auf eine Datei zeigen.")
-    parts = full[len(base) + 1:].split("/")
-
     if encoding == "base64":
         try:
             data = base64.b64decode(content, validate=True)
@@ -1590,11 +1956,29 @@ def write_vhost_file(
             raise ValueError(f"content ist kein gültiges Base64: {e}")
     else:
         data = content.encode("utf-8")
+    if len(data) > _UPLOAD_MAX_BYTES:
+        raise ValueError(
+            f"content ist {len(data)} Bytes gross - Limit {_UPLOAD_MAX_BYTES} Bytes (UPLOAD_MAX_BYTES); "
+            "für grosse Dateien upload_begin oder fetch_to_vhost verwenden."
+        )
+
+    # Dieselbe Prüfkette wie upload_begin/fetch_to_vhost: Subscription, kein
+    # geschützter Bereich, ausführbare Dateien nur mit allow_executable.
+    ctx = _vhost_ctx(domain)
+    parts = _strict_parts(path)
+    _check_not_protected(parts, ctx, "Ziel")
+    _check_executable(parts, allow_executable)
+    base = ctx["base"]
+    full = f"{base}/{'/'.join(parts)}"
 
     # Gemeinsame Schreiblogik mit Upload/Fetch (Helper auf dem Plesk-Server,
     # siehe _HELPER_SRC): Temp-Datei, Backup, atomarer rename, Besitzer.
     try:
-        res = _helper_put(_helper_args(base, parts=parts, max_bytes=len(data)), [data])
+        res = _helper_put(
+            _helper_args(base, parts=parts, max_bytes=min(len(data), _UPLOAD_MAX_BYTES),
+                         reserve=_UPLOAD_MIN_FREE),
+            [data],
+        )
     except _HelperError as e:
         if e.code == "target_symlink":
             raise ValueError(f"'{full}' ist ein Symlink - wird aus Sicherheitsgründen nicht überschrieben.")
@@ -1621,17 +2005,19 @@ _REPLACE_MAX_FILES = 50
 _REPLACE_MAX_CONTEXT = 50
 
 
-def _replace_parts(domain: str, path: str) -> list[str]:
-    """Pfadprüfung wie write_vhost_file (_vhost_path), zusätzlich ohne "..",
-    absolute Pfade oder Wildcards (_strict_parts)."""
-    full = _vhost_path(domain, path)
-    if full == f"{_VHOST_BASE}/{_domain_arg(domain)}":
-        raise ValueError("path muss auf eine Datei zeigen.")
-    return _strict_parts(path)
+def _replace_parts(ctx: dict[str, Any], path: str, allow_executable: bool) -> list[str]:
+    """Pfadprüfung wie write_vhost_file/upload_begin: relativ ohne "..",
+    absolute Pfade oder Wildcards (_strict_parts), kein geschützter Bereich,
+    ausführbare Dateien nur mit allow_executable."""
+    parts = _strict_parts(path)
+    _check_not_protected(parts, ctx, "Ziel")
+    _check_executable(parts, allow_executable)
+    return parts
 
 
 def _replace_run(domain: str, old_str: str, new_str: str, replace_all: bool,
-                 paths: list[list[str]] | None = None, glob: str | None = None) -> dict[str, Any]:
+                 paths: list[list[str]] | None = None, glob: str | None = None,
+                 allow_executable: bool = False) -> dict[str, Any]:
     if not isinstance(old_str, str) or old_str == "":
         raise ValueError("old_str darf nicht leer sein.")
     if not isinstance(new_str, str):
@@ -1643,7 +2029,7 @@ def _replace_run(domain: str, old_str: str, new_str: str, replace_all: bool,
     args = _helper_args(base, paths=paths or [], glob=glob or "", replace_all=bool(replace_all),
                         max_bytes=_REPLACE_MAX_BYTES, max_files=_REPLACE_MAX_FILES,
                         max_ctx=_REPLACE_MAX_CONTEXT, max_payload=len(payload),
-                        reserve=_UPLOAD_MIN_FREE)
+                        reserve=_UPLOAD_MIN_FREE, allow_exec=bool(allow_executable))
     # old_str/new_str über stdin statt Kommandozeile: nicht in der Prozessliste
     # des Servers sichtbar und ohne argv-Längenlimit.
     session = _helper_session_factory("replace", args)
@@ -1698,6 +2084,7 @@ def replace_in_vhost_file(
     new_str: str,
     replace_all: bool = False,
     confirm: bool = False,
+    allow_executable: bool = False,
 ) -> str:
     """Ersetzt eine Textstelle in einer Datei im Vhost-Verzeichnis der Domain
     (/var/www/vhosts/<domain>/<path>, path relativ, z.B.
@@ -1716,11 +2103,14 @@ def replace_in_vhost_file(
     bewusste Bestätigung PRO Aufruf. Vor dem Schreiben wird automatisch ein
     Backup "<path>.bak-<YYYYMMDDHHMMSS>" angelegt (siehe delete_vhost_backup),
     danach wird atomar ersetzt (Temp-Datei + rename). Sicherheitsregeln wie
-    write_vhost_file: kein "..", keine absoluten Pfade, Abbruch bei Symlinks
-    (Datei oder Ordner im Pfad), keine root-eigenen Dateien ausserhalb von
-    httpdocs; Besitzer, Gruppe und Rechte bleiben erhalten (root-eigene
-    Dateien unter httpdocs werden wie bei write_vhost_file auf den
-    Subscription-User umgestellt).
+    write_vhost_file/upload_begin: domain muss die Hauptdomain einer
+    Subscription sein, kein "..", keine absoluten Pfade, geschützte Bereiche
+    (conf, logs, .ssh, Dotfiles im Vhost-Root, ...) abgelehnt, ausführbare
+    Dateien (.php, .htaccess, .user.ini, ...) nur mit allow_executable=true,
+    Abbruch bei Symlinks (Datei oder Ordner im Pfad), keine root-eigenen
+    Dateien ausserhalb von httpdocs; Besitzer, Gruppe und Rechte bleiben
+    erhalten (root-eigene Dateien unter httpdocs werden wie bei
+    write_vhost_file auf den Subscription-User umgestellt).
 
     Rückgabe: Anzahl Ersetzungen, Backup-Pfad, neue Dateigrösse und je Treffer
     eine Kontextzeile vorher/nachher (max. 120 Zeichen, max. 50 Treffer).
@@ -1730,15 +2120,16 @@ def replace_in_vhost_file(
             "confirm=true erforderlich - dieses Tool schreibt auf einem "
             "Produktivserver und braucht eine explizite Bestätigung pro Aufruf."
         )
-    parts = _replace_parts(domain, path)
-    res = _replace_run(domain, old_str, new_str, replace_all, paths=[parts])
+    ctx = _vhost_ctx(domain)
+    parts = _replace_parts(ctx, path, allow_executable)
+    res = _replace_run(ctx["domain"], old_str, new_str, replace_all, paths=[parts],
+                       allow_executable=allow_executable)
     if not res["files"]:
         raise ValueError(
             f"old_str kommt in '{'/'.join(parts)}' nicht vor - nichts geändert. Exakten Text "
             "inkl. Leerzeichen/Einrückung prüfen (z.B. mit read_vhost_file)."
         )
-    base = f"{_VHOST_BASE}/{_domain_arg(domain)}"
-    return _json(_replace_file_view(base, res["files"][0]))
+    return _json(_replace_file_view(ctx["base"], res["files"][0]))
 
 
 @mcp.tool()
@@ -1750,6 +2141,7 @@ def replace_in_vhost_files(
     glob: str = "",
     replace_all: bool = False,
     confirm: bool = False,
+    allow_executable: bool = False,
 ) -> str:
     """Wie replace_in_vhost_file, aber für mehrere Dateien in einem Aufruf.
     Entweder paths (Liste relativer Pfade, max. 50) ODER glob angeben. glob
@@ -1759,7 +2151,9 @@ def replace_in_vhost_files(
     Beim glob werden Symlinks nicht verfolgt (nur aufgelistet), Backups
     (.bak-*) und der Papierkorb ignoriert.
 
-    Pro Datei dieselben Prüfungen und Backups wie replace_in_vhost_file.
+    Pro Datei dieselben Prüfungen und Backups wie replace_in_vhost_file;
+    ausführbare Dateien (.php, .htaccess, ...) - auch als glob-Treffer - nur
+    mit allow_executable=true.
     Dateien ohne Treffer werden übersprungen und im Ergebnis aufgelistet.
     Alles-oder-nichts: Zuerst werden alle Dateien gelesen und geprüft (UTF-8,
     Grösse, Symlinks, Mehrfachtreffer ohne replace_all, ...), dann alle
@@ -1775,11 +2169,12 @@ def replace_in_vhost_files(
     g = (glob or "").strip()
     if bool(paths) == bool(g):
         raise ValueError("Entweder paths oder glob angeben (genau eines davon).")
+    ctx = _vhost_ctx(domain)
     plist = None
     if paths:
         if len(paths) > _REPLACE_MAX_FILES:
             raise ValueError(f"Maximal {_REPLACE_MAX_FILES} Dateien pro Aufruf.")
-        plist = [_replace_parts(domain, p) for p in paths]
+        plist = [_replace_parts(ctx, p, allow_executable) for p in paths]
         if len({"/".join(p) for p in plist}) != len(plist):
             raise ValueError("paths enthält doppelte Einträge.")
     else:
@@ -1790,8 +2185,9 @@ def replace_in_vhost_files(
                 f"Ungültiges glob {glob!r}: relativ, muss mit 'httpdocs/' beginnen, ohne '..', '.' "
                 "und leere Teile."
             )
-    res = _replace_run(domain, old_str, new_str, replace_all, paths=plist, glob=g or None)
-    base = f"{_VHOST_BASE}/{_domain_arg(domain)}"
+    res = _replace_run(ctx["domain"], old_str, new_str, replace_all, paths=plist, glob=g or None,
+                       allow_executable=allow_executable)
+    base = ctx["base"]
     out: dict[str, Any] = {
         "geaendert": [_replace_file_view(base, f) for f in res["files"]],
         "ersetzungen_gesamt": sum(f["replacements"] for f in res["files"]),
@@ -2882,6 +3278,8 @@ def op_replace(a):
             raise HErr("glob_empty")
         if len(set(join(p) for p in targets)) != len(targets):
             raise HErr("duplicate_path")
+        if not a.get("allow_exec") and any(is_exec(p[-1], a) for p in targets):
+            raise HErr("executable")
         items = [prepare_replace(base_fd, p, old, new, bool(a["replace_all"]), a["max_bytes"], a["max_ctx"])
                  for p in targets]
         todo = [it for it in items if it["count"]]
@@ -3421,9 +3819,6 @@ async def _upload_asgi(scope, receive, send) -> None:
         await JSONResponse(body, status_code=status)(scope, receive, send)
 
     now = time.time()
-    if _rate_limited(_client_ip(scope), now):
-        await reply(429, {"error": "too_many_requests"})
-        return
     if scope["method"] != "PUT":
         await reply(405, {"error": "method_not_allowed"})
         return
@@ -3448,6 +3843,12 @@ async def _upload_asgi(scope, receive, send) -> None:
                 rec["status"] = "uploading"
                 _upload_active += 1
     if not ok:
+        # Nur Fehlversuche zaehlen fuers Rate-Limit: Ein gueltiger Upload wird
+        # damit nie durch fremde Fehlversuche aus demselben (Proxy-)Bucket
+        # blockiert; Token-Raten bleibt trotzdem gedrosselt.
+        if _rate_limited(_client_ip(scope), now):
+            await reply(429, {"error": "too_many_requests"})
+            return
         await reply(401, {"error": "unauthorized"})
         return
     if busy:
@@ -9518,9 +9919,20 @@ def run_diagnostic(command: str) -> str:
     die von den anderen Tools nicht abgedeckt sind. Nur eine Whitelist an
     Programmen ist erlaubt (plesk, lveinfo, lveps, systemctl, journalctl,
     grep, tail, head, cat, find, ls, du, df, dmesg, uptime, top, free, ps,
-    hostname, wc, zcat, zgrep), destruktive Subcommands
-    (restart/stop/kill/rm/delete/...) sind blockiert. Beispiel:
-    "journalctl -k --since '2026-09-17 21:00'"
+    hostname, wc, zcat, zgrep), je Utility gilt eine Positiv-Liste:
+    - plesk: nur "plesk version", "plesk bin <utility> -i|--info|-l|--list|
+      --show-*" und "plesk ext <name> --list|--info" (kein --wp-cli, dafür
+      die wp_*-Tools; schreibende Aktionen über dns_*/php_settings_*/...)
+    - systemctl: status, is-active, list-units, show, cat
+    - journalctl ohne --vacuum-*/--rotate/--flush/--sync/-f; dmesg ohne
+      -C/-c/-n; tail ohne -f/-F; hostname ohne Argumente
+    - find, du und grep -r nur mit absolutem Pfad unterhalb von
+      /var/www/vhosts, /var/log, /etc/nginx, /etc/httpd, /usr/local/psa;
+      keine find-Aktionen (-exec/-delete/-fprint...), kein -L
+    - keine Geräte wie /dev/zero, /dev/urandom, /proc/kcore
+    Shell-Konstrukte (;, &&, >, $( ...) sind gesperrt, Pipes erlaubt. Läuft
+    unter "timeout" (DIAG_TIMEOUT, Standard 60 s), Ausgabe auf 4 MB begrenzt.
+    Beispiel: "journalctl -k --since '2026-09-17 21:00'"
     """
     return ssh_run_whitelisted(command)
 
@@ -10037,15 +10449,16 @@ def _build_http_app():
 
         def __init__(self, app, token: str):
             self.app = app
-            self.token = token
+            self.expected = f"Bearer {token}".encode("latin-1", errors="replace")
 
         async def __call__(self, scope, receive, send):
             if scope["type"] != "http":
                 await self.app(scope, receive, send)
                 return
             headers = dict(scope.get("headers", []))
-            auth_header = headers.get(b"authorization", b"").decode("latin-1")
-            if auth_header != f"Bearer {self.token}":
+            auth_header = headers.get(b"authorization", b"")
+            # Zeitkonstanter Vergleich (kein Abbruch beim ersten abweichenden Byte)
+            if not hmac.compare_digest(auth_header, self.expected):
                 response = JSONResponse({"error": "unauthorized"}, status_code=401)
                 await response(scope, receive, send)
                 return
@@ -10093,11 +10506,38 @@ async def _run_http_server() -> None:
     await srv.serve()
 
 
-def main() -> None:
+def _check_startup_config() -> list[str]:
+    """Fail-safe-Pruefungen vor dem Start (RuntimeError = kein Start) und
+    Warnungen (Rueckgabe) fuer Konfigurationen, die funktionieren, aber
+    Schutz abschwaechen."""
     if not _MCP_API_KEY:
         raise RuntimeError(
             "MCP_API_KEY (statisches Bearer-Token) fehlt - aus Sicherheitsgruenden kein Start ohne Token."
         )
+    if len(_MCP_API_KEY) < _MCP_API_KEY_MIN_LEN:
+        raise RuntimeError(
+            f"MCP_API_KEY ist zu kurz ({len(_MCP_API_KEY)} Zeichen, mindestens {_MCP_API_KEY_MIN_LEN}) - "
+            "ein zufaelliges Token erzeugen, z.B. mit: python -c "
+            "\"import secrets; print(secrets.token_urlsafe(32))\""
+        )
+    if not _SSH_HOST_KEY and not _SSH_KNOWN_HOSTS:
+        raise RuntimeError(
+            "PLESK_SSH_HOST_KEY oder PLESK_SSH_KNOWN_HOSTS fehlt - ohne gepinnten SSH-Host-Key "
+            "(MITM-Schutz) kein Start. Host-Key ermitteln mit: ssh-keyscan -t ed25519 <plesk-host>"
+        )
+    warnings: list[str] = []
+    if _PUBLIC_BASE_URL and not _UPLOAD_TRUSTED_PROXIES:
+        warnings.append(
+            "WARNUNG: PUBLIC_BASE_URL ist gesetzt, aber UPLOAD_TRUSTED_PROXIES ist leer - das "
+            "Upload-Rate-Limit sieht nur die IP des Reverse-Proxys (ein gemeinsamer Bucket fuer "
+            "alle Clients). IP(s) des Proxys, wie der Container sie sieht, eintragen."
+        )
+    return warnings
+
+
+def main() -> None:
+    for warning in _check_startup_config():
+        print(warning, file=sys.stderr, flush=True)
     import asyncio
 
     asyncio.run(_run_http_server())
