@@ -88,7 +88,7 @@ _MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 # Commit mit einer neuen Basis ergibt also <Basis>.0.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.30"
+_VERSION_BASE = "0.31"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -6534,6 +6534,207 @@ def wc_order_mark_shipped(
     result["ausgefuehrt"] = res.get("done")
     result["ergebnis"] = "Ausgeführt und kontrolliert." if ok_tr and ok_st else "Ausgeführt, aber Kontrolle weicht ab - bitte Bestellung prüfen."
     result["order"] = after
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# WooCommerce-Lager: Bestand lesen, setzen, erhöhen, verringern
+# ---------------------------------------------------------------------------
+
+_WC_SKU_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]{0,63}$")
+_WC_STOCK_MAX = 1_000_000
+_WC_STOCK_MAX_CHANGE = 10_000
+
+# Fester PHP-Code; Werte nur per JSON auf stdin. Produkt per ID oder Artikelnummer.
+# Bei Varianten mit Lager auf dem Hauptprodukt wird dort gebucht (wie WooCommerce selbst).
+_WC_STOCK_VIEW_PHP = r'''
+function plmcp_stock_view($p) {
+    $managed_by = $p->get_stock_managed_by_id();
+    $m = ($managed_by && $managed_by !== $p->get_id()) ? wc_get_product($managed_by) : $p;
+    $out = array(
+        "id" => $p->get_id(), "name" => $p->get_name(), "sku" => $p->get_sku(), "type" => $p->get_type(),
+        "parent_id" => $p->get_parent_id(), "status" => $p->get_status(),
+        "manage_stock" => $p->get_manage_stock(), "stock_managed_by" => $m ? $m->get_id() : null,
+        "stock_quantity" => $m ? $m->get_stock_quantity() : null,
+        "stock_status" => $p->get_stock_status(), "backorders" => $p->get_backorders(),
+    );
+    if ($p->is_type("variable")) {
+        $vars = array();
+        foreach ($p->get_children() as $cid) {
+            $c = wc_get_product($cid); if (!$c) { continue; }
+            $vars[] = array("id" => $c->get_id(), "name" => $c->get_name(), "sku" => $c->get_sku(),
+                "manage_stock" => $c->get_manage_stock(), "stock_managed_by" => $c->get_stock_managed_by_id(),
+                "stock_quantity" => $c->get_stock_quantity(), "stock_status" => $c->get_stock_status());
+        }
+        $out["variations"] = $vars;
+    }
+    return $out;
+}
+$in = json_decode(stream_get_contents(STDIN), true);
+$id = 0;
+if ($in["by"] === "id") { $id = (int) $in["key"]; }
+else { $id = (int) wc_get_product_id_by_sku((string) $in["key"]); }
+$p = $id > 0 ? wc_get_product($id) : null;
+if (!$p) { fwrite(STDERR, "Produkt nicht gefunden"); exit(1); }
+'''
+
+_WC_STOCK_GET_PHP = _WC_STOCK_VIEW_PHP + r'''
+echo json_encode(array("product" => plmcp_stock_view($p)));
+'''
+
+_WC_STOCK_UPDATE_PHP = _WC_STOCK_VIEW_PHP + r'''
+if ($p->is_type("variable") && !$p->managing_stock()) { fwrite(STDERR, "Variables Produkt ohne eigenes Lager - bitte die Variante angeben, nichts geändert"); exit(1); }
+if (!$p->managing_stock()) { fwrite(STDERR, "Lagerverwaltung für dieses Produkt nicht aktiv - nichts geändert"); exit(1); }
+$m = wc_get_product($p->get_stock_managed_by_id());
+$before = $m ? $m->get_stock_quantity() : null;
+if ($in["expected"] !== null && (int) $before !== (int) $in["expected"]) { fwrite(STDERR, "Bestand ist " . var_export($before, true) . ", erwartet " . (int) $in["expected"] . " - nichts geändert"); exit(1); }
+$new = wc_update_product_stock($p, abs((int) $in["value"]), $in["op"]);
+if ($new === false || $new === null) { fwrite(STDERR, "WooCommerce hat den Bestand nicht angepasst"); exit(1); }
+$p = wc_get_product($p->get_id());
+echo json_encode(array("before" => $before, "after" => $new, "product" => plmcp_stock_view($p)));
+'''
+
+
+def _wc_check_product_ref(product: Any) -> tuple[str, str]:
+    """Produkt-ID (bis 9 Ziffern) oder Artikelnummer (SKU, z.B. EAN-13)."""
+    if isinstance(product, bool):
+        raise ValueError("product muss eine Produkt-ID oder Artikelnummer sein.")
+    s = str(product or "").strip()
+    if s.isdigit() and int(s) == 0:
+        raise ValueError("Produkt-ID 0 gibt es nicht.")
+    if s.isdigit() and len(s) <= 9:
+        return "id", s
+    if _WC_SKU_RE.match(s):
+        return "sku", s
+    raise ValueError(f"Ungültige Produkt-ID oder Artikelnummer {product!r}.")
+
+
+def _wc_check_stock_op(quantity: Any, change: Any) -> tuple[str, int]:
+    """Genau eins von quantity (absolut) oder change (+/-). Rückgabe (op, wert)."""
+    has_q = quantity is not None and quantity != ""
+    has_c = change is not None and change != "" and change != 0
+    if has_q == has_c:
+        raise ValueError("Genau eines angeben: quantity (neuer Bestand) oder change (z.B. 5 oder -3).")
+    if has_q:
+        if isinstance(quantity, bool) or not isinstance(quantity, int):
+            raise ValueError("quantity muss eine ganze Zahl sein.")
+        if not -_WC_STOCK_MAX < quantity < _WC_STOCK_MAX:
+            raise ValueError(f"quantity ausserhalb von ±{_WC_STOCK_MAX}.")
+        return "set", quantity
+    if isinstance(change, bool) or not isinstance(change, int):
+        raise ValueError("change muss eine ganze Zahl sein (positiv = erhöhen, negativ = verringern).")
+    if abs(change) > _WC_STOCK_MAX_CHANGE:
+        raise ValueError(f"change höchstens ±{_WC_STOCK_MAX_CHANGE} pro Aufruf.")
+    return ("increase" if change > 0 else "decrease"), abs(change)
+
+
+def _wc_check_note(note: str) -> str:
+    s = str(note or "").strip()
+    if len(s) > 200 or any(ord(ch) < 32 for ch in s):
+        raise ValueError("note höchstens 200 Zeichen, ohne Steuerzeichen.")
+    return s
+
+
+@mcp.tool()
+@_wp_reporting
+def wc_stock_get(domain: str, wp_path: str, product: str) -> str:
+    """Zeigt den Lagerbestand eines WooCommerce-Produkts oder einer Variante.
+
+    product: Produkt-ID (Ziffern, bis 9 Stellen) oder Artikelnummer/SKU
+    (z.B. EAN-13). Bei Varianten, deren Lager auf dem Hauptprodukt geführt
+    wird, steht dessen ID unter stock_managed_by. Bei variablen Produkten
+    werden alle Varianten mit Bestand aufgelistet. Rein lesend.
+    """
+    by, key = _wc_check_product_ref(product)
+    client, ctx, wp_dir, uid, d = _wc_open(domain, wp_path)
+    try:
+        data = _wp_eval(client, ctx, wp_dir, _WC_STOCK_GET_PHP,
+                        stdin_data=json.dumps({"by": by, "key": key}).encode("utf-8"))
+    finally:
+        client.close()
+    if not isinstance(data, dict) or "product" not in data:
+        raise SSHError("Unerwartete Antwort beim Lesen des Produkts.")
+    return json.dumps({"domain": d, "wp_path": wp_dir, **data}, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+@_wp_reporting
+def wc_stock_update(
+    domain: str,
+    wp_path: str,
+    product: str,
+    quantity: int | None = None,
+    change: int | None = None,
+    expected: int | None = None,
+    note: str = "",
+    confirm: bool = False,
+) -> str:
+    """Ändert den Lagerbestand eines WooCommerce-Produkts oder einer Variante.
+
+    product: Produkt-ID oder Artikelnummer/SKU (z.B. EAN-13).
+    Genau eines von:
+    - quantity: neuer Bestand (setzen, z.B. 25)
+    - change: Differenz (positiv = erhöhen, negativ = verringern, max. ±10000)
+    expected: optional der erwartete aktuelle Bestand; weicht er ab (z.B.
+    weil inzwischen eine Bestellung abgebucht hat), wird nichts geändert.
+    note: optionaler Grund fürs Audit-Log (z.B. "Inventur", "Lieferung").
+
+    Gebucht wird über die WooCommerce-API (wc_update_product_stock, atomar),
+    bei Varianten mit Lager auf dem Hauptprodukt dort. Produkte ohne aktive
+    Lagerverwaltung werden nicht geändert. Ohne confirm=true nur Vorschau
+    (aktueller und neuer Bestand). Mit confirm=true Ausführung als
+    Subscription-User, Eintrag im Audit-Log und Kontrolle.
+    """
+    by, key = _wc_check_product_ref(product)
+    op, value = _wc_check_stock_op(quantity, change)
+    if expected is not None and (isinstance(expected, bool) or not isinstance(expected, int)):
+        raise ValueError("expected muss eine ganze Zahl sein.")
+    why = _wc_check_note(note)
+    client, ctx, wp_dir, uid, d = _wc_open(domain, wp_path)
+    try:
+        cur = _wp_eval(client, ctx, wp_dir, _WC_STOCK_GET_PHP,
+                       stdin_data=json.dumps({"by": by, "key": key}).encode("utf-8"))
+        if not isinstance(cur, dict) or "product" not in cur:
+            raise SSHError("Unerwartete Antwort beim Lesen des Produkts.")
+        prod = cur["product"]
+        if prod.get("type") == "variable" and prod.get("stock_managed_by") in (None, 0):
+            raise ValueError("Variables Produkt ohne eigenes Lager - bitte die Variante angeben. Nichts geändert.")
+        if not prod.get("manage_stock"):
+            raise ValueError("Lagerverwaltung für dieses Produkt ist nicht aktiv - nichts geändert.")
+        before = prod.get("stock_quantity")
+        base = int(before or 0)
+        planned = value if op == "set" else base + value if op == "increase" else base - value
+        result: dict[str, Any] = {
+            "domain": d, "wp_path": wp_dir, "produkt": prod.get("name"), "produkt_id": prod.get("id"),
+            "artikelnummer": prod.get("sku"), "lager_bei": prod.get("stock_managed_by"),
+            "bestand_aktuell": before, "bestand_neu": planned,
+            "aktion": {"set": f"setzen auf {value}", "increase": f"+{value}", "decrease": f"-{value}"}[op],
+        }
+        if expected is not None and before != expected:
+            raise ValueError(f"Bestand ist {before}, erwartet {expected} - nichts geändert.")
+        if op == "set" and before == value:
+            result["ergebnis"] = "Nichts zu tun - Bestand ist bereits so."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        if not confirm:
+            result["ergebnis"] = "Vorschau - nichts geändert. Mit confirm=true ausführen."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        try:
+            res = _wp_eval(client, ctx, wp_dir, _WC_STOCK_UPDATE_PHP, stdin_data=json.dumps({
+                "by": "id", "key": str(prod.get("id")), "op": op, "value": value,
+                "expected": before if expected is None else expected,
+            }).encode("utf-8"))
+        except Exception as e:
+            _audit("wc_stock_update", domain=d, product_id=prod.get("id"), sku=prod.get("sku"), op=op,
+                   value=value, before=before, note=why, result="failed", error=str(e)[:200])
+            raise
+    finally:
+        client.close()
+    after = res.get("after") if isinstance(res, dict) else None
+    ok = after is not None and int(after) == planned
+    _audit("wc_stock_update", domain=d, product_id=prod.get("id"), sku=prod.get("sku"), op=op, value=value,
+           before=before, after=after, note=why, result="ok" if ok else "mismatch")
+    result["bestand_neu"] = after
+    result["ergebnis"] = "Ausgeführt und kontrolliert." if ok else f"Ausgeführt, Bestand jetzt {after} statt {planned} - bitte prüfen."
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
