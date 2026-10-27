@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.32
+
+- Neues Tool `wc_order_create`: legt eine WooCommerce-Bestellung über die WooCommerce-API an (`wc_create_order`, `add_product`, `set_address`, Versandposition, `calculate_totals`, `update_status`, Lagerabbau), damit alle Hooks wie bei einer Shop-Bestellung laufen (z.B. Druck- und ERP-Plugins bei "processing").
+  - Parameter: Rechnungs- und Lieferadresse (Lieferadresse leer = Rechnungsadresse), Positionen mit Produkt- oder Variations-ID, Menge und optionalem Stückpreis (z.B. 0 für Muster), Versandart als `<methode>:<instanz>` mit optionalen Versandkosten, Status (Standard `processing`), `suppress_customer_emails`, Kundenhinweis und interne Notiz.
+  - Ohne `confirm=true` nur Vorschau: Positionen mit Shop- und Bestellpreis, Lager, Adressen, Versandart, Status, Mailverhalten, verfügbare Versandarten und Bestellungen derselben E-Mail der letzten 24 Stunden.
+  - `suppress_customer_emails=true` schaltet beim Anlegen alle WooCommerce-Kundenmails ab, Admin-Mails bleiben. Gilt nur für diesen Aufruf.
+  - Fester PHP-Code per `wp eval`, alle Werte geprüft als JSON per stdin, Eintrag im Audit-Log.
+- Tests: `tests/test_wc_order_create.py` (Validierung, Vorschau, `php -l` und Ablauf der PHP-Templates gegen WooCommerce-Stubs).
+
 ## 0.31.x
 
 - `wc_order_get` / `wc_order_mark_shipped`: unterstützen neben WooCommerce Shipment Tracking (`wc_st_add_tracking_number`) auch Advanced Shipment Tracking ab 4.x (`ast_add_tracking_number`, Anbieter-Slug, Status setzt weiterhin das Tool). `tracking_function` liefert jetzt den Namen der gefundenen Funktion statt true/false.
