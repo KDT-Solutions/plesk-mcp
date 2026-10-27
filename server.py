@@ -88,7 +88,7 @@ _MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 # Commit mit einer neuen Basis ergibt also <Basis>.0.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.31"
+_VERSION_BASE = "0.32"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -6545,6 +6545,352 @@ def wc_order_mark_shipped(
     result["ausgefuehrt"] = res.get("done")
     result["ergebnis"] = "Ausgeführt und kontrolliert." if ok_tr and ok_st else "Ausgeführt, aber Kontrolle weicht ab - bitte Bestellung prüfen."
     result["order"] = after
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# WooCommerce-Bestellung anlegen (z.B. Muster- oder Ersatzlieferung)
+# ---------------------------------------------------------------------------
+#
+# Läuft wie wc_order_get per `wp eval` mit festem PHP-Code als
+# Subscription-User; alle Werte kommen geprüft als JSON per stdin. Angelegt
+# wird über die WooCommerce-API (wc_create_order, add_product, set_address,
+# Versandposition, calculate_totals, update_status), damit alle Hooks laufen
+# wie bei einer Shop-Bestellung (Lagerabbau, Admin-Mail, Druck-/ERP-Plugins).
+
+_WC_ORDER_STATUSES = ("pending", "processing", "on-hold", "completed")
+_WC_ADDR_KEYS = ("company", "first_name", "last_name", "address_1", "address_2",
+                 "postcode", "city", "country", "email", "phone")
+_WC_ADDR_REQUIRED = ("first_name", "last_name", "address_1", "postcode", "city", "country")
+_WC_ADDR_TEXT_RE = re.compile(r"^[^\x00-\x1f\x7f<>]{1,100}$")
+_WC_POSTCODE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 \-]{1,11}$")
+_WC_COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
+_WC_ORDER_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9\-]{0,62}\.)+[A-Za-z]{2,24}$")
+_WC_PHONE_RE = re.compile(r"^[0-9 +()./\-]{3,30}$")
+_WC_PRICE_RE = re.compile(r"^\d{1,7}(\.\d{1,2})?$")
+_WC_SHIPPING_ID_RE = re.compile(r"^[a-z0-9_\-]{1,64}:\d{1,9}$")
+_WC_ORDER_MAX_ITEMS = 50
+_WC_ORDER_MAX_QTY = 1000
+_WC_ORDER_NOTE_MAX = 1000
+
+_WC_ORDER_CREATE_BASE_PHP = r'''
+$in = json_decode(stream_get_contents(STDIN), true);
+function plmcp_shipping_methods() {
+    $out = array();
+    $zones = WC_Shipping_Zones::get_zones();
+    $zones[] = array("id" => 0, "zone_name" => "Übrige Regionen", "shipping_methods" => (new WC_Shipping_Zone(0))->get_shipping_methods());
+    foreach ($zones as $z) {
+        foreach ($z["shipping_methods"] as $m) {
+            $out[] = array("id" => $m->id . ":" . $m->instance_id, "method_id" => $m->id,
+                "instance_id" => (int) $m->instance_id, "title" => $m->get_title(),
+                "enabled" => $m->is_enabled(), "zone" => $z["zone_name"],
+                "cost" => isset($m->instance_settings["cost"]) ? (string) $m->instance_settings["cost"] : null);
+        }
+    }
+    return $out;
+}
+function plmcp_items($items) {
+    $out = array(); $errors = array();
+    foreach ($items as $it) {
+        $p = wc_get_product((int) $it["product_id"]);
+        if (!$p) { $errors[] = "Produkt " . (int) $it["product_id"] . " nicht gefunden"; continue; }
+        if ($p->is_type("variable")) { $errors[] = "Produkt " . $p->get_id() . " ist variabel - bitte die Variations-ID angeben"; continue; }
+        if (!in_array($p->get_status(), array("publish", "private"), true)) { $errors[] = "Produkt " . $p->get_id() . " hat Status " . $p->get_status(); continue; }
+        $qty = (int) $it["quantity"];
+        $unit = $it["price"] === null ? (string) $p->get_price() : (string) $it["price"];
+        $out[] = array("product" => $p, "view" => array(
+            "product_id" => $p->get_id(), "parent_id" => $p->get_parent_id(), "name" => $p->get_name(),
+            "sku" => $p->get_sku(), "type" => $p->get_type(), "quantity" => $qty,
+            "shop_price" => (string) $p->get_price(), "unit_price" => $unit,
+            "price_override" => $it["price"] !== null,
+            "manage_stock" => $p->managing_stock(), "stock_quantity" => $p->get_stock_quantity(),
+            "in_stock" => $p->is_in_stock()));
+    }
+    return array($out, $errors);
+}
+function plmcp_customer_emails() {
+    $ids = array();
+    foreach (WC()->mailer()->get_emails() as $e) { if ($e->is_customer_email()) { $ids[] = $e->id; } }
+    return $ids;
+}
+$methods = plmcp_shipping_methods();
+$method = null;
+foreach ($methods as $m) { if ($m["id"] === $in["shipping_method"]) { $method = $m; } }
+list($lines, $errors) = plmcp_items($in["items"]);
+if ($in["shipping_method"] !== "" && !$method) { $errors[] = "Versandart " . $in["shipping_method"] . " nicht gefunden"; }
+$ship_cost = $in["shipping_cost"];
+if ($method && $ship_cost === null) {
+    if ($method["cost"] === null || $method["cost"] === "") { $ship_cost = "0"; }
+    elseif (preg_match('/^\d+(\.\d+)?$/', $method["cost"])) { $ship_cost = $method["cost"]; }
+    else { $errors[] = "Versandkosten der Versandart sind eine Formel (" . $method["cost"] . ") - bitte shipping_cost angeben"; }
+}
+$recent = array();
+foreach (wc_get_orders(array("billing_email" => $in["billing"]["email"], "date_created" => ">" . (time() - 86400), "limit" => 10, "type" => "shop_order")) as $r) {
+    $recent[] = array("id" => $r->get_id(), "number" => $r->get_order_number(), "status" => $r->get_status(),
+        "total" => $r->get_total(), "created_via" => $r->get_created_via(),
+        "date_created" => $r->get_date_created() ? $r->get_date_created()->date("c") : null);
+}
+$preview = array(
+    "items" => array_map(function ($l) { return $l["view"]; }, $lines),
+    "shipping_method" => $method, "shipping_cost" => $ship_cost,
+    "prices_include_tax" => wc_prices_include_tax(), "currency" => get_woocommerce_currency(),
+    "customer_emails" => plmcp_customer_emails(),
+    "orders_same_email_24h" => $recent, "errors" => $errors,
+);
+'''
+
+_WC_ORDER_PREVIEW_PHP = _WC_ORDER_CREATE_BASE_PHP + r'''
+$preview["available_shipping_methods"] = $methods;
+echo json_encode($preview);
+'''
+
+_WC_ORDER_CREATE_PHP = _WC_ORDER_CREATE_BASE_PHP + r'''
+if ($errors) { fwrite(STDERR, implode("; ", $errors) . " - nichts angelegt"); exit(1); }
+if (!$method) { fwrite(STDERR, "Keine Versandart angegeben - nichts angelegt"); exit(1); }
+$suppressed = array();
+if ($in["suppress_customer_emails"]) {
+    // Nur in diesem Prozess: alle Kundenmails von WooCommerce aus, Admin-Mails bleiben.
+    foreach (WC()->mailer()->get_emails() as $e) {
+        if ($e->is_customer_email()) {
+            add_filter("woocommerce_email_enabled_" . $e->id, "__return_false", 9999);
+            add_filter("woocommerce_email_recipient_" . $e->id, "__return_empty_string", 9999);
+            $suppressed[] = $e->id;
+        }
+    }
+}
+$order = wc_create_order(array("status" => "pending", "customer_id" => 0, "created_via" => "plesk-mcp"));
+if (is_wp_error($order)) { fwrite(STDERR, $order->get_error_message()); exit(1); }
+foreach ($lines as $l) {
+    $p = $l["product"]; $qty = $l["view"]["quantity"]; $args = array();
+    if ($l["view"]["price_override"]) {
+        $line = wc_get_price_excluding_tax($p, array("qty" => $qty, "price" => (float) $l["view"]["unit_price"]));
+        $args = array("subtotal" => $line, "total" => $line);
+    }
+    $order->add_product($p, $qty, $args);
+}
+$order->set_address($in["billing"], "billing");
+$order->set_address($in["shipping"], "shipping");
+$si = new WC_Order_Item_Shipping();
+$si->set_method_title($method["title"]);
+$si->set_method_id($method["method_id"]);
+$si->set_instance_id($method["instance_id"]);
+$si->set_total((float) $ship_cost);
+$order->add_item($si);
+if ($in["customer_note"] !== "") { $order->set_customer_note($in["customer_note"]); }
+$order->calculate_totals(true);
+$order->save();
+if ($in["order_note"] !== "") { $order->add_order_note($in["order_note"], 0, false); }
+$order->add_order_note("Bestellung angelegt über plesk-mcp" . ($suppressed ? " (Kundenmails unterdrückt)" : "") . ".", 0, false);
+if ($in["status"] !== "pending") { $order->update_status($in["status"]); }
+if (in_array($in["status"], array("processing", "completed", "on-hold"), true)) { wc_maybe_reduce_stock_levels($order->get_id()); }
+$o = wc_get_order($order->get_id());
+$items = array();
+foreach ($o->get_items() as $it) { $items[] = array("name" => $it->get_name(), "qty" => $it->get_quantity(), "total" => $it->get_total(), "product_id" => $it->get_product_id(), "variation_id" => $it->get_variation_id()); }
+echo json_encode(array(
+    "id" => $o->get_id(), "number" => $o->get_order_number(), "status" => $o->get_status(),
+    "total" => $o->get_total(), "currency" => $o->get_currency(), "items" => $items,
+    "shipping" => array("method" => $method["id"], "title" => $method["title"], "total" => $o->get_shipping_total()),
+    "stock_reduced" => (bool) $o->get_data_store()->get_stock_reduced($o->get_id()),
+    "customer_emails_suppressed" => $suppressed,
+));
+'''
+
+
+def _wc_check_address(addr: Any, kind: str, require_email: bool) -> dict[str, str]:
+    if not isinstance(addr, dict):
+        raise ValueError(f"{kind}: Adresse als Objekt angeben (company, first_name, last_name, address_1, postcode, city, country, email, phone).")
+    unknown = sorted(set(addr) - set(_WC_ADDR_KEYS))
+    if unknown:
+        raise ValueError(f"{kind}: unbekannte Felder {', '.join(unknown)} - erlaubt: {', '.join(_WC_ADDR_KEYS)}.")
+    out: dict[str, str] = {}
+    for key in _WC_ADDR_KEYS:
+        v = addr.get(key)
+        if v is None or str(v).strip() == "":
+            continue
+        if isinstance(v, (bool, dict, list)):
+            raise ValueError(f"{kind}.{key}: ungültiger Wert.")
+        s = re.sub(r"\s+", " ", str(v).strip())
+        if key == "postcode":
+            ok = bool(_WC_POSTCODE_RE.match(s))
+        elif key == "country":
+            s = s.upper()
+            ok = bool(_WC_COUNTRY_RE.match(s))
+        elif key == "email":
+            s = s.lower()
+            ok = bool(_WC_ORDER_EMAIL_RE.match(s))
+        elif key == "phone":
+            ok = bool(_WC_PHONE_RE.match(s))
+        else:
+            ok = bool(_WC_ADDR_TEXT_RE.match(s))
+        if not ok:
+            raise ValueError(f"{kind}.{key}: ungültiger Wert {v!r}.")
+        out[key] = s
+    missing = [k for k in _WC_ADDR_REQUIRED + (("email",) if require_email else ()) if k not in out]
+    if missing:
+        raise ValueError(f"{kind}: Pflichtfelder fehlen: {', '.join(missing)}.")
+    if kind == "shipping":
+        out.pop("email", None)
+    return out
+
+
+def _wc_check_price(v: Any, what: str) -> str:
+    if isinstance(v, bool):
+        raise ValueError(f"{what}: ungültiger Preis.")
+    s = str(v).strip()
+    if isinstance(v, float):
+        s = f"{v:.2f}"
+    if not _WC_PRICE_RE.match(s):
+        raise ValueError(f"{what}: ungültiger Preis {v!r} (z.B. 0 oder 12.50).")
+    return s
+
+
+def _wc_check_order_items(items: Any) -> list[dict[str, Any]]:
+    if not isinstance(items, list) or not 1 <= len(items) <= _WC_ORDER_MAX_ITEMS:
+        raise ValueError(f"items: 1 bis {_WC_ORDER_MAX_ITEMS} Positionen angeben.")
+    out = []
+    for n, it in enumerate(items, 1):
+        if not isinstance(it, dict):
+            raise ValueError(f"Position {n}: Objekt mit product_id und quantity angeben.")
+        unknown = sorted(set(it) - {"product_id", "quantity", "price"})
+        if unknown:
+            raise ValueError(f"Position {n}: unbekannte Felder {', '.join(unknown)}.")
+        pid = it.get("product_id")
+        if isinstance(pid, bool) or not str(pid or "").strip().isdigit() or not 0 < int(str(pid).strip()) < 10**9:
+            raise ValueError(f"Position {n}: ungültige product_id {pid!r} (Produkt- oder Variations-ID).")
+        qty = it.get("quantity", 1)
+        if isinstance(qty, bool) or not isinstance(qty, int) or not 1 <= qty <= _WC_ORDER_MAX_QTY:
+            raise ValueError(f"Position {n}: quantity muss eine ganze Zahl von 1 bis {_WC_ORDER_MAX_QTY} sein.")
+        price = it.get("price")
+        out.append({"product_id": int(str(pid).strip()), "quantity": qty,
+                    "price": None if price is None or price == "" else _wc_check_price(price, f"Position {n}")})
+    return out
+
+
+def _wc_check_order_text(text: str, what: str) -> str:
+    s = str(text or "").strip()
+    if len(s) > _WC_ORDER_NOTE_MAX or any(ord(c) < 32 and c not in "\n\t" for c in s) or "<" in s:
+        raise ValueError(f"{what}: höchstens {_WC_ORDER_NOTE_MAX} Zeichen, keine Steuerzeichen, kein '<'.")
+    return s
+
+
+def _wc_order_create_payload(billing, shipping, items, shipping_method, shipping_cost, status,
+                             suppress_customer_emails, customer_note, order_note) -> dict[str, Any]:
+    if status not in _WC_ORDER_STATUSES:
+        raise ValueError(f"status muss eines von {', '.join(_WC_ORDER_STATUSES)} sein.")
+    sm = str(shipping_method or "").strip()
+    if sm and not _WC_SHIPPING_ID_RE.match(sm):
+        raise ValueError(f"Ungültige Versandart {shipping_method!r} - erwartet '<methode>:<instanz>', z.B. 'flat_rate:3'.")
+    bill = _wc_check_address(billing, "billing", require_email=True)
+    ship = _wc_check_address(shipping, "shipping", require_email=False) if shipping else {
+        k: v for k, v in bill.items() if k != "email"}
+    return {
+        "billing": bill, "shipping": ship, "items": _wc_check_order_items(items),
+        "shipping_method": sm,
+        "shipping_cost": None if shipping_cost is None or shipping_cost == "" else _wc_check_price(shipping_cost, "shipping_cost"),
+        "status": status, "suppress_customer_emails": bool(suppress_customer_emails),
+        "customer_note": _wc_check_order_text(customer_note, "customer_note"),
+        "order_note": _wc_check_order_text(order_note, "order_note"),
+    }
+
+
+@mcp.tool()
+@_wp_reporting
+def wc_order_create(
+    domain: str,
+    billing: dict[str, Any],
+    items: list[dict[str, Any]],
+    shipping_method: str = "",
+    shipping: dict[str, Any] | None = None,
+    shipping_cost: str | int | float | None = None,
+    status: str = "processing",
+    suppress_customer_emails: bool = False,
+    customer_note: str = "",
+    order_note: str = "",
+    wp_path: str = "httpdocs",
+    confirm: bool = False,
+) -> str:
+    """Legt eine WooCommerce-Bestellung über die WooCommerce-API an
+    (wc_create_order, add_product, set_address, Versandposition,
+    calculate_totals, Status, Lagerabbau) - alle Hooks laufen wie bei einer
+    Shop-Bestellung, z.B. Druck- oder ERP-Plugins beim Status "processing".
+
+    billing: {company, first_name, last_name, address_1, address_2,
+    postcode, city, country (ISO, z.B. "CH"), email, phone}; Pflicht:
+    first_name, last_name, address_1, postcode, city, country, email.
+    shipping: Lieferadresse wie billing (ohne email); leer = wie billing.
+    items: [{"product_id": <Produkt- oder Variations-ID>, "quantity": 1,
+    "price": "0"}] - price optional (Stückpreis wie im Shop erfasst, z.B. 0
+    für Muster), sonst Shop-Preis. Variable Produkte nur per Variations-ID
+    (IDs liefert wc_stock_get auf dem Hauptprodukt).
+    shipping_method: "<methode>:<instanz>" einer Versandart des Shops, z.B.
+    "flat_rate:3" - die Vorschau listet alle Versandarten mit ID.
+    shipping_cost: optional (z.B. "0"), sonst die Kosten der Versandart.
+    status: "processing" (Standard), "pending", "on-hold" oder "completed".
+    suppress_customer_emails=true: keine WooCommerce-Kundenmails beim
+    Anlegen (Bestellbestätigung, "In Bearbeitung" usw.), Admin-Mails bleiben.
+    Gilt nur für diesen Aufruf, spätere Statuswechsel senden wieder Mails.
+    customer_note: Kundenhinweis; order_note: interne Notiz.
+    Ohne confirm=true nur Vorschau (Positionen, Preise, Adressen, Versandart,
+    Status, Mailverhalten, Bestellungen derselben E-Mail der letzten 24 h).
+    """
+    payload = _wc_order_create_payload(billing, shipping, items, shipping_method, shipping_cost, status,
+                                       suppress_customer_emails, customer_note, order_note)
+    client, ctx, wp_dir, uid, d = _wc_open(domain, wp_path)
+    try:
+        pre = _wp_eval(client, ctx, wp_dir, _WC_ORDER_PREVIEW_PHP,
+                       stdin_data=json.dumps(payload).encode("utf-8"))
+        if not isinstance(pre, dict) or "items" not in pre:
+            raise SSHError("Unerwartete Antwort bei der Vorschau der Bestellung.")
+        result: dict[str, Any] = {
+            "domain": d, "wp_path": wp_dir,
+            "positionen": pre["items"],
+            "preise_inkl_mwst": pre.get("prices_include_tax"), "waehrung": pre.get("currency"),
+            "rechnungsadresse": payload["billing"], "lieferadresse": payload["shipping"],
+            "versandart": pre.get("shipping_method"), "versandkosten": pre.get("shipping_cost"),
+            "status": status,
+            "kundenmails": ("unterdrückt: " + ", ".join(pre.get("customer_emails") or []))
+            if payload["suppress_customer_emails"] else "werden wie üblich von WooCommerce versendet",
+            "kundenhinweis": payload["customer_note"], "interne_notiz": payload["order_note"],
+        }
+        if pre.get("orders_same_email_24h"):
+            result["warnung_bestellungen_24h"] = pre["orders_same_email_24h"]
+        problems = list(pre.get("errors") or [])
+        if not payload["shipping_method"]:
+            problems.append("Keine Versandart angegeben - eine ID aus versandarten_verfuegbar wählen.")
+        if not payload["shipping_method"] or problems:
+            result["versandarten_verfuegbar"] = [m for m in pre.get("available_shipping_methods") or []
+                                                 if m.get("enabled")]
+        if problems:
+            result["fehler"] = problems
+            result["ergebnis"] = "Nicht ausführbar - nichts angelegt."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        if not confirm:
+            result["ergebnis"] = ("Vorschau - nichts angelegt. Mit confirm=true ausführen. "
+                                  "Summe und Steuern berechnet WooCommerce beim Anlegen.")
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        try:
+            res = _wp_eval(client, ctx, wp_dir, _WC_ORDER_CREATE_PHP,
+                           stdin_data=json.dumps(payload).encode("utf-8"))
+        except Exception as e:
+            _audit("wc_order_create", domain=d, items=payload["items"], status=status,
+                   result="failed", error=str(e)[:200])
+            raise
+    finally:
+        client.close()
+    if not isinstance(res, dict) or not res.get("id"):
+        raise SSHError("Unerwartete Antwort beim Anlegen - bitte im Shop prüfen, ob die Bestellung existiert.")
+    _audit("wc_order_create", domain=d, order_id=res.get("id"), status=res.get("status"),
+           total=res.get("total"), items=payload["items"],
+           customer_emails_suppressed=bool(res.get("customer_emails_suppressed")), result="ok")
+    ok = res.get("status") == status
+    result.update({
+        "bestellnummer": res.get("number"), "bestell_id": res.get("id"), "status": res.get("status"),
+        "summe": res.get("total"), "waehrung": res.get("currency"), "angelegte_positionen": res.get("items"),
+        "versand": res.get("shipping"), "lager_reduziert": res.get("stock_reduced"),
+        "kundenmails_unterdrueckt": bool(res.get("customer_emails_suppressed")),
+        "ergebnis": "Bestellung angelegt und kontrolliert." if ok
+        else f"Bestellung angelegt, Status ist aber {res.get('status')!r} statt {status!r} - bitte prüfen.",
+    })
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
