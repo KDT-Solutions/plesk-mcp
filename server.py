@@ -6387,8 +6387,12 @@ if (!$o || $o->get_type() !== "shop_order") { fwrite(STDERR, "Bestellung nicht g
 '''
 
 _WC_ORDER_GET_PHP = _WC_ORDER_VIEW_PHP + r'''
+// Unterstützt: WooCommerce Shipment Tracking (wc_st_add_tracking_number) und
+// Advanced Shipment Tracking ab 4.x (ast_add_tracking_number).
+$fn = function_exists("wc_st_add_tracking_number") ? "wc_st_add_tracking_number"
+    : (function_exists("ast_add_tracking_number") ? "ast_add_tracking_number" : null);
 echo json_encode(array("order" => plmcp_order_view($o, $in["label_keys"]),
-    "tracking_function" => function_exists("wc_st_add_tracking_number")));
+    "tracking_function" => $fn));
 '''
 
 _WC_ORDER_SHIP_PHP = _WC_ORDER_VIEW_PHP + r'''
@@ -6398,8 +6402,14 @@ $exists = false;
 $tr = $o->get_meta("_wc_shipment_tracking_items");
 if (is_array($tr)) { foreach ($tr as $t) { if (isset($t["tracking_number"]) && (string) $t["tracking_number"] === $nr) { $exists = true; } } }
 if (!$exists) {
-    if (!function_exists("wc_st_add_tracking_number")) { fwrite(STDERR, "Kein Shipment-Tracking-Plugin aktiv (wc_st_add_tracking_number fehlt) - nichts geändert"); exit(1); }
-    wc_st_add_tracking_number($o->get_id(), $nr, $prov, current_time("Y-m-d"));
+    if (function_exists("wc_st_add_tracking_number")) {
+        wc_st_add_tracking_number($o->get_id(), $nr, $prov, current_time("Y-m-d"));
+    } elseif (function_exists("ast_add_tracking_number")) {
+        // status_shipped=0: Status setzt dieses Tool selbst (set_completed).
+        ast_add_tracking_number($o->get_id(), $nr, $prov, current_time("Y-m-d"), 0);
+    } else {
+        fwrite(STDERR, "Kein Shipment-Tracking-Plugin aktiv (weder wc_st_add_tracking_number noch ast_add_tracking_number) - nichts geändert"); exit(1);
+    }
     $done[] = "tracking_hinzugefuegt";
 } else { $done[] = "tracking_bereits_vorhanden"; }
 $o = wc_get_order($o->get_id());
@@ -6476,7 +6486,8 @@ def wc_order_mark_shipped(
 ) -> str:
     """Markiert eine WooCommerce-Bestellung als verschickt: trägt die
     Sendungsnummer über das Shipment-Tracking-Plugin ein
-    (wc_st_add_tracking_number, wie beim manuellen Eintragen im Backend) und
+    (wc_st_add_tracking_number bzw. bei Advanced Shipment Tracking
+    ast_add_tracking_number, wie beim manuellen Eintragen im Backend) und
     setzt den Status auf "Abgeschlossen" (set_completed=false: nur Tracking).
 
     tracking_number leer = Sendungsnummer aus dem Label-Plugin der Bestellung
@@ -6514,7 +6525,7 @@ def wc_order_mark_shipped(
                                   "sendungsnummer": nr, "quelle_sendungsnummer": quelle,
                                   "provider": prov, "geplant": geplant}
         if not exists and not cur.get("tracking_function"):
-            raise ValueError("Kein Shipment-Tracking-Plugin aktiv (wc_st_add_tracking_number fehlt) - nichts geändert.")
+            raise ValueError("Kein Shipment-Tracking-Plugin aktiv (weder wc_st_add_tracking_number noch ast_add_tracking_number) - nichts geändert.")
         if not geplant:
             result["ergebnis"] = "Nichts zu tun - Sendungsnummer und Status sind bereits gesetzt."
             result["order"] = order

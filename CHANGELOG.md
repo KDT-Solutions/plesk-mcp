@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.31.x
+
+- `wc_order_get` / `wc_order_mark_shipped`: unterstützen neben WooCommerce Shipment Tracking (`wc_st_add_tracking_number`) auch Advanced Shipment Tracking ab 4.x (`ast_add_tracking_number`, Anbieter-Slug, Status setzt weiterhin das Tool). `tracking_function` liefert jetzt den Namen der gefundenen Funktion statt true/false.
+
 ## 0.31
 
 - Neue Tools `wc_stock_get` und `wc_stock_update` für den WooCommerce-Lagerbestand. Produkt per ID oder Artikelnummer (SKU, z.B. EAN-13). `wc_stock_update` setzt den Bestand (`quantity`) oder erhöht/verringert ihn (`change`, max. ±10000), optional nur wenn der aktuelle Bestand `expected` entspricht. Gebucht wird über `wc_update_product_stock` (atomar; bei Varianten mit Lager auf dem Hauptprodukt dort), nur bei aktiver Lagerverwaltung. Fester PHP-Code per `wp eval`, Werte als JSON per stdin, ohne `confirm=true` nur Vorschau, danach Kontrolle und Eintrag im Audit-Log (Produkt, Aktion, vorher/nachher, Grund).
