@@ -43,3 +43,10 @@ def test_php_has_no_placeholders():
     # Werte kommen nur per stdin, nie per String-Formatierung in den Code
     for php in (server._WC_ORDER_GET_PHP, server._WC_ORDER_SHIP_PHP):
         assert "%s" not in php and "stream_get_contents(STDIN)" in php
+
+
+def test_php_supports_advanced_shipment_tracking():
+    # Advanced Shipment Tracking 4.x kennt nur ast_add_tracking_number.
+    assert "ast_add_tracking_number" in server._WC_ORDER_GET_PHP
+    assert "ast_add_tracking_number" in server._WC_ORDER_SHIP_PHP
+    assert "wc_st_add_tracking_number" in server._WC_ORDER_SHIP_PHP
