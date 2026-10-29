@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.33
+
+- Neues Tool `domain_create(domain, owner, service_plan, ip, notify, confirm)`: legt eine Domain als neue Subscription ohne Hosting an (`plesk bin subscription --create <domain> -owner <login> -service-plan <plan> -ip <ip> -hosting false -notify false`). Danach können die DNS-Records mit den `dns_*`-Tools gesetzt werden.
+  - Prüft vorher: Domain existiert noch nicht, Kundenaccount vorhanden (oder `admin`), Servicepaket vorhanden (Liste aus `psa.Templates`), IP ist eine Shared-IP des Servers; ohne `ip` wird die einzige Shared-IP genommen, bei mehreren muss sie angegeben werden.
+  - Ohne `confirm=true` nur Vorschau. Danach Kontrolle der Subscription, Ausgabe der angelegten DNS-Zone und Eintrag im Audit-Log.
+- Tests: `tests/test_domain_create.py`.
+
 ## 0.32
 
 - Neues Tool `wc_order_create`: legt eine WooCommerce-Bestellung über die WooCommerce-API an (`wc_create_order`, `add_product`, `set_address`, Versandposition, `calculate_totals`, `update_status`, Lagerabbau), damit alle Hooks wie bei einer Shop-Bestellung laufen (z.B. Druck- und ERP-Plugins bei "processing").
