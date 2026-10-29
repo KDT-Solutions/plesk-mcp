@@ -88,7 +88,7 @@ _MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 # Commit mit einer neuen Basis ergibt also <Basis>.0.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.32"
+_VERSION_BASE = "0.33"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -1658,6 +1658,114 @@ def subscription_delete(domain: str, confirm_domain: str = "", confirm: bool = F
     _, _, code = _ssh_exec(f"plesk bin subscription --info {shlex.quote(d)}")
     gone = "gelöscht" if code != 0 else "NOCH VORHANDEN - bitte prüfen"
     return f"Vorher:\n{summary}\n\n{out}\n\nKontrolle: Subscription {gone}"
+
+_IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+
+
+def _service_plans() -> list[str]:
+    """Namen aller Hosting-Servicepläne (psa.Templates, type='domain')."""
+    out, err, code = _ssh_exec(
+        "plesk db -N -B -e \"SELECT name FROM Templates WHERE type='domain' ORDER BY name\""
+    )
+    if code != 0:
+        raise ValueError(f"Servicepakete nicht lesbar: {(err or out).strip()[:200]}")
+    return [l.strip() for l in out.splitlines() if l.strip()]
+
+
+def _shared_ips() -> list[str]:
+    """Lokale IPv4-Adressen vom Typ "S" (shared) aus `plesk bin ipmanage -l`."""
+    out, err, code = _ssh_exec("plesk bin ipmanage -l")
+    if code != 0:
+        raise ValueError(f"IP-Liste nicht lesbar: {(err or out).strip()[:200]}")
+    ips = []
+    for line in out.splitlines():
+        cols = line.split()
+        if len(cols) >= 3 and cols[1] == "S":
+            ip = cols[2].split(":")[-1].split("/")[0]
+            if _IPV4_RE.match(ip):
+                ips.append(ip)
+    return ips
+
+
+@mcp.tool()
+def domain_create(
+    domain: str,
+    owner: str,
+    service_plan: str,
+    ip: str = "",
+    notify: bool = False,
+    confirm: bool = False,
+) -> str:
+    """Legt eine Domain in Plesk als neue Subscription OHNE Hosting an
+    (Hosting-Typ "Kein Hosting", z.B. nur für DNS und Mail-Weiterleitungen).
+    Entspricht `plesk bin subscription --create <domain> -owner <login>
+    -service-plan <plan> -ip <ip> -hosting false -notify false`. Plesk legt
+    die DNS-Zone nach der Server-Vorlage an; Records danach mit dns_*.
+
+    owner: Login des Inhabers ("admin" oder Kunden-Login aus
+           plesk_api_get("clients")).
+    service_plan: exakter Name des Servicepakets (bei unbekanntem Namen
+                  listet die Fehlermeldung alle vorhandenen).
+    ip: lokale IPv4 des Servers; leer = die einzige Shared-IP, bei mehreren
+        muss sie angegeben werden.
+    notify: Plesk-Benachrichtigungsmails beim Anlegen (Standard aus).
+
+    Schreibt auf einem Produktivserver: ohne confirm=true nur Vorschau
+    (Inhaber, Plan, IP, Prüfung ob die Domain schon existiert).
+    """
+    d = _wp_domain(domain)
+    if "." not in d:
+        raise ValueError(f"Ungültiger Domainname: {domain!r}")
+    lg = owner.strip()
+    if not _LOGIN_RE.match(lg):
+        raise ValueError(f"Ungültiger Plesk-Login: {owner!r}")
+    plan = service_plan.strip()
+    plans = _service_plans()
+    if plan not in plans:
+        raise ValueError(
+            f"Servicepaket {service_plan!r} nicht gefunden. Vorhanden: {', '.join(plans) or '-'}"
+        )
+    shared = _shared_ips()
+    addr = ip.strip()
+    if addr:
+        if addr not in shared:
+            raise ValueError(f"IP {addr!r} ist keine Shared-IP des Servers. Vorhanden: {', '.join(shared) or '-'}")
+    elif len(shared) == 1:
+        addr = shared[0]
+    else:
+        raise ValueError(f"Mehrere oder keine Shared-IPs ({', '.join(shared) or '-'}) - ip angeben.")
+
+    _, _, code = _ssh_exec(f"plesk bin domain --info {shlex.quote(d)}")
+    if code == 0:
+        raise ValueError(f"Domain {d!r} existiert in Plesk bereits, nichts angelegt.")
+    if lg != "admin":
+        out, _, code = _ssh_exec(f"plesk bin customer --info {shlex.quote(lg)}")
+        if code != 0:
+            raise ValueError(f"Kein Kundenaccount {lg!r} gefunden.")
+        name = next((l.partition(":")[2].strip() for l in out.splitlines()
+                     if l.startswith(("Company name", "Personal name")) and l.partition(":")[2].strip()), "")
+        owner_txt = f"{lg} ({name})" if name else lg
+    else:
+        owner_txt = "admin"
+
+    summary = (
+        f"Domain: {d}\nInhaber: {owner_txt}\nServicepaket: {plan}\nIP: {addr}\n"
+        f"Hosting: keins\nBenachrichtigung: {'ja' if notify else 'nein'}"
+    )
+    if not confirm:
+        return f"Vorschau (nichts angelegt) - Domain ohne Hosting anlegen:\n{summary}\nZum Ausführen confirm=true setzen."
+
+    out = ssh_run(
+        f"plesk bin subscription --create {shlex.quote(d)} -owner {shlex.quote(lg)}"
+        f" -service-plan {shlex.quote(plan)} -ip {shlex.quote(addr)}"
+        f" -hosting false -notify {'true' if notify else 'false'}"
+    )
+    _audit("domain_create", domain=d, owner=lg, service_plan=plan, ip=addr)
+    _, _, code = _ssh_exec(f"plesk bin subscription --info {shlex.quote(d)}")
+    check = "Subscription vorhanden" if code == 0 else "Subscription NICHT gefunden - bitte prüfen"
+    dns = ssh_run(f"plesk bin dns --info {shlex.quote(d)}")
+    return f"{summary}\n\n{out}\n\nKontrolle: {check}\n\nDNS-Zone:\n{dns}"
+
 
 @mcp.tool()
 def customer_delete(login: str, confirm_login: str = "", confirm: bool = False) -> str:
