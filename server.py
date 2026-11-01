@@ -88,7 +88,7 @@ _MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 # Commit mit einer neuen Basis ergibt also <Basis>.0.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.33"
+_VERSION_BASE = "0.34"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -1687,20 +1687,45 @@ def _shared_ips() -> list[str]:
     return ips
 
 
+# Systembenutzer (FTP) einer Subscription: Linux-Konvention, Plesk prüft zusätzlich.
+_SYS_LOGIN_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,31}$")
+_PW_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+_PW_SPECIAL = "!#%+-=_"
+
+
+def _gen_password(length: int = 20) -> str:
+    """Zufallspasswort mit Gross-/Kleinbuchstaben, Ziffern und Sonderzeichen."""
+    while True:
+        pw = [secrets.choice(_PW_ALPHABET + _PW_SPECIAL) for _ in range(length)]
+        s = "".join(pw)
+        if (any(c.isupper() for c in s) and any(c.islower() for c in s)
+                and any(c.isdigit() for c in s) and any(c in _PW_SPECIAL for c in s)):
+            return s
+
+
 @mcp.tool()
 def domain_create(
     domain: str,
     owner: str,
     service_plan: str,
     ip: str = "",
+    hosting: bool = False,
+    ftp_login: str = "",
+    ftp_password: str = "",
     notify: bool = False,
     confirm: bool = False,
 ) -> str:
-    """Legt eine Domain in Plesk als neue Subscription OHNE Hosting an
-    (Hosting-Typ "Kein Hosting", z.B. nur für DNS und Mail-Weiterleitungen).
-    Entspricht `plesk bin subscription --create <domain> -owner <login>
-    -service-plan <plan> -ip <ip> -hosting false -notify false`. Plesk legt
-    die DNS-Zone nach der Server-Vorlage an; Records danach mit dns_*.
+    """Legt eine Domain in Plesk als neue Subscription an, wahlweise OHNE
+    Hosting (Standard, z.B. nur für DNS und Mail-Weiterleitungen) oder MIT
+    Webhosting (hosting=true).
+
+    Ohne Hosting: `plesk bin subscription --create <domain> -owner <login>
+    -service-plan <plan> -ip <ip> -hosting false -notify false`.
+    Mit Hosting: `... -hosting true -hst_type phys -login <ftp_login>
+    -passwd '' -notify false`, das Passwort geht per stdin in die
+    Umgebungsvariable PSA_PASSWORD (nicht in der Prozessliste). Plesk legt
+    die DNS-Zone nach der Server-Vorlage an; Records danach mit dns_*,
+    PHP-Handler mit set_php_handler.
 
     owner: Login des Inhabers ("admin" oder Kunden-Login aus
            plesk_api_get("clients")).
@@ -1708,10 +1733,17 @@ def domain_create(
                   listet die Fehlermeldung alle vorhandenen).
     ip: lokale IPv4 des Servers; leer = die einzige Shared-IP, bei mehreren
         muss sie angegeben werden.
+    hosting: true = Webhosting (Webspace unter /var/www/vhosts/<domain>).
+    ftp_login: nur mit hosting - Systembenutzer/FTP-Login der Subscription
+               (Pflicht, Kleinbuchstaben/Ziffern/._-, max. 32 Zeichen,
+               darf auf dem Server noch nicht existieren).
+    ftp_password: nur mit hosting - leer = sicheres Zufallspasswort, das
+                  einmalig in der Rückgabe steht (nie im Audit-Log).
     notify: Plesk-Benachrichtigungsmails beim Anlegen (Standard aus).
 
     Schreibt auf einem Produktivserver: ohne confirm=true nur Vorschau
-    (Inhaber, Plan, IP, Prüfung ob die Domain schon existiert).
+    (Inhaber, Plan, IP, Hosting, Prüfung ob Domain und Login schon
+    existieren).
     """
     d = _wp_domain(domain)
     if "." not in d:
@@ -1719,6 +1751,19 @@ def domain_create(
     lg = owner.strip()
     if not _LOGIN_RE.match(lg):
         raise ValueError(f"Ungültiger Plesk-Login: {owner!r}")
+    sys_login = ftp_login.strip()
+    password = ftp_password
+    if hosting:
+        if not sys_login:
+            raise ValueError("Mit hosting=true ist ftp_login Pflicht.")
+        if not _SYS_LOGIN_RE.match(sys_login):
+            raise ValueError(
+                f"Ungültiger FTP-Login: {ftp_login!r} (Kleinbuchstabe am Anfang, dann a-z 0-9 . _ -, max. 32)"
+            )
+        if password and (len(password) < 8 or len(password) > 255 or any(c in password for c in "\r\n\0")):
+            raise ValueError("ftp_password muss 8-255 Zeichen lang sein und darf keine Zeilenumbrüche enthalten.")
+    elif sys_login or password:
+        raise ValueError("ftp_login/ftp_password nur zusammen mit hosting=true.")
     plan = service_plan.strip()
     plans = _service_plans()
     if plan not in plans:
@@ -1738,6 +1783,10 @@ def domain_create(
     _, _, code = _ssh_exec(f"plesk bin domain --info {shlex.quote(d)}")
     if code == 0:
         raise ValueError(f"Domain {d!r} existiert in Plesk bereits, nichts angelegt.")
+    if hosting:
+        _, _, code = _ssh_exec(f"id -u {shlex.quote(sys_login)}")
+        if code == 0:
+            raise ValueError(f"Systembenutzer {sys_login!r} existiert auf dem Server bereits, nichts angelegt.")
     if lg != "admin":
         out, _, code = _ssh_exec(f"plesk bin customer --info {shlex.quote(lg)}")
         if code != 0:
@@ -1748,23 +1797,54 @@ def domain_create(
     else:
         owner_txt = "admin"
 
+    if hosting:
+        pw_txt = "angegeben" if password else "wird generiert"
+        hosting_txt = f"Webhosting (FTP-Login: {sys_login}, Passwort: {pw_txt})"
+    else:
+        hosting_txt = "keins"
     summary = (
         f"Domain: {d}\nInhaber: {owner_txt}\nServicepaket: {plan}\nIP: {addr}\n"
-        f"Hosting: keins\nBenachrichtigung: {'ja' if notify else 'nein'}"
+        f"Hosting: {hosting_txt}\nBenachrichtigung: {'ja' if notify else 'nein'}"
     )
     if not confirm:
-        return f"Vorschau (nichts angelegt) - Domain ohne Hosting anlegen:\n{summary}\nZum Ausführen confirm=true setzen."
+        label = "Domain mit Webhosting anlegen" if hosting else "Domain ohne Hosting anlegen"
+        return f"Vorschau (nichts angelegt) - {label}:\n{summary}\nZum Ausführen confirm=true setzen."
 
-    out = ssh_run(
+    base = (
         f"plesk bin subscription --create {shlex.quote(d)} -owner {shlex.quote(lg)}"
         f" -service-plan {shlex.quote(plan)} -ip {shlex.quote(addr)}"
-        f" -hosting false -notify {'true' if notify else 'false'}"
     )
-    _audit("domain_create", domain=d, owner=lg, service_plan=plan, ip=addr)
+    notify_opt = f" -notify {'true' if notify else 'false'}"
+    if hosting:
+        generated = not password
+        if generated:
+            password = _gen_password()
+        cmd = (
+            "IFS= read -r PSA_PASSWORD && export PSA_PASSWORD && "
+            f"{base} -hosting true -hst_type phys -login {shlex.quote(sys_login)} -passwd ''{notify_opt}"
+        )
+        client = _ssh_connect()
+        try:
+            o, e, rc = _client_exec(client, cmd, stdin_data=(password + "\n").encode("utf-8"))
+        finally:
+            client.close()
+        out = o
+        if e.strip():
+            out += f"\n[stderr]\n{e}"
+        if rc != 0:
+            out += f"\n[exit code: {rc}]"
+        out = out.replace(password, "***").strip() or "(keine Ausgabe)"
+    else:
+        out = ssh_run(f"{base} -hosting false{notify_opt}")
+    _audit("domain_create", domain=d, owner=lg, service_plan=plan, ip=addr,
+           hosting=hosting, ftp_login=sys_login or None)
     _, _, code = _ssh_exec(f"plesk bin subscription --info {shlex.quote(d)}")
     check = "Subscription vorhanden" if code == 0 else "Subscription NICHT gefunden - bitte prüfen"
     dns = ssh_run(f"plesk bin dns --info {shlex.quote(d)}")
-    return f"{summary}\n\n{out}\n\nKontrolle: {check}\n\nDNS-Zone:\n{dns}"
+    result = f"{summary}\n\n{out}\n\nKontrolle: {check}"
+    if hosting and code == 0 and generated:
+        result += f"\n\nFTP-Zugang: {sys_login} / {password}\n(Passwort wird nur hier angezeigt, bitte sicher ablegen.)"
+    return f"{result}\n\nDNS-Zone:\n{dns}"
 
 
 @mcp.tool()

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.34
+
+- `domain_create` kann Domains jetzt auch mit Webhosting anlegen: neue Parameter `hosting`, `ftp_login`, `ftp_password`. Mit `hosting=true` läuft `plesk bin subscription --create <domain> ... -hosting true -hst_type phys -login <ftp_login> -passwd ''`; ohne `hosting` bleibt alles wie bisher (`-hosting false`).
+  - `ftp_login` ist mit Hosting Pflicht, wird per Regex geprüft und darf als Systembenutzer noch nicht existieren (`id -u`).
+  - Das Passwort geht per stdin in `PSA_PASSWORD`, nicht auf die Kommandozeile und nicht ins Audit-Log; in der Plesk-Ausgabe wird es maskiert. Ohne `ftp_password` wird ein Zufallspasswort erzeugt und einmalig in der Rückgabe angezeigt.
+  - Audit-Log enthält zusätzlich `hosting` und `ftp_login`.
+- Tests: `tests/test_domain_create.py` um die Hosting-Fälle erweitert.
+
 ## 0.33
 
 - Neues Tool `domain_create(domain, owner, service_plan, ip, notify, confirm)`: legt eine Domain als neue Subscription ohne Hosting an (`plesk bin subscription --create <domain> -owner <login> -service-plan <plan> -ip <ip> -hosting false -notify false`). Danach können die DNS-Records mit den `dns_*`-Tools gesetzt werden.
