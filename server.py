@@ -88,7 +88,7 @@ _MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 # Commit mit einer neuen Basis ergibt also <Basis>.0.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.33"
+_VERSION_BASE = "0.34"
 _VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -6004,6 +6004,304 @@ def wp_theme_rollback(backup_id: str, themes: list[str] | None = None, confirm: 
     backup_id in der Rückgabe).
     """
     return _wp_ext_rollback("theme", backup_id, themes, confirm)
+
+
+# ---------------------------------------------------------------------------
+# WordPress-Übersicht, Core-Updates und WP Time Capsule (WPTC)
+# ---------------------------------------------------------------------------
+
+_WP_CORE_BACKUP_SUBDIR = ".plesk-mcp/wp-core-backups"
+_WP_VERSION_RE = re.compile(r"^\d{1,2}\.\d{1,2}(?:\.\d{1,2})?$")
+_WP_SCAN_DEPTH = 4
+# WPTC speichert seine Einstellungen in <prefix>wptc_options
+_WPTC_KEYS = ("site_url_wptc", "revision_limit", "default_repo",
+              "last_backup_success_complete_time", "last_backup_time", "schedule_time_str")
+_WPTC_MIN_DAYS = 1
+_WPTC_MAX_DAYS = 365
+_WP_DB_IDENT_RE = re.compile(r"^[A-Za-z0-9_$-]{1,64}$")
+
+_WP_SCAN_SH = r"""
+find /var/www/vhosts -mindepth 2 -maxdepth "$1" -name wp-config.php -type f \
+  -not -path '*/.plesk-mcp/*' -not -path '*/wp-content/*' -not -path '/var/www/vhosts/system/*' \
+  -not -path '*/@*' 2>/dev/null | sort | while IFS= read -r f; do
+  d=$(dirname "$f")
+  [ -f "$d/wp-load.php" ] || continue
+  v=$(sed -n "s/^\$wp_version = '\([^']*\)';.*/\1/p" "$d/wp-includes/version.php" 2>/dev/null | head -1)
+  db=$(sed -n "s/.*define( *['\"]DB_NAME['\"] *, *['\"]\([^'\"]*\)['\"].*/\1/p" "$f" | head -1)
+  pre=$(sed -n "s/^[[:space:]]*\$table_prefix *= *['\"]\([^'\"]*\)['\"].*/\1/p" "$f" | head -1)
+  printf '%s\t%s\t%s\t%s\n' "$d" "$v" "$db" "$pre"
+done
+"""
+
+
+def _wp_scan_installs(client: paramiko.SSHClient) -> list[dict[str, str]]:
+    out, err, rc = _client_exec(
+        client, f"sh -c {shlex.quote(_WP_SCAN_SH)} sh {_WP_SCAN_DEPTH + 2}", timeout=_WP_CLI_TIMEOUT
+    )
+    if rc != 0 and not out.strip():
+        raise SSHError(f"Suche nach WordPress-Installationen fehlgeschlagen: {err.strip()}")
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 4:
+            continue
+        path, version, db, prefix = parts
+        rel = posixpath.relpath(path, _VHOST_BASE)
+        vhost, _, wp_path = rel.partition("/")
+        rows.append({"domain": vhost, "wp_path": wp_path or ".", "dir": path,
+                     "wp_version": version or None, "db": db, "prefix": prefix})
+    return rows
+
+
+def _wptc_read(client: paramiko.SSHClient, db: str, prefix: str) -> dict[str, Any] | None:
+    """WPTC-Optionen aus der Datenbank (Plesk-Admin-Zugang, nur lesend).
+    None = kein WPTC in dieser Installation."""
+    if not _WP_DB_IDENT_RE.match(db or "") or not re.match(r"^[A-Za-z0-9_]{0,64}$", prefix or ""):
+        return None
+    table = f"`{db}`.`{prefix}wptc_options`"
+    keys = ",".join(_sql_quote(k) for k in _WPTC_KEYS)
+    sql = f"SELECT name, value FROM {table} WHERE name IN ({keys})"
+    out, _, rc = _client_exec(client, f"plesk db -Ne {shlex.quote(sql)}")
+    if rc != 0:
+        return None
+    vals: dict[str, str] = {}
+    for line in out.splitlines():
+        k, _, v = line.partition("\t")
+        vals[k.strip()] = v.strip()
+    return vals
+
+
+def _wp_siteurl(client: paramiko.SSHClient, db: str, prefix: str) -> str | None:
+    if not _WP_DB_IDENT_RE.match(db or "") or not re.match(r"^[A-Za-z0-9_]{0,64}$", prefix or ""):
+        return None
+    sql = f"SELECT option_value FROM `{db}`.`{prefix}options` WHERE option_name='home'"
+    out, _, rc = _client_exec(client, f"plesk db -Ne {shlex.quote(sql)}")
+    if rc != 0:
+        return None
+    return out.strip() or None
+
+
+def _ts_to_iso(raw: str | None) -> str | None:
+    if not raw or not str(raw).strip().isdigit():
+        return None
+    try:
+        return datetime.datetime.fromtimestamp(int(raw), datetime.timezone.utc).astimezone().isoformat(
+            timespec="minutes")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+@mcp.tool()
+def wp_sites_overview(filter: str = "", max_backup_age_days: int = 3) -> str:
+    """Übersicht aller WordPress-Installationen auf dem Server (Suche nach
+    wp-config.php unter /var/www/vhosts, unabhängig vom WP Toolkit).
+
+    Pro Installation: domain + wp_path (Parameter für die übrigen wp_*-Tools),
+    URL (Option home), WordPress-Version, Datenbank und - falls WP Time
+    Capsule installiert ist - Speicherdauer (revision_limit in Tagen),
+    Backup-Ziel und letzte erfolgreiche Sicherung. backup_alt=true, wenn die
+    letzte erfolgreiche Sicherung älter als max_backup_age_days ist.
+    filter: optional Teil von Domain, Pfad oder URL. Rein lesend.
+    """
+    if not 0 < max_backup_age_days <= 365:
+        raise ValueError("max_backup_age_days muss zwischen 1 und 365 liegen.")
+    f = (filter or "").strip().lower()
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    client = _ssh_connect()
+    try:
+        sites = []
+        for row in _wp_scan_installs(client):
+            url = _wp_siteurl(client, row["db"], row["prefix"])
+            if f and f not in f"{row['domain']}/{row['wp_path']} {url or ''}".lower():
+                continue
+            site: dict[str, Any] = {"domain": row["domain"], "wp_path": row["wp_path"],
+                                    "url": url, "wp_version": row["wp_version"], "db": row["db"]}
+            wptc = _wptc_read(client, row["db"], row["prefix"])
+            if wptc is None:
+                site["wptc"] = None
+            else:
+                last = wptc.get("last_backup_success_complete_time")
+                site["wptc"] = {
+                    "revision_limit_tage": int(wptc["revision_limit"]) if wptc.get("revision_limit", "").isdigit() else wptc.get("revision_limit"),
+                    "ziel": wptc.get("default_repo") or None,
+                    "letzte_sicherung": _ts_to_iso(last),
+                    "backup_alt": (not last or not last.isdigit()
+                                   or now - int(last) > max_backup_age_days * 86400),
+                }
+            sites.append(site)
+    finally:
+        client.close()
+    ohne = [f"{s['domain']}/{s['wp_path']}" for s in sites if s["wptc"] is None]
+    alt = [f"{s['domain']}/{s['wp_path']}" for s in sites if s["wptc"] and s["wptc"]["backup_alt"]]
+    return json.dumps({"anzahl": len(sites), "ohne_wptc": ohne, "backup_alt": alt, "sites": sites},
+                      ensure_ascii=False, indent=2)
+
+
+def _wp_core_state(client, ctx, wp_dir: str) -> tuple[str, list[dict[str, Any]]]:
+    version = _wp_cli(client, ctx, wp_dir, ["core", "version"]).strip().splitlines()[-1].strip()
+    out, err, rc = _wp_cli_run(client, ctx, wp_dir, ["core", "check-update", "--format=json"])
+    updates: list[dict[str, Any]] = []
+    if rc == 0 and out.strip():
+        try:
+            data = _wp_json(out)
+            updates = data if isinstance(data, list) else []
+        except ValueError:
+            updates = []
+    return version, updates
+
+
+@mcp.tool()
+@_wp_reporting
+def wp_core_update(domain: str, wp_path: str, version: str = "", minor_only: bool = False,
+                   confirm: bool = False) -> str:
+    """Aktualisiert WordPress selbst (Core) per WP-CLI als System-User.
+
+    domain/wp_path wie bei wp_plugin_update (siehe wp_sites_overview).
+    version: optional Zielversion (z.B. "6.8.3"), sonst die neueste;
+    minor_only=true: nur Sicherheits-/Wartungsupdates innerhalb der
+    Hauptversion. Ohne confirm=true nur Vorschau (installiert, verfügbar).
+    Mit confirm=true: Datenbank-Export als Backup unter
+    /var/www/vhosts/<domain>/.plesk-mcp/wp-core-backups/<backup_id>/, dann
+    `wp core update` und `wp core update-db`, danach Kontrolle von Version und
+    Startseite. Liefert die Startseite vorher keinen 5xx-Fehler und danach
+    schon, wird automatisch auf die alte Version zurückgestellt (Core-Dateien
+    und Datenbank).
+    """
+    v = (version or "").strip()
+    if v and not _WP_VERSION_RE.match(v):
+        raise ValueError(f"Ungültige Version {version!r} (z.B. 6.8.3).")
+    if v and minor_only:
+        raise ValueError("version und minor_only nicht zusammen verwenden.")
+    d = _wp_domain(domain)
+    client = _ssh_connect()
+    try:
+        ctx = _wp_context(client, d)
+        sftp = client.open_sftp()
+        try:
+            wp_dir = _wp_install_dir(sftp, d, wp_path)
+        finally:
+            sftp.close()
+        current, updates = _wp_core_state(client, ctx, wp_dir)
+        if minor_only:
+            updates = [u for u in updates if u.get("update_type") == "minor"]
+        target = v or (updates[0].get("version") if updates else None)
+        result: dict[str, Any] = {"domain": d, "wp_path": wp_dir, "installiert": current,
+                                  "verfuegbar": [u.get("version") for u in updates]}
+        if not target or target == current:
+            result["ergebnis"] = "Nichts zu aktualisieren."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        result["ziel"] = target
+        if not confirm:
+            result["ergebnis"] = "Vorschau - nichts geändert. Mit confirm=true ausführen."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+
+        http_before, _ = _phps_http(d)
+        ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        backup_id = f"{ts}-{os.urandom(4).hex()}@{d}"
+        bdir = f"{ctx['home']}/{_WP_CORE_BACKUP_SUBDIR}/{backup_id}"
+        _, err, rc = _wp_run_as_user(client, ctx, ["/bin/sh", "-c", 'umask 077 && mkdir -p "$1"', "sh", bdir],
+                                     cwd=ctx["home"])
+        if rc != 0:
+            raise SSHError(f"Backup-Ordner konnte nicht angelegt werden - nichts geändert: {err.strip()}")
+        out, err, rc = _wp_cli_run(client, ctx, wp_dir, ["db", "export", f"{bdir}/db.sql", "--quiet"],
+                                   timeout=_WP_PLUGIN_UPDATE_TIMEOUT)
+        if rc != 0:
+            raise SSHError(f"Datenbank-Backup fehlgeschlagen - nichts geändert: {_wp_cli_error(out, err)}")
+        manifest = json.dumps({"id": backup_id, "created": datetime.datetime.now().isoformat(timespec="seconds"),
+                               "source": "wp_core_update", "domain": d, "wp_path": wp_path,
+                               "version": current, "ziel": target}, ensure_ascii=False).encode()
+        _wp_run_as_user(client, ctx, ["/bin/sh", "-c", 'umask 077 && cat > "$1"', "sh", f"{bdir}/manifest.json"],
+                        cwd=ctx["home"], stdin_data=manifest)
+        args = ["core", "update"] + ([f"--version={v}"] if v else []) + (["--minor"] if minor_only else [])
+        out, err, rc = _wp_cli_run(client, ctx, wp_dir, args, timeout=_WP_PLUGIN_UPDATE_TIMEOUT)
+        cli_error = _wp_cli_error(out, err, lines=10) if rc != 0 else None
+        _wp_cli_run(client, ctx, wp_dir, ["core", "update-db"], timeout=_WP_PLUGIN_UPDATE_TIMEOUT)
+        now_version, _ = _wp_core_state(client, ctx, wp_dir)
+        http_after, http_detail = _phps_http(d)
+        rolled_back = False
+        rollback_error = None
+        if http_before is not None and http_before < 500 and http_after is not None and http_after >= 500:
+            o1, e1, r1 = _wp_cli_run(client, ctx, wp_dir, ["core", "update", f"--version={current}", "--force"],
+                                     timeout=_WP_PLUGIN_UPDATE_TIMEOUT)
+            o2, e2, r2 = _wp_cli_run(client, ctx, wp_dir, ["db", "import", f"{bdir}/db.sql"],
+                                     timeout=_WP_PLUGIN_UPDATE_TIMEOUT)
+            rolled_back = r1 == 0 and r2 == 0
+            if not rolled_back:
+                rollback_error = _wp_cli_error(o1 + o2, e1 + e2, lines=10)
+            now_version, _ = _wp_core_state(client, ctx, wp_dir)
+            http_after, http_detail = _phps_http(d)
+    finally:
+        client.close()
+    _audit("wp_core_update", domain=d, wp_path=wp_path, alt=current, ziel=target, neu=now_version,
+           rollback=rolled_back, backup_id=backup_id)
+    result.update({"backup_id": backup_id, "backup_ordner": bdir, "version_jetzt": now_version,
+                   "startseite": http_detail})
+    if cli_error:
+        result["wp_cli_fehler"] = cli_error
+    if rolled_back or rollback_error:
+        result["automatisch_zurueckgestellt"] = rolled_back
+        result["ergebnis"] = ("ZURÜCKGESTELLT: Die Startseite lieferte nach dem Update einen 5xx-Fehler - "
+                              f"WordPress {current} und Datenbank wiederhergestellt."
+                              if rolled_back else
+                              "ACHTUNG: 5xx nach dem Update und Zurückstellen fehlgeschlagen!")
+        if rollback_error:
+            result["fehler"] = rollback_error
+    elif now_version != target:
+        result["ergebnis"] = f"Nicht aktualisiert (jetzt {now_version}, erwartet {target})."
+    else:
+        result["ergebnis"] = f"WordPress von {current} auf {now_version} aktualisiert und kontrolliert."
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+@_wp_reporting
+def wptc_set_revision_limit(domain: str, wp_path: str, days: int = 30, confirm: bool = False) -> str:
+    """Setzt bei WP Time Capsule die Speicherdauer der Sicherungen
+    (revision_limit, in Tagen) direkt in der WPTC-Tabelle der Installation.
+
+    domain/wp_path wie bei den übrigen wp_*-Tools. days: 1..365 (Vorgabe 30).
+    Ohne confirm=true nur Vorschau (alter und neuer Wert). Danach Kontrolle.
+    """
+    if not isinstance(days, int) or not _WPTC_MIN_DAYS <= days <= _WPTC_MAX_DAYS:
+        raise ValueError(f"days muss zwischen {_WPTC_MIN_DAYS} und {_WPTC_MAX_DAYS} liegen.")
+    d = _wp_domain(domain)
+    client = _ssh_connect()
+    try:
+        ctx = _wp_context(client, d)
+        sftp = client.open_sftp()
+        try:
+            wp_dir = _wp_install_dir(sftp, d, wp_path)
+        finally:
+            sftp.close()
+        prefix = _wp_cli(client, ctx, wp_dir, ["db", "prefix"]).strip().splitlines()[-1].strip()
+        if not re.match(r"^[A-Za-z0-9_]{0,64}$", prefix):
+            raise ValueError(f"Unerwarteter Tabellen-Präfix {prefix!r}.")
+        table = f"{prefix}wptc_options"
+        q = f"SELECT value FROM `{table}` WHERE name='revision_limit'"
+        out, err, rc = _wp_cli_run(client, ctx, wp_dir, ["db", "query", q, "--skip-column-names"])
+        if rc != 0:
+            raise ValueError(f"WP Time Capsule nicht gefunden ({_wp_cli_error(out, err)}).")
+        old = out.strip().splitlines()[-1].strip() if out.strip() else None
+        result: dict[str, Any] = {"domain": d, "wp_path": wp_dir, "alt": old, "neu": str(days)}
+        if old == str(days):
+            result["ergebnis"] = "Unverändert - bereits gesetzt."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        if not confirm:
+            result["ergebnis"] = "Vorschau - nichts geändert. Mit confirm=true ausführen."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        sql = (f"UPDATE `{table}` SET value='{days}' WHERE name='revision_limit'" if old is not None else
+               f"INSERT INTO `{table}` (name, value) VALUES ('revision_limit', '{days}')")
+        out, err, rc = _wp_cli_run(client, ctx, wp_dir, ["db", "query", sql])
+        if rc != 0:
+            raise SSHError(f"Schreiben fehlgeschlagen: {_wp_cli_error(out, err)}")
+        out, _, _ = _wp_cli_run(client, ctx, wp_dir, ["db", "query", q, "--skip-column-names"])
+        now = out.strip().splitlines()[-1].strip() if out.strip() else None
+    finally:
+        client.close()
+    _audit("wptc_set_revision_limit", domain=d, wp_path=wp_path, alt=old, neu=now)
+    result["kontrolle"] = now
+    result["ergebnis"] = "Gesetzt und kontrolliert." if now == str(days) else "ACHTUNG: Kontrolle weicht ab."
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 # ---------------------------------------------------------------------------

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.34
+
+- Neues Tool `wp_sites_overview(filter, max_backup_age_days)`: findet alle WordPress-Installationen auf dem Server (wp-config.php unter /var/www/vhosts, unabhängig vom WP Toolkit) und liefert pro Installation `domain` + `wp_path` für die übrigen `wp_*`-Tools, URL, WordPress-Version, Datenbank sowie - wenn WP Time Capsule installiert ist - Speicherdauer, Backup-Ziel und letzte erfolgreiche Sicherung (`backup_alt`, wenn älter als `max_backup_age_days`). Rein lesend.
+- Neues Tool `wp_core_update(domain, wp_path, version, minor_only, confirm)`: WordPress-Core-Update per WP-CLI als System-User. Vorher Datenbank-Export unter `.plesk-mcp/wp-core-backups/<backup_id>/`, danach `wp core update-db`, Kontrolle von Version und Startseite; bei neuem 5xx automatisches Zurückstellen auf die alte Version inkl. Datenbank. Ohne `confirm=true` nur Vorschau, Eintrag im Audit-Log.
+- Neues Tool `wptc_set_revision_limit(domain, wp_path, days, confirm)`: setzt die WPTC-Speicherdauer (1..365 Tage) in der WPTC-Tabelle der Installation, mit Vorschau, Kontrolle und Audit-Log.
+- Tests: `tests/test_wp_core_wptc.py`.
+
 ## 0.33
 
 - Neues Tool `domain_create(domain, owner, service_plan, ip, notify, confirm)`: legt eine Domain als neue Subscription ohne Hosting an (`plesk bin subscription --create <domain> -owner <login> -service-plan <plan> -ip <ip> -hosting false -notify false`). Danach können die DNS-Records mit den `dns_*`-Tools gesetzt werden.
