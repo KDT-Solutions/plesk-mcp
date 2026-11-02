@@ -70,6 +70,7 @@ import sys
 import threading
 import time
 import contextvars
+from collections import deque
 from typing import Any
 
 import paramiko
@@ -11428,6 +11429,58 @@ def pagespeed_insights(
 # HTTP-Transport (Cloud/Docker) mit Bearer-Auth
 # ---------------------------------------------------------------------------
 
+# Brute-Force-Bremse: nach AUTH_MAX_FAILURES falschen Tokens innerhalb von AUTH_FAILURE_WINDOW
+# Sekunden bekommen unauthentifizierte Requests 429 statt 401. Requests mit gültigem Token
+# werden nie gebremst. Einfacher In-Memory-Zähler über alle Quellen (hinter dem Reverse-Proxy
+# ist die Client-IP ohne vertrauenswürdige Forwarded-Header ohnehin nicht zuverlässig).
+# /healthz und /upload/ (eigenes Rate-Limit) laufen nicht über diese Bremse.
+_AUTH_MAX_FAILURES_DEFAULT = 10
+_AUTH_FAILURE_WINDOW_DEFAULT = 600.0
+
+
+def _auth_limit_setting(name: str, default, cast):
+    """Env-Wert als int/float, ungültige oder nicht-positive Werte -> Default (kein Absturz)."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = cast(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+AUTH_MAX_FAILURES = _auth_limit_setting("AUTH_MAX_FAILURES", _AUTH_MAX_FAILURES_DEFAULT, int)
+AUTH_FAILURE_WINDOW = _auth_limit_setting("AUTH_FAILURE_WINDOW", _AUTH_FAILURE_WINDOW_DEFAULT, float)
+
+_auth_log = logging.getLogger("plesk_mcp.auth")
+
+
+class _AuthFailureLimiter:
+    """Zählt fehlgeschlagene Token-Prüfungen in einem gleitenden Zeitfenster (prozessweit, thread-sicher)."""
+
+    def __init__(self, max_failures: int | None = None, window: float | None = None):
+        self.max_failures = max_failures if max_failures is not None else AUTH_MAX_FAILURES
+        self.window = window if window is not None else AUTH_FAILURE_WINDOW
+        self._failures: deque = deque()
+        self._lock = threading.Lock()
+
+    def _prune(self, now: float) -> None:
+        while self._failures and now - self._failures[0] > self.window:
+            self._failures.popleft()
+
+    def blocked(self) -> bool:
+        with self._lock:
+            self._prune(time.monotonic())
+            return len(self._failures) >= self.max_failures
+
+    def record_failure(self) -> int:
+        with self._lock:
+            now = time.monotonic()
+            self._prune(now)
+            self._failures.append(now)
+            return len(self._failures)
+
 
 def _build_http_app():
     from mcp.server.transport_security import TransportSecuritySettings
@@ -11449,11 +11502,13 @@ def _build_http_app():
     )
 
     class _BearerAuthMiddleware:
-        """Minimalistische ASGI-Middleware: prüft 'Authorization: Bearer <token>'."""
+        """Minimalistische ASGI-Middleware: prüft 'Authorization: Bearer <token>' timing-sicher
+        (hmac.compare_digest) und bremst wiederholte Fehlversuche (429)."""
 
-        def __init__(self, app, token: str):
+        def __init__(self, app, token: str, limiter: _AuthFailureLimiter | None = None):
             self.app = app
             self.expected = f"Bearer {token}".encode("latin-1", errors="replace")
+            self.limiter = limiter or _AuthFailureLimiter()
 
         async def __call__(self, scope, receive, send):
             if scope["type"] != "http":
@@ -11461,12 +11516,23 @@ def _build_http_app():
                 return
             headers = dict(scope.get("headers", []))
             auth_header = headers.get(b"authorization", b"")
-            # Zeitkonstanter Vergleich (kein Abbruch beim ersten abweichenden Byte)
-            if not hmac.compare_digest(auth_header, self.expected):
-                response = JSONResponse({"error": "unauthorized"}, status_code=401)
-                await response(scope, receive, send)
+            # Zeitkonstanter Vergleich (kein Abbruch beim ersten abweichenden Byte);
+            # gültiges Token vor der Sperrprüfung, damit es nie gebremst wird.
+            if hmac.compare_digest(auth_header, self.expected):
+                await self.app(scope, receive, send)
                 return
-            await self.app(scope, receive, send)
+            client = (scope.get("client") or ("?",))[0]
+            if self.limiter.blocked():
+                _auth_log.warning("Auth gesperrt (zu viele Fehlversuche), Quelle %s, Pfad %s",
+                                  client, scope.get("path"))
+                response = JSONResponse({"error": "too many failed attempts"}, status_code=429,
+                                        headers={"Retry-After": str(int(self.limiter.window))})
+            else:
+                count = self.limiter.record_failure()
+                _auth_log.warning("Auth fehlgeschlagen (%d/%d), Quelle %s, Pfad %s", count,
+                                  self.limiter.max_failures, client, scope.get("path"))
+                response = JSONResponse({"error": "unauthorized"}, status_code=401)
+            await response(scope, receive, send)
 
     secured_app = _BearerAuthMiddleware(starlette_app, _MCP_API_KEY)
     # CORS aussen um die Auth-Middleware: Browser-basierte MCP-Clients (z.B.

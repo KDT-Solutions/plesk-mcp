@@ -57,6 +57,8 @@ Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven K
 | `REPLACE_MAX_BYTES` | nein | `5242880` | Maximale Dateigrösse in Bytes für `replace_in_vhost_file(s)` (Standard 5 MB) |
 | `AUDIT_LOG_FILE` | nein | – | Optionaler Pfad im Container für das Audit-Log (zusätzlich zu stderr) |
 | `MCP_API_KEY` | ja | – | Statisches Bearer-Token zum Schutz des öffentlichen Endpoints, mindestens 32 Zeichen Zufall (z.B. `python -c "import secrets; print(secrets.token_urlsafe(32))"`). Ohne Token oder mit kürzerem Token startet der Server nicht (fail-safe) |
+| `AUTH_MAX_FAILURES` | nein | `10` | Brute-Force-Bremse: nach so vielen fehlgeschlagenen Bearer-Prüfungen innerhalb von `AUTH_FAILURE_WINDOW` antwortet der Server auf Requests ohne gültiges Token mit `429` statt `401` (ungültiger Wert = Standard) |
+| `AUTH_FAILURE_WINDOW` | nein | `600` | Zeitfenster der Brute-Force-Bremse in Sekunden, gleitend; wird auch als `Retry-After` gesendet (ungültiger Wert = Standard) |
 | `MCP_HOST` | nein | `0.0.0.0` | Bind-Adresse des HTTP-Servers *innerhalb* des Containers |
 | `MCP_PORT` | nein | `8000` | Port des HTTP-Servers *innerhalb* des Containers |
 | `MCP_BIND_ADDR` | nein | `0.0.0.0` | Bind-Adresse *auf dem Docker-Host* (docker-compose Port-Mapping) |
@@ -88,6 +90,7 @@ Der Container bindet standardmässig auf `0.0.0.0:8422` auf dem Docker-Host (all
 
 - Der Server startet nur, wenn `MCP_API_KEY` gesetzt und mindestens 32 Zeichen lang ist - es gibt also nie einen ungeschützten oder nur schwach geschützten öffentlichen Endpoint.
 - Jeder HTTP-Request muss den Header `Authorization: Bearer <MCP_API_KEY>` mitschicken, sonst Antwort `401 unauthorized`. Der Vergleich ist zeitkonstant (`hmac.compare_digest`).
+- Brute-Force-Bremse: nach `AUTH_MAX_FAILURES` (Standard 10) fehlgeschlagenen Token-Prüfungen innerhalb von `AUTH_FAILURE_WINDOW` Sekunden (Standard 600, gleitendes Fenster) bekommen Requests ohne gültiges Token `429 {"error": "too many failed attempts"}` mit `Retry-After`. Requests mit gültigem Token werden nie gebremst (Token-Prüfung vor der Sperrprüfung). Der Zähler ist prozessweit und bewusst nicht pro IP (hinter dem Reverse-Proxy ist die Client-IP nur aus Headern bekannt); jeder Fehlversuch und jede Sperre wird als WARNING mit Quelle und Pfad geloggt, nie das Token. `/healthz` und `/upload/` (eigenes Rate-Limit) sind davon ausgenommen.
 - Der SSH-Host-Key des Plesk-Servers muss gepinnt sein (`PLESK_SSH_HOST_KEY` oder `PLESK_SSH_KNOWN_HOSTS`), sonst startet der Server nicht; ein abweichender Key führt zum Verbindungsabbruch mit beiden Fingerprints in der Meldung. Ein automatisches Akzeptieren beim ersten Connect gibt es nicht (bei Passwort-Authentifizierung könnte ein MITM sonst das Root-Passwort abgreifen).
 - Jedes SSH-Kommando hat ein Inaktivitäts-Timeout (`PLESK_SSH_TIMEOUT` bzw. der Wert des Tools), eine harte Gesamtlaufzeit (`PLESK_SSH_MAX_RUNTIME`) und eine Ausgabe-Obergrenze von 4 MB je Strom - danach wird der Kanal geschlossen und die Ausgabe als gekürzt markiert. `search_log`/`search_main_nginx_log` klemmen `lines` auf 1..5000.
 - Der Container läuft als Non-Root-User (UID 10001); gemountete Dateien (SSH-Key, known_hosts, Audit-Log) müssen für diesen User lesbar bzw. schreibbar sein. Abhängigkeiten sind in `requirements.txt` exakt gepinnt.

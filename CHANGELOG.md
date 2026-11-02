@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.35.1
+
+- Brute-Force-Bremse für das Bearer-Token: nach `AUTH_MAX_FAILURES` (Standard 10) fehlgeschlagenen Token-Prüfungen innerhalb von `AUTH_FAILURE_WINDOW` Sekunden (Standard 600, gleitendes Fenster, prozessweit) antwortet der Server auf Requests ohne gültiges Token mit `429 {"error": "too many failed attempts"}` und `Retry-After` statt `401`. Requests mit gültigem Token werden nie gebremst; `/healthz` und `/upload/` (eigenes Rate-Limit) bleiben unverändert. Fehlversuche und Sperren werden als WARNING (Quelle, Pfad) geloggt, nie das Token. Ungültige Env-Werte fallen auf den Standard zurück.
+- Tests: `tests/test_http_auth.py` (401 bis zur Grenze, 429 mit `Retry-After`, gültiges Token trotz Sperre, Env-Override).
+
 ## 0.35
 
 - `wc_order_get`: liefert pro Position `backordered` (Menge im Lieferrückstand, WooCommerce-Positions-Meta "Backordered" in der Shop-Sprache) und für die Bestellung `backordered` true/false, dazu `label_tracking_list` mit allen Etiketten der Bestellung (Label-Plugin, eine Nummer pro Etikett, das letzte zuletzt; `label_tracking` bleibt das zuletzt erstellte).
