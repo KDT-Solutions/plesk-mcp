@@ -56,6 +56,8 @@ services:
       - AUDIT_LOG_FILE=${AUDIT_LOG_FILE:-}
       # Mindestens 32 Zeichen, sonst kein Start
       - MCP_API_KEY=${MCP_API_KEY}
+      - AUTH_MAX_FAILURES=${AUTH_MAX_FAILURES:-10}
+      - AUTH_FAILURE_WINDOW=${AUTH_FAILURE_WINDOW:-600}
       - MCP_HOST=0.0.0.0
       - MCP_PORT=8000
     ports:

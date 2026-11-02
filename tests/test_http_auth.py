@@ -83,6 +83,68 @@ def test_bearer_compared_time_constant(http_client, monkeypatch):
     assert (b"Bearer wrong", f"Bearer {API_KEY}".encode()) in seen
 
 
+# --- Brute-Force-Bremse -----------------------------------------------------------
+
+def test_rate_limit_after_failures(http_client, monkeypatch):
+    bad = {**HEADERS, "Authorization": "Bearer wrong"}
+    good = {**HEADERS, "Authorization": f"Bearer {API_KEY}"}
+    for _ in range(server.AUTH_MAX_FAILURES):
+        resp = http_client.post("/mcp", json=init_request(), headers=bad)
+        assert resp.status_code == 401 and resp.json() == {"error": "unauthorized"}
+    resp = http_client.post("/mcp", json=init_request(), headers=bad)
+    assert resp.status_code == 429
+    assert resp.json() == {"error": "too many failed attempts"}
+    assert resp.headers["Retry-After"] == str(int(server.AUTH_FAILURE_WINDOW))
+    assert http_client.get("/").status_code == 429  # ohne Token ebenfalls gebremst
+    # gueltiges Token wird nie gebremst, /healthz bleibt frei
+    assert http_client.post("/mcp", json=init_request(), headers=good).status_code == 200
+    assert http_client.get("/healthz").status_code == 200
+    # nach Ablauf des Fensters wieder 401
+    now = server.time.monotonic()
+    monkeypatch.setattr(server.time, "monotonic", lambda: now + server.AUTH_FAILURE_WINDOW + 1)
+    assert http_client.post("/mcp", json=init_request(), headers=bad).status_code == 401
+
+
+def test_rate_limit_defaults():
+    lim = server._AuthFailureLimiter()
+    assert lim.max_failures == 10 and lim.window == 600.0
+
+
+def test_rate_limit_logs_without_token(http_client, caplog):
+    caplog.set_level("WARNING", logger="plesk_mcp.auth")
+    http_client.post("/mcp", json=init_request(), headers={**HEADERS, "Authorization": "Bearer geheim-xyz"})
+    assert any("Auth fehlgeschlagen (1/" in r.getMessage() for r in caplog.records)
+    assert "geheim-xyz" not in caplog.text
+
+
+def test_failure_limiter_window():
+    lim = server._AuthFailureLimiter(max_failures=2, window=100)
+    assert not lim.blocked()
+    lim._failures.extend([0.0, 1.0])
+    assert lim.blocked() is (server.time.monotonic() - 1.0 <= 100)
+
+
+def test_rate_limit_env_override(monkeypatch):
+    monkeypatch.setenv("AUTH_MAX_FAILURES", "2")
+    monkeypatch.setenv("AUTH_FAILURE_WINDOW", "30")
+    monkeypatch.setattr(server, "AUTH_MAX_FAILURES", server._auth_limit_setting("AUTH_MAX_FAILURES", 10, int))
+    monkeypatch.setattr(server, "AUTH_FAILURE_WINDOW", server._auth_limit_setting("AUTH_FAILURE_WINDOW", 600.0, float))
+    assert server.AUTH_MAX_FAILURES == 2 and server.AUTH_FAILURE_WINDOW == 30.0
+    monkeypatch.setattr(server, "_MCP_API_KEY", API_KEY)
+    bad = {**HEADERS, "Authorization": "Bearer wrong"}
+    with TestClient(server._build_http_app(), base_url="https://mcp.example.com") as client:
+        assert client.post("/mcp", json=init_request(), headers=bad).status_code == 401
+        assert client.post("/mcp", json=init_request(), headers=bad).status_code == 401
+        resp = client.post("/mcp", json=init_request(), headers=bad)
+        assert resp.status_code == 429 and resp.headers["Retry-After"] == "30"
+
+
+@pytest.mark.parametrize("raw", ["", "abc", "0", "-5", "1.5"])
+def test_rate_limit_env_invalid_falls_back(monkeypatch, raw):
+    monkeypatch.setenv("AUTH_MAX_FAILURES", raw)
+    assert server._auth_limit_setting("AUTH_MAX_FAILURES", 10, int) == 10
+
+
 def _startup(monkeypatch, key=API_KEY, host_key="ssh-ed25519 AAAA", known_hosts="", public="", proxies=frozenset()):
     monkeypatch.setattr(server, "_MCP_API_KEY", key)
     monkeypatch.setattr(server, "_SSH_HOST_KEY", host_key)
