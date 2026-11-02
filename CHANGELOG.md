@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.35
+
+- `wc_order_get`: liefert pro Position `backordered` (Menge im Lieferrückstand, WooCommerce-Positions-Meta "Backordered" in der Shop-Sprache) und für die Bestellung `backordered` true/false, dazu `label_tracking_list` mit allen Etiketten der Bestellung (Label-Plugin, eine Nummer pro Etikett, das letzte zuletzt; `label_tracking` bleibt das zuletzt erstellte).
+- `wc_order_mark_shipped`: neuer Parameter `status` (Slug ohne `wc-`, z.B. `partial-shipped` für "Teilweise versendet" bei Teillieferungen mit Rückstand). Der Status muss im Shop registriert sein (`wc_get_order_statuses`), sonst Abbruch ohne Statusänderung; leer = wie bisher nach `set_completed`. Vorschau zeigt `status_ziel`.
+- Tests: `tests/test_wc_order.py` (Validierung, PHP-Vorlagen gegen WooCommerce-Stubs).
+
 ## 0.34
 
 - Neues Tool `wp_sites_overview(filter, max_backup_age_days)`: findet alle WordPress-Installationen auf dem Server (wp-config.php unter /var/www/vhosts, unabhängig vom WP Toolkit) und liefert pro Installation `domain` + `wp_path` für die übrigen `wp_*`-Tools, URL, WordPress-Version, Datenbank sowie - wenn WP Time Capsule installiert ist - Speicherdauer, Backup-Ziel und letzte erfolgreiche Sicherung (`backup_alt`, wenn älter als `max_backup_age_days`). Rein lesend.
