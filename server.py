@@ -2034,8 +2034,9 @@ def write_vhost_file(
     ACHTUNG - schreibt auf einem Produktivserver: erfordert confirm=true als
     bewusste Bestätigung PRO Aufruf (keine globale Freischaltung). Existiert
     die Zieldatei bereits, wird vorher automatisch ein Backup als
-    "<path>.bak-<YYYYMMDDHHMMSS>" im selben Verzeichnis angelegt (siehe
-    delete_vhost_backup zum späteren Aufräumen, sobald die Änderung verifiziert ist).
+    "<path>.bak-<YYYYMMDDHHMMSS>" im selben Verzeichnis angelegt (Rechte 0600,
+    vom Webserver nicht auslieferbar; siehe delete_vhost_backup zum späteren
+    Aufräumen, sobald die Änderung verifiziert ist).
     Ist der Zielpfad bereits ein Symlink, wird aus Sicherheitsgründen
     abgebrochen (kein Überschreiben durch Symlinks hindurch).
     Besitzer/Rechte: Bestehende Dateien (und ihr Backup) behalten Besitzer,
@@ -2210,7 +2211,8 @@ def replace_in_vhost_file(
 
     ACHTUNG - schreibt auf einem Produktivserver: erfordert confirm=true als
     bewusste Bestätigung PRO Aufruf. Vor dem Schreiben wird automatisch ein
-    Backup "<path>.bak-<YYYYMMDDHHMMSS>" angelegt (siehe delete_vhost_backup),
+    Backup "<path>.bak-<YYYYMMDDHHMMSS>" angelegt (Rechte 0600, vom Webserver
+    nicht auslieferbar; siehe delete_vhost_backup),
     danach wird atomar ersetzt (Temp-Datei + rename). Sicherheitsregeln wie
     write_vhost_file/upload_begin: domain muss die Hauptdomain einer
     Subscription sein, kein "..", keine absoluten Pfade, geschützte Bereiche
@@ -2618,6 +2620,13 @@ def rename(sfd, sname, dfd, dname):
         raise
 
 
+# Backups (.bak-<Zeitstempel>) liegen neben der Datei, oft im Docroot. Mit 0600
+# kann nur der Abo-User sie lesen; nginx/Apache liefern sie nicht aus (403),
+# sonst würde z.B. die Kopie einer wp-config.php oder config.php samt
+# Passwörtern als Klartext ausgeliefert.
+BACKUP_MODE = 0o600
+
+
 def copy_file(dfd, src_name, dst_name, uid, gid, mode, expect_ino):
     """Kopiert eine reguläre Datei im selben Ordner (Backup), ohne Symlinks."""
     sfd = os.open(src_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dfd)
@@ -2825,7 +2834,7 @@ def op_put(a):
         backup = None
         if p["exists"]:
             backup = name + ".bak-" + time.strftime("%Y%m%d%H%M%S")
-            copy_file(dfd, name, backup, uid, gid, mode, p["ino"])
+            copy_file(dfd, name, backup, uid, gid, BACKUP_MODE, p["ino"])
             rename(dfd, tmp, dfd, name)
         else:
             rename_noreplace(dfd, tmp, dfd, name)
@@ -3028,6 +3037,13 @@ def op_move(a):
             raise HErr("changed", join(src))
         if dst_st is None:
             rename_noreplace(spfd, src[-1], dpfd, dst[-1])
+            if BAK_RE.search(src[-1]) and not BAK_RE.search(dst[-1]) and stat.S_ISREG(sst.st_mode):
+                # Backup an einen neuen Namen zurückgespielt: übliche Dateirechte statt 0600.
+                rfd = os.open(dst[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dpfd)
+                try:
+                    os.fchmod(rfd, 0o644)
+                finally:
+                    os.close(rfd)
         else:
             if not a.get("overwrite"):
                 raise HErr("exists", join(dst))
@@ -3036,8 +3052,16 @@ def op_move(a):
             if not stat.S_ISREG(dst_st.st_mode) or stat.S_ISDIR(sst.st_mode):
                 raise HErr("target_not_file", join(dst))
             backup = dst[-1] + ".bak-" + time.strftime("%Y%m%d%H%M%S")
-            copy_file(dpfd, dst[-1], backup, dst_st.st_uid, dst_st.st_gid, stat.S_IMODE(dst_st.st_mode), dst_st.st_ino)
+            copy_file(dpfd, dst[-1], backup, dst_st.st_uid, dst_st.st_gid, BACKUP_MODE, dst_st.st_ino)
             rename(spfd, src[-1], dpfd, dst[-1])
+            if BAK_RE.search(src[-1]) and stat.S_ISREG(sst.st_mode):
+                # Backup zurückgespielt: wieder die Rechte der ersetzten Datei,
+                # nicht die 0600 des Backups (sonst z.B. CSS/JS nicht mehr auslieferbar).
+                rfd = os.open(dst[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dpfd)
+                try:
+                    os.fchmod(rfd, stat.S_IMODE(dst_st.st_mode))
+                finally:
+                    os.close(rfd)
             backup = join(dst[:-1] + [backup])
         os.fsync(dpfd)
         return {"created": created, "backup": backup, "type": info["type"], "files": info["files"]}
@@ -3416,7 +3440,7 @@ def op_replace(a):
                 for k in range(10):
                     it["backup"] = name + ".bak-" + time.strftime("%Y%m%d%H%M%S", time.localtime(now + k))
                     try:
-                        write_tmp(dfd, it["backup"], it["data"], p["uid"], p["gid"], p["mode"])
+                        write_tmp(dfd, it["backup"], it["data"], p["uid"], p["gid"], BACKUP_MODE)
                         break
                     except OSError as e:
                         if e.errno != errno.EEXIST:
@@ -3840,7 +3864,7 @@ def upload_begin(
     max_bytes verkleinert das Server-Limit, sha256 (optional) wird nach dem
     Upload geprüft - bei Abweichung wird nichts ersetzt. Ausführbare Dateien
     (.php, .htaccess, ...) nur mit allow_executable=true. Bestehende Dateien
-    werden als <path>.bak-<Zeitstempel> gesichert. Erfordert confirm=true.
+    werden als <path>.bak-<Zeitstempel> gesichert (Rechte 0600). Erfordert confirm=true.
     Status danach mit upload_status(upload_id) prüfen.
     """
     if not confirm:
@@ -4186,7 +4210,9 @@ def move_vhost_file(
     nur innerhalb desselben Docroots derselben Domain (src/dst relativ zu
     /var/www/vhosts/<domain>/, z.B. "httpdocs/alt.jpg"). Existiert dst, wird
     abgebrochen, ausser overwrite=true (nur für Dateien; dst wird vorher als
-    .bak-<Zeitstempel> gesichert). create_parents legt fehlende Zielordner
+    .bak-<Zeitstempel> gesichert, Rechte 0600; wird ein .bak-Backup zurück-
+    verschoben, bekommt es wieder die Rechte der ersetzten Datei bzw. 0644).
+    create_parents legt fehlende Zielordner
     an. Ausführbare Dateien (.php, .htaccess, ...) nur mit
     allow_executable=true. Symlinks werden nur selbst verschoben. Erfordert
     confirm=true.
