@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.35.2
+
+- Sicherheit: Backups, die `write_vhost_file`, `replace_in_vhost_file(s)`, `upload_begin` und `move_vhost_file` (overwrite) als `<datei>.bak-<Zeitstempel>` neben der Datei anlegen, bekommen jetzt immer die Rechte `0600` (Besitzer bleibt der Abo-User). Vorher übernahmen sie die Rechte des Originals (meist `0644`) und lagen damit im Docroot für nginx/Apache lesbar: Die Kopie einer `.php`-Datei mit Zugangsdaten (z.B. `config.php`, `wp-config.php`) wurde unter `…/config.php.bak-…` als Klartext ausgeliefert.
+- Wird ein `.bak-`Backup mit `move_vhost_file` zurückgespielt, bekommt die Datei wieder die Rechte der ersetzten Datei (bzw. `0644` bei neuem Namen), damit z.B. CSS/JS weiter ausgeliefert werden.
+- Tests: Backup-Rechte bei Upload, Ersetzen und Zurückspielen.
+
 ## 0.35.1
 
 - Brute-Force-Bremse für das Bearer-Token: nach `AUTH_MAX_FAILURES` (Standard 10) fehlgeschlagenen Token-Prüfungen innerhalb von `AUTH_FAILURE_WINDOW` Sekunden (Standard 600, gleitendes Fenster, prozessweit) antwortet der Server auf Requests ohne gültiges Token mit `429 {"error": "too many failed attempts"}` und `Retry-After` statt `401`. Requests mit gültigem Token werden nie gebremst; `/healthz` und `/upload/` (eigenes Rate-Limit) bleiben unverändert. Fehlversuche und Sperren werden als WARNING (Quelle, Pfad) geloggt, nie das Token. Ungültige Env-Werte fallen auf den Standard zurück.

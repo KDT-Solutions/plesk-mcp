@@ -96,7 +96,8 @@ def test_permissions_unchanged(vhost):
     assert (after.st_uid, after.st_gid, after.st_mode) == (before.st_uid, before.st_gid, before.st_mode)
     assert res["rechte"] == "0600"
     bst = os.stat(baks(vhost / "httpdocs", "config.php")[0])
-    assert (bst.st_uid, bst.st_gid, bst.st_mode) == (before.st_uid, before.st_gid, before.st_mode)
+    assert (bst.st_uid, bst.st_gid) == (before.st_uid, before.st_gid)
+    assert bst.st_mode & 0o777 == 0o600  # Backup nie vom Webserver lesbar
 
 
 def test_no_match(vhost):

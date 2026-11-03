@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import pwd
+import stat
 import subprocess
 import sys
 import time
@@ -492,3 +493,20 @@ def test_list_vhost_dir(vhost):
         (vhost / "httpdocs/img" / f"f{i:03d}").write_text("x")
     res = json.loads(server.list_vhost_dir(DOMAIN, "httpdocs", depth=3))
     assert len(res["entries"]) == 500 and "hinweis" in res
+
+
+def test_backups_not_web_readable_and_restore_keeps_mode(client, vhost):
+    """Backups neben der Datei sind 0600 (Webserver darf sie nicht ausliefern);
+    ein zurückgespieltes Backup bekommt wieder die Rechte der Datei."""
+    f = vhost / "httpdocs/old.txt"
+    os.chmod(f, 0o644)
+    info = begin("httpdocs/old.txt")
+    assert put(client, info, b"neu").status_code == 200
+    bak = next(p for p in (vhost / "httpdocs").iterdir() if p.name.startswith("old.txt.bak-"))
+    assert stat.S_IMODE(os.stat(bak).st_mode) == 0o600
+    assert stat.S_IMODE(os.stat(f).st_mode) == 0o644
+    res = json.loads(server.move_vhost_file(DOMAIN, f"httpdocs/{bak.name}", "httpdocs/old.txt",
+                                            overwrite=True, confirm=True))
+    assert f.read_text() == "old"
+    assert stat.S_IMODE(os.stat(f).st_mode) == 0o644
+    assert stat.S_IMODE(os.stat(vhost / res["backup_ueberschriebenes_ziel"]).st_mode) == 0o600
