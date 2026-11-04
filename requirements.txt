@@ -3,3 +3,6 @@ paramiko==5.1.0
 httpx==0.28.1
 starlette==1.8.0
 uvicorn==0.54.0
+# WordPress-Tools (wpsite): Word-Umwandlung für wp_docx_to_content
+mammoth==1.13.0
+beautifulsoup4==4.15.0
