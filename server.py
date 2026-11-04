@@ -35,7 +35,10 @@ dns_update_record kombiniert beides für einen bestehenden Record).
 imunify_ignore_add/imunify_ignore_remove ändern ausschliesslich die
 Imunify360-Malware-Ignore-Liste (nur Pfade unter /var/www/vhosts/),
 wp_option_update/wp_option_rollback einzelne freigegebene WordPress-Optionen
-(per WP-CLI als Subscription-User). Alle schreibenden Tools erfordern zwingend confirm=true pro Aufruf
+(per WP-CLI als Subscription-User). Dazu kommen die WordPress-Tools aus wpsite/
+(wp_post_*, wp_elementor_*, wp_menu_*, wp_user_* usw., wie im WordPress-MCP,
+ohne Plugin auf der Seite), deren schreibende Varianten ebenfalls nur mit
+confirm=true ändern und vorher sichern. Alle schreibenden Tools erfordern zwingend confirm=true pro Aufruf
 (keine globale Freischaltung), write_vhost_file und die replace_*-Tools legen
 vor dem Überschreiben automatisch ein Backup der alten Version an.
 
@@ -89,8 +92,8 @@ _MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 # Commit mit einer neuen Basis ergibt also <Basis>.0.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.35"
-_VERSION_PATHS = ["server.py", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
+_VERSION_BASE = "0.36"
+_VERSION_PATHS = ["server.py", "wpsite", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
 def _read_version() -> str:
@@ -11600,6 +11603,105 @@ async def _run_http_server() -> None:
     if _TRASH_AUTOCLEAN_DAYS > 0:
         threading.Thread(target=_trash_autoclean, daemon=True).start()
     await srv.serve()
+
+
+# ---------------------------------------------------------------------------
+# WordPress-Tools wie im WordPress-MCP (wp_post_list, wp_elementor_*, wp_menu_*,
+# wp_user_* ...), ohne Plugin auf der Seite: Der Code des Plugins tabside-mcp
+# liegt im Image (wpsite/php/) und läuft pro Aufruf per `wp eval-file -` als
+# System-User der Subscription. Details in wpsite/__init__.py.
+# ---------------------------------------------------------------------------
+
+import wpsite  # noqa: E402
+from wpsite.common import ToolRunner as _WPSiteRunner  # noqa: E402
+from wpsite.tools import register_all as _wpsite_register_all  # noqa: E402
+
+_WPSITE_TIMEOUT = int(os.environ.get("WPSITE_TIMEOUT", "180"))
+_WPSITE_MAX_RESPONSE_KB = int(os.environ.get("WPSITE_MAX_RESPONSE_KB", "500"))
+_WPSITE_MAX_FILE_MB = int(os.environ.get("WPSITE_MAX_FILE_MB", "20"))
+
+
+def _wpsite_parse(site: str) -> tuple[str, str | None]:
+    """'example.com' -> (Domain, None = Webroot der Domain),
+    'example.com:httpdocs/blog' -> (Domain, 'httpdocs/blog')."""
+    raw = (site or "").strip()
+    domain, sep, path = raw.partition(":")
+    d = _wp_domain(domain)
+    if not sep:
+        return d, None
+    path = path.strip().strip("/")
+    if not path:
+        raise ValueError(f"Nach ':' fehlt das WordPress-Verzeichnis (z.B. {d}:httpdocs).")
+    return d, path
+
+
+def _wpsite_check(site: str) -> None:
+    _wpsite_parse(site)
+
+
+def _wpsite_docroot(client: paramiko.SSHClient, domain: str) -> str:
+    """Webroot der Domain relativ zu /var/www/vhosts/<domain>/."""
+    sql = (
+        "SELECT h.www_root FROM domains d JOIN hosting h ON h.dom_id = d.id "
+        f"WHERE d.name = {_sql_quote(domain)}"
+    )
+    out, err, rc = _client_exec(client, f"plesk db -Ne {shlex.quote(sql)}")
+    rows = [line.strip() for line in out.strip().splitlines() if line.strip()]
+    if rc != 0 or len(rows) != 1:
+        raise ValueError(f"Webroot von '{domain}' nicht ermittelbar" + (f": {err.strip()}" if err.strip() else "."))
+    base = f"{_VHOST_BASE}/{domain}"
+    root = posixpath.normpath(rows[0])
+    if not root.startswith(base + "/"):
+        raise ValueError(
+            f"Der Webroot von '{domain}' liegt nicht unter {base}/ - die Hauptdomain der Subscription "
+            f"mit Verzeichnis angeben, z.B. hauptdomain.ch:{domain}."
+        )
+    return root[len(base) + 1:]
+
+
+def _wpsite_call(site: str, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+    d, wp_path = _wpsite_parse(site)
+    client = _ssh_connect()
+    try:
+        ctx = _wp_context(client, d)
+        if wp_path is None:
+            wp_path = _wpsite_docroot(client, d)
+        sftp = client.open_sftp()
+        try:
+            wp_dir = _wp_install_dir(sftp, d, wp_path)
+        finally:
+            sftp.close()
+        script = wpsite.build_script(wpsite.ability_name(tool), args)
+        out, err, rc = _wp_cli_run(
+            client, ctx, wp_dir, ["eval-file", "-"], stdin_data=script, timeout=_WPSITE_TIMEOUT
+        )
+    finally:
+        client.close()
+    try:
+        result = wpsite.parse_output(tool, out)
+    except wpsite.WPSiteError as exc:
+        if exc.code in ("pmcp_no_output", "pmcp_bad_output"):
+            raise wpsite.WPSiteError(
+                f"WP-CLI fehlgeschlagen (Exit {rc}): {_wp_cli_error(out, err) or 'keine Ausgabe'}",
+                code=exc.code,
+            ) from exc
+        raise
+    warnings = ctx.get("warnings") or []
+    if warnings:
+        result["php_warnungen"] = {"anzahl": len(warnings), "erste": warnings[:3]}
+    return result
+
+
+_wpsite_runner = _WPSiteRunner(
+    _wpsite_call,
+    _audit,
+    _wpsite_check,
+    max_response_chars=_WPSITE_MAX_RESPONSE_KB * 1024,
+    max_file_bytes=_WPSITE_MAX_FILE_MB * 1024 * 1024,
+)
+_WPSITE_TOOLS = _wpsite_register_all(
+    _mcp_tool, _wpsite_runner, {t.name for t in mcp._tool_manager.list_tools()}
+)
 
 
 def _check_startup_config() -> list[str]:
