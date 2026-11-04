@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.36
+
+- Neu: die WordPress-Tools des WordPress-MCP für alle WordPress-Seiten auf dem Plesk-Server, ohne Plugin auf der Seite (62 Tools, z.B. `wp_post_get`, `wp_post_update`, `wp_elementor_replace_text`, `wp_menu_get`, `wp_user_list`, `wp_user_update`, `wp_media_upload`). Der PHP-Code des Plugins `tabside-mcp` 2.4.1 liegt im Image (`wpsite/php/`) und läuft per `wp eval-file -` als System-User der Subscription, als erster Administrator der Seite. Parameter `site` = Domain oder `domain:<wp_path>`. Vorschau ohne `confirm=true`, Sicherungen und Protokoll in der Datenbank der Seite, zusätzlich Audit-Log `wpsite_write`. Vorhandene gleichnamige Tools des plesk-mcp bleiben unverändert (siehe README).
+- Neue Abhängigkeiten `mammoth` und `beautifulsoup4` (für `wp_docx_to_content`); das Image kopiert zusätzlich `wpsite/`, Änderungen dort lösen den Build aus und zählen zur Version.
+- Tests: `tests/test_wpsite.py` (inkl. optionalem Integrationstest gegen eine lokale WordPress-Installation).
+
 ## 0.35.2
 
 - Sicherheit: Backups, die `write_vhost_file`, `replace_in_vhost_file(s)`, `upload_begin` und `move_vhost_file` (overwrite) als `<datei>.bak-<Zeitstempel>` neben der Datei anlegen, bekommen jetzt immer die Rechte `0600` (Besitzer bleibt der Abo-User). Vorher übernahmen sie die Rechte des Originals (meist `0644`) und lagen damit im Docroot für nginx/Apache lesbar: Die Kopie einer `.php`-Datei mit Zugangsdaten (z.B. `config.php`, `wp-config.php`) wurde unter `…/config.php.bak-…` als Klartext ausgeliefert.
