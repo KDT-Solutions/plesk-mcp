@@ -92,7 +92,7 @@ _MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 # Commit mit einer neuen Basis ergibt also <Basis>.0.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.36"
+_VERSION_BASE = "0.37"
 _VERSION_PATHS = ["server.py", "wpsite", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -1574,7 +1574,70 @@ def customer_update_email(login: str, email: str, confirm: bool = False) -> str:
     return f"Vorher: {current}\n{out}"
 
 
-_SUB_INFO_KEYS = ("Domain name", "Owner's contact name", "Domain status", "Size")
+_DKIM_STATE_RE = re.compile(r"^DKIM Sign Outgoing Mail:\s*(\S+)", re.MULTILINE)
+
+
+def _dkim_state(domain: str) -> str:
+    """DKIM-Signierung der Domain laut `plesk bin domain_pref --info`
+    ("true"/"false"). Wirft, wenn die Domain unbekannt ist."""
+    out, err, code = _ssh_exec(f"plesk bin domain_pref --info {shlex.quote(domain)}")
+    if code != 0:
+        msg = (err.strip() or out.strip()).splitlines()
+        raise ValueError(f"Domain {domain!r} nicht gefunden: {msg[0] if msg else f'exit {code}'}")
+    m = _DKIM_STATE_RE.search(out)
+    if not m:
+        raise ValueError(f"DKIM-Status von {domain!r} nicht lesbar (domain_pref --info).")
+    return m.group(1).lower()
+
+
+def _dkim_dns_records(domain: str) -> str:
+    out, _, code = _ssh_exec(f"plesk bin dns --info {shlex.quote(domain)}")
+    if code != 0:
+        return "(DNS-Zone nicht lesbar)"
+    lines = [ln.strip() for ln in out.splitlines() if "_domainkey" in ln]
+    return "\n".join(lines) or "(kein _domainkey-Record in der Plesk-Zone)"
+
+
+@mcp.tool()
+def mail_dkim_set(domain: str, enabled: bool = True, confirm: bool = False) -> str:
+    """Schaltet die DKIM-Signierung ausgehender Mails einer Domain ein oder
+    aus. Entspricht `plesk bin domain_pref --update <domain>
+    -sign_outgoing_mail true|false`. Plesk erzeugt beim Einschalten den
+    Schlüssel und trägt den Record default._domainkey selbst in die
+    Plesk-DNS-Zone ein (liegt die Zone extern, muss der Record dort von Hand
+    gesetzt werden - die Ausgabe zeigt ihn). Voraussetzung: DKIM ist auf dem
+    Server global aktiviert.
+
+    Anlass z.B. Ablehnungen wie "550 5.7.1 Message lacks SPF/DKIM/DMARC Auth
+    Records" (Outlook/Hotmail). DMARC wird separat per dns_add_record gesetzt.
+
+    ACHTUNG - schreibt auf einem Produktivserver (Mailversand der Domain):
+    erfordert confirm=true PRO Aufruf. Ohne confirm nur Vorschau (aktueller
+    Status, vorhandene _domainkey-Records).
+    """
+    d = _wp_domain(domain)
+    target = "true" if enabled else "false"
+    before = _dkim_state(d)
+    records = _dkim_dns_records(d)
+    if not confirm:
+        return (
+            f"Vorschau (nichts geändert) - {d}: DKIM {before} -> {target}\n"
+            f"DNS:\n{records}\nZum Ausführen confirm=true setzen."
+        )
+    if before == target:
+        return f"{d}: DKIM ist bereits {target}, nichts geändert.\nDNS:\n{records}"
+    out = ssh_run(
+        f"plesk bin domain_pref --update {shlex.quote(d)} -sign_outgoing_mail {target}"
+    )
+    after = _dkim_state(d)
+    _audit("mail_dkim_set", domain=d, before=before, after=after)
+    result = f"{out}\n{d}: DKIM vorher {before}, jetzt {after}\nDNS:\n{_dkim_dns_records(d)}"
+    if after != target:
+        result += f"\nWARNUNG: Zielzustand {target} nicht erreicht."
+    return result
+
+
+_SUB_INFO_KEYS =("Domain name", "Owner's contact name", "Domain status", "Size")
 _SUB_DELETE_KEYS = ("Mailboxes", "Total size")
 
 
