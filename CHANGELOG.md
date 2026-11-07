@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.37
+
+- Neues Tool `mail_dkim_set(domain, enabled, confirm)`: schaltet die DKIM-Signierung ausgehender Mails einer Domain ein/aus (`plesk bin domain_pref --update <domain> -sign_outgoing_mail true|false`). Vorschau ohne `confirm=true` (aktueller Status, vorhandene `_domainkey`-Records), danach Kontrolle des Status, Ausgabe der `_domainkey`-Records aus der Plesk-Zone und Eintrag im Audit-Log. Anlass: Ablehnungen durch Outlook/Hotmail ("Message lacks SPF/DKIM/DMARC Auth Records") bei Domains ohne DKIM.
+- Tests: `tests/test_mail_dkim.py`.
+
 ## 0.36
 
 - Neu: die WordPress-Tools des WordPress-MCP für alle WordPress-Seiten auf dem Plesk-Server, ohne Plugin auf der Seite (62 Tools, z.B. `wp_post_get`, `wp_post_update`, `wp_elementor_replace_text`, `wp_menu_get`, `wp_user_list`, `wp_user_update`, `wp_media_upload`). Der PHP-Code des Plugins `tabside-mcp` 2.4.1 liegt im Image (`wpsite/php/`) und läuft per `wp eval-file -` als System-User der Subscription, als erster Administrator der Seite. Parameter `site` = Domain oder `domain:<wp_path>`. Vorschau ohne `confirm=true`, Sicherungen und Protokoll in der Datenbank der Seite, zusätzlich Audit-Log `wpsite_write`. Vorhandene gleichnamige Tools des plesk-mcp bleiben unverändert (siehe README).
