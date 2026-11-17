@@ -12046,7 +12046,7 @@ def db_create(
             f"if [ ! -f {q_cfg} ] || [ -L {q_cfg} ]; then echo 'wp-config fehlt oder ist ein Symlink' >&2; exit 1; fi\n"
             "SEDPROG=$(cat <<'EOS'\n" + sed_prog + "\nEOS\n)\n"
             f"printf '%s\\n' \"${{SEDPROG//@@PW@@/$PW}}\" | runuser -u {shlex.quote(ctx['login'])} -- "
-            f"env -i PATH=/usr/bin:/bin sed -i -E -f /dev/stdin {q_cfg}\n"
+            f"env -i PATH=/usr/bin:/bin sed -i -E -f - {q_cfg}\n"
             f"V=\"$(sed -nE \"s/.*define\\([[:space:]]*['\\\"]DB_PASSWORD['\\\"][[:space:]]*,[[:space:]]*['\\\"]([^'\\\"]*)['\\\"].*/\\1/p\" {q_cfg} | head -n 1)\"\n"
             "if [ \"$V\" = \"$PW\" ]; then echo WPCONFIG_PW_OK; else echo WPCONFIG_PW_MISMATCH; fi\n"
             f"grep -E \"define\\([[:space:]]*['\\\"]DB_(NAME|USER|HOST)['\\\"]\" {q_cfg} || true\n"

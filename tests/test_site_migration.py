@@ -163,3 +163,11 @@ def test_ssl_preview(fake_ssh):
 def test_ssl_unknown_alias(fake_ssh):
     with pytest.raises(ValueError, match="kein Domain-Alias"):
         server.ssl_letsencrypt("example.ch", "web@example.ch", aliases=["other.net"])
+
+
+def test_db_create_sed_reads_open_stdin():
+    """Regression: /dev/stdin lässt sich nach runuser nicht neu öffnen (root-Pipe)."""
+    import inspect
+    src = inspect.getsource(server.db_create)
+    assert "/dev/stdin" not in src
+    assert "sed -i -E -f - " in src
