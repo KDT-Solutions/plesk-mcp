@@ -29,6 +29,8 @@ def fake_ssh(monkeypatch):
             return IPS, "", 0
         if cmd.startswith("id -u "):
             return ("1001", "", 0) if cmd.split()[-1] in state["users"] else ("", "no such user", 1)
+        if "customer --info" in cmd:
+            return "", "not found", 1
         if "domalias --info" in cmd:
             return ("info", "", 0) if cmd.split()[-1] in state["aliases"] else ("", "not found", 1)
         if "domain --info" in cmd:
