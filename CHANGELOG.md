@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.39
+
+- Neues Tool `customer_create(login, name, email, company, notify, confirm)`: neuer Plesk-Kundenaccount (`plesk bin customer --create ... -passwd ''`), Passwort zufällig auf dem Server über `PSA_PASSWORD`, nie ausgegeben. Vorschau ohne `confirm=true`, Kontrolle per `customer --info`, Audit-Log.
+
 ## 0.38
 
 - Neue Tools für den Umzug einer Website auf den Server:

@@ -140,6 +140,7 @@ Der Container bindet standardmässig auf `0.0.0.0:8422` auf dem Docker-Host (all
 | `dns_delete_record` | Entfernt einen DNS-Resource-Record (gleiche Parameter wie beim Anlegen) - **erfordert `confirm=true`** |
 | `dns_update_record` | Ändert einen bestehenden DNS-Resource-Record (Delete alter Werte + Add neuer Werte in einem Aufruf) - **erfordert `confirm=true`** |
 | `domain_create` | Legt eine Domain als neue Subscription ohne Hosting an (`plesk bin subscription --create ... -hosting false`), DNS-Records danach mit `dns_*` - **erfordert `confirm=true`** |
+| `customer_create` | Neuen Plesk-Kundenaccount anlegen (`plesk bin customer --create`), Passwort zufällig auf dem Server, nicht ausgegeben - **erfordert `confirm=true`** |
 | `subscription_create` | Legt eine Domain als neue Subscription MIT Webhosting an (`-hosting true -hst_type phys -login <system_user>`), Passwort des System-Users zufällig auf dem Server (`PSA_PASSWORD`), wird nicht ausgegeben - **erfordert `confirm=true`** |
 | `domain_alias_create` | Domain-Alias für eine bestehende Domain (`plesk bin domalias --create`), Standard: Web an, 301-Weiterleitung auf die Hauptdomain, Mail und DNS aus - **erfordert `confirm=true`** |
 | `db_create` | MySQL/MariaDB-Datenbank mit eigenem Benutzer in einer Subscription anlegen und Zugangsdaten direkt in eine bestehende `wp-config.php` schreiben; Passwort nur auf dem Server, nie ausgegeben; optional neue Keys/Salts - **erfordert `confirm=true`** |

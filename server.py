@@ -92,7 +92,7 @@ _MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 # Commit mit einer neuen Basis ergibt also <Basis>.0.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.38"
+_VERSION_BASE = "0.39"
 _VERSION_PATHS = ["server.py", "wpsite", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -12375,6 +12375,54 @@ def wp_search_replace(domain: str, wp_path: str, old: str, new: str, include_gui
     result.update({"ersetzt": done, "verbleibend": rest, "backup_id": backup_id, "backup_ordner": bdir,
                    "ergebnis": "Ersetzt und kontrolliert." if rest == "0" else "ACHTUNG: Kontrolle findet noch Treffer."})
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+_CUSTOMER_LOGIN_RE = re.compile(r"^[a-z][a-z0-9_.-]{2,31}$")
+_EMAIL_RE_SIMPLE = re.compile(r"^[^@\s'\"]+@[^@\s'\"]+\.[^@\s'\"]+$")
+
+
+@mcp.tool()
+def customer_create(login: str, name: str, email: str, company: str = "", notify: bool = False,
+                    confirm: bool = False) -> str:
+    """Legt einen neuen Plesk-Kundenaccount an. Entspricht `plesk bin
+    customer --create <login> -name <name> -company <company> -email <email>
+    -passwd '' -notify false`. Das Passwort wird auf dem Server zufällig
+    erzeugt (PSA_PASSWORD) und nicht ausgegeben - für ein Kunden-Login bei
+    Bedarf in Plesk neu setzen. Ohne confirm=true nur Vorschau.
+    """
+    lg = login.strip()
+    if not _CUSTOMER_LOGIN_RE.match(lg) or lg == "admin":
+        raise ValueError(f"Ungültiger Login {login!r} (3-32 Zeichen, a-z, 0-9, _ . -).")
+    nm, co, em = name.strip(), company.strip(), email.strip()
+    for v, what in ((nm, "name"), (co, "company")):
+        if len(v) > 100 or any(c in v for c in "\n\r\0"):
+            raise ValueError(f"Ungültiger Wert für {what}.")
+    if not nm:
+        raise ValueError("name darf nicht leer sein.")
+    if not _EMAIL_RE_SIMPLE.match(em):
+        raise ValueError(f"Ungültige E-Mail {email!r}.")
+    _, _, code = _ssh_exec(f"plesk bin customer --info {shlex.quote(lg)}")
+    if code == 0:
+        raise ValueError(f"Kundenaccount {lg!r} existiert bereits, nichts angelegt.")
+    summary = f"Login: {lg}\nName: {nm}\nFirma: {co or '-'}\nE-Mail: {em}\nPasswort: zufällig, wird nicht ausgegeben"
+    if not confirm:
+        return f"Vorschau (nichts angelegt) - Kundenaccount anlegen:\n{summary}\nZum Ausführen confirm=true setzen."
+    script = (
+        "set -euo pipefail\n" + _GEN_PW_BASH +
+        f"PSA_PASSWORD=\"$PW\" plesk bin customer --create {shlex.quote(lg)} -name {shlex.quote(nm)}"
+        + (f" -company {shlex.quote(co)}" if co else "")
+        + f" -email {shlex.quote(em)} -passwd '' -notify {_bool_arg(notify)}\n"
+    )
+    client = _ssh_connect()
+    try:
+        out, err, rc = _client_exec(client, "bash -s", stdin_data=script.encode(), timeout=120)
+    finally:
+        client.close()
+    _audit("customer_create", login=lg, email=em, rc=rc)
+    if rc != 0:
+        raise SSHError(f"Anlegen fehlgeschlagen (exit {rc}): {(err or out).strip()[-600:]}")
+    info = ssh_run(f"plesk bin customer --info {shlex.quote(lg)}")
+    return f"{summary}\n\n{out.strip()}\n\nKontrolle:\n{info}"
 
 
 def main() -> None:

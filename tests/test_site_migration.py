@@ -133,3 +133,19 @@ def test_extract_args():
 def test_search_replace_validation(old, new, msg):
     with pytest.raises(ValueError, match=msg):
         server.wp_search_replace("example.ch", "httpdocs", old, new)
+
+
+def test_customer_create_preview(fake_ssh):
+    out = server.customer_create("newcust", "New Customer", "info@example.ch", company="New AG")
+    assert "Vorschau" in out and "Login: newcust" in out
+    assert not any("customer --create" in c for c in fake_ssh[0])
+
+
+@pytest.mark.parametrize("login,email,msg", [
+    ("admin", "a@example.ch", "Ungültiger Login"),
+    ("Bad Login", "a@example.ch", "Ungültiger Login"),
+    ("newcust", "kein-mail", "E-Mail"),
+])
+def test_customer_create_validation(login, email, msg):
+    with pytest.raises(ValueError, match=msg):
+        server.customer_create(login, "Name", email)
