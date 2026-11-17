@@ -151,3 +151,15 @@ def test_customer_create_preview(fake_ssh):
 def test_customer_create_validation(login, email, msg):
     with pytest.raises(ValueError, match=msg):
         server.customer_create(login, "Name", email)
+
+
+def test_ssl_preview(fake_ssh):
+    fake_ssh[1]["aliases"].add("example.net")
+    out = server.ssl_letsencrypt("example.ch", "web@example.ch", aliases=["example.net"])
+    assert "example.ch, www.example.ch, example.net, www.example.net" in out
+    assert not any("letsencrypt" in c for c in fake_ssh[0])
+
+
+def test_ssl_unknown_alias(fake_ssh):
+    with pytest.raises(ValueError, match="kein Domain-Alias"):
+        server.ssl_letsencrypt("example.ch", "web@example.ch", aliases=["other.net"])

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.40
+
+- Neues Tool `ssl_letsencrypt(domain, email, include_www, aliases, redirect_https, confirm)`: Let's-Encrypt-Zertifikat über die Plesk-Erweiterung (`plesk bin extension --exec letsencrypt cli.php -d ... -m ...`), optional inkl. Domain-Aliase im selben Zertifikat und HTTP->HTTPS-Weiterleitung (`site --update -ssl-redirect true`). Vorschau ohne `confirm=true`, Audit-Log.
+
 ## 0.39
 
 - Neues Tool `customer_create(login, name, email, company, notify, confirm)`: neuer Plesk-Kundenaccount (`plesk bin customer --create ... -passwd ''`), Passwort zufällig auf dem Server über `PSA_PASSWORD`, nie ausgegeben. Vorschau ohne `confirm=true`, Kontrolle per `customer --info`, Audit-Log.

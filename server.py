@@ -92,7 +92,7 @@ _MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 # Commit mit einer neuen Basis ergibt also <Basis>.0.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.39"
+_VERSION_BASE = "0.40"
 _VERSION_PATHS = ["server.py", "wpsite", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -12423,6 +12423,53 @@ def customer_create(login: str, name: str, email: str, company: str = "", notify
         raise SSHError(f"Anlegen fehlgeschlagen (exit {rc}): {(err or out).strip()[-600:]}")
     info = ssh_run(f"plesk bin customer --info {shlex.quote(lg)}")
     return f"{summary}\n\n{out.strip()}\n\nKontrolle:\n{info}"
+
+
+@mcp.tool()
+def ssl_letsencrypt(domain: str, email: str, include_www: bool = True, aliases: list[str] | None = None,
+                    redirect_https: bool = True, confirm: bool = False) -> str:
+    """Stellt für eine Domain ein Let's-Encrypt-Zertifikat über die
+    Plesk-Erweiterung aus und weist es zu (`plesk bin extension --exec
+    letsencrypt cli.php -d <domain> [-d www.<domain>] [-d <alias> ...]
+    -m <email>`). aliases: Domain-Aliase der Domain, die ins selbe
+    Zertifikat sollen (jeweils inkl. www, wenn include_www=true).
+    redirect_https=true: danach permanente Weiterleitung HTTP -> HTTPS
+    (`plesk bin site --update <domain> -ssl-redirect true`).
+    Voraussetzung: alle Namen zeigen per DNS auf den Server.
+    Ohne confirm=true nur Vorschau.
+    """
+    d = _wp_domain(domain)
+    em = email.strip()
+    if not _EMAIL_RE_SIMPLE.match(em):
+        raise ValueError(f"Ungültige E-Mail {email!r}.")
+    names = [d] + ([f"www.{d}"] if include_www else [])
+    for a in aliases or []:
+        an = _wp_domain(a)
+        _, _, code = _ssh_exec(f"plesk bin domalias --info {shlex.quote(an)}")
+        if code != 0:
+            raise ValueError(f"{an!r} ist kein Domain-Alias in Plesk.")
+        names += [an] + ([f"www.{an}"] if include_www else [])
+    if len(names) > 100 or len(set(names)) != len(names):
+        raise ValueError("Zu viele oder doppelte Namen.")
+    _, _, code = _ssh_exec(f"plesk bin site --info {shlex.quote(d)}")
+    if code != 0:
+        raise ValueError(f"{d!r} ist keine Website in Plesk.")
+    summary = (f"Domain: {d}\nNamen im Zertifikat: {', '.join(names)}\nE-Mail: {em}\n"
+               f"HTTP -> HTTPS: {'ja' if redirect_https else 'nein'}")
+    if not confirm:
+        return f"Vorschau (nichts ausgestellt):\n{summary}\nZum Ausführen confirm=true setzen."
+    cmd = ("plesk bin extension --exec letsencrypt cli.php "
+           + " ".join(f"-d {shlex.quote(n)}" for n in names) + f" -m {shlex.quote(em)}")
+    out, err, rc = _ssh_exec(cmd, timeout=300)
+    _audit("ssl_letsencrypt", domain=d, names=names, rc=rc)
+    if rc != 0:
+        raise SSHError(f"Let's Encrypt fehlgeschlagen (exit {rc}): {(err or out).strip()[-1500:]}")
+    red = ""
+    if redirect_https:
+        red = ssh_run(f"plesk bin site --update {shlex.quote(d)} -ssl-redirect true")
+    info = ssh_run(f"plesk bin site --info {shlex.quote(d)}")
+    lines = [l for l in info.splitlines() if "ssl" in l.lower() or "certificate" in l.lower()]
+    return f"{summary}\n\n{out.strip()}\n{red}\n\nKontrolle:\n" + "\n".join(lines)
 
 
 def main() -> None:
