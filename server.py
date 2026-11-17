@@ -4867,6 +4867,28 @@ def _wp_apply(
     return errors
 
 
+def _wp_values_equal(now: Any, new: Any) -> bool:
+    """Vergleich nach dem Schreiben: WordPress speichert einfache Optionen als
+    String (z.B. 1 -> "1", True -> "1", False -> ""), deshalb Skalare
+    textuell vergleichen; Arrays/Objekte und _WP_MISSING exakt."""
+    if now is _WP_MISSING or new is _WP_MISSING:
+        return now is new
+    if now == new:
+        return True
+    scalar = (str, int, float, bool, type(None))
+    if isinstance(now, scalar) and isinstance(new, scalar):
+        def norm(v: Any) -> str:
+            if v is None:
+                return ""
+            if isinstance(v, bool):
+                return "1" if v else ""
+            if isinstance(v, float) and v.is_integer():
+                return str(int(v))
+            return str(v)
+        return norm(now) == norm(new)
+    return False
+
+
 def _wp_change(
     domain: str,
     wp_path: str,
@@ -4920,7 +4942,7 @@ def _wp_change(
             if not p["changed"]:
                 continue
             now = after.get(key, _WP_MISSING) if (mode == "keys" and isinstance(after, dict)) else after
-            if now != p["new"] and not (now is _WP_MISSING and p["new"] is _WP_MISSING):
+            if not _wp_values_equal(now, p["new"]):
                 mismatches.append(key or option)
     finally:
         client.close()

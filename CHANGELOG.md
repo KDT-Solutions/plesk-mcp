@@ -2,6 +2,7 @@
 
 ## 0.40
 
+- Fix `wp_option_update`: Kontrolle nach dem Schreiben vergleicht einfache Werte textuell wie WordPress sie speichert (z.B. `1` -> `"1"`, `true` -> `"1"`); bisher meldete z.B. `blog_public=1` fälschlich "Teilweise fehlgeschlagen".
 - Fix `db_create`: sed las sein Programm (mit dem DB-Passwort) als System-User über `-f /dev/stdin`; das Neu-Öffnen der root-eigenen Pipe nach `runuser` scheiterte mit "Permission denied" (DB und Benutzer waren angelegt, die `wp-config.php` blieb unverändert). Jetzt `sed -f -`, das das bereits offene stdin liest.
 - Neues Tool `ssl_letsencrypt(domain, email, include_www, aliases, redirect_https, confirm)`: Let's-Encrypt-Zertifikat über die Plesk-Erweiterung (`plesk bin extension --exec letsencrypt cli.php -d ... -m ...`), optional inkl. Domain-Aliase im selben Zertifikat und HTTP->HTTPS-Weiterleitung (`site --update -ssl-redirect true`). Vorschau ohne `confirm=true`, Audit-Log.
 

@@ -59,3 +59,23 @@ def test_plan_keys():
 def test_plan_value_type_change_counts():
     plan = server._wp_plan("1", "value", {"": 1})
     assert plan[""]["changed"] is True
+
+
+@pytest.mark.parametrize("now,new,eq", [
+    ("1", 1, True),
+    ("1", True, True),
+    ("", False, True),
+    ("0", 0, True),
+    ("swap", "swap", True),
+    ("2", 1, False),
+    ({"a": 1}, {"a": 1}, True),
+    ({"a": "1"}, {"a": 1}, False),
+])
+def test_wp_values_equal_scalar_strings(now, new, eq):
+    """Regression: blog_public=1 wurde nach dem Schreiben als "1" gelesen und als Abweichung gemeldet."""
+    assert server._wp_values_equal(now, new) is eq
+
+
+def test_wp_values_equal_missing():
+    assert server._wp_values_equal(server._WP_MISSING, server._WP_MISSING)
+    assert not server._wp_values_equal(server._WP_MISSING, "")
