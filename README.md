@@ -34,6 +34,7 @@ Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven K
 | `WP_PLUGIN_UPDATE_TIMEOUT` | nein | `600` | Timeout in Sekunden für `wp plugin update`/`wp theme update` sowie Backup/Wiederherstellen eines Plugins oder Themes |
 | `PUBLIC_BASE_URL` | ja, für Uploads | – | Öffentliche Basis-URL des Containers hinter dem Reverse-Proxy, z.B. `https://plesk-mcp.example.com` (daraus wird die Upload-URL gebaut) |
 | `UPLOAD_MAX_BYTES` | nein | `26214400` (25 MB) | Grössenlimit für Upload und Fetch; pro Upload per `max_bytes` weiter verkleinerbar |
+| `MIGRATE_TIMEOUT` | nein | `1800` | Inaktivitäts-Timeout in Sekunden für `extract_archive`, `wp_db_import` und `wp_search_replace` (grosse Archive/Dumps) |
 | `UPLOAD_RATE_LIMIT_PER_MIN` | nein | `20` | Fehlversuche (ungültiges/abgelaufenes Token) pro Minute und IP auf `/upload/`; gültige Uploads zählen nicht und werden nie durch fremde Fehlversuche blockiert |
 | `UPLOAD_MAX_CONCURRENT` | nein | `2` | Maximal gleichzeitig laufende Uploads |
 | `UPLOAD_MIN_FREE_MB` | nein | `256` | Freier Speicher, der auf dem Plesk-Server zusätzlich zum Upload-Limit frei bleiben muss |
@@ -139,6 +140,12 @@ Der Container bindet standardmässig auf `0.0.0.0:8422` auf dem Docker-Host (all
 | `dns_delete_record` | Entfernt einen DNS-Resource-Record (gleiche Parameter wie beim Anlegen) - **erfordert `confirm=true`** |
 | `dns_update_record` | Ändert einen bestehenden DNS-Resource-Record (Delete alter Werte + Add neuer Werte in einem Aufruf) - **erfordert `confirm=true`** |
 | `domain_create` | Legt eine Domain als neue Subscription ohne Hosting an (`plesk bin subscription --create ... -hosting false`), DNS-Records danach mit `dns_*` - **erfordert `confirm=true`** |
+| `subscription_create` | Legt eine Domain als neue Subscription MIT Webhosting an (`-hosting true -hst_type phys -login <system_user>`), Passwort des System-Users zufällig auf dem Server (`PSA_PASSWORD`), wird nicht ausgegeben - **erfordert `confirm=true`** |
+| `domain_alias_create` | Domain-Alias für eine bestehende Domain (`plesk bin domalias --create`), Standard: Web an, 301-Weiterleitung auf die Hauptdomain, Mail und DNS aus - **erfordert `confirm=true`** |
+| `db_create` | MySQL/MariaDB-Datenbank mit eigenem Benutzer in einer Subscription anlegen und Zugangsdaten direkt in eine bestehende `wp-config.php` schreiben; Passwort nur auf dem Server, nie ausgegeben; optional neue Keys/Salts - **erfordert `confirm=true`** |
+| `extract_archive` | ZIP-Archiv (oder mehrere hochgeladene Teilstücke) im Vhost als System-User entpacken; Einträge mit `..`, absolutem Pfad oder Symlinks werden abgelehnt - **erfordert `confirm=true`** |
+| `wp_db_import` | SQL-Dump per `wp db import` als System-User in die Datenbank aus der `wp-config.php` importieren (bei vorhandenen Tabellen nur mit `replace_existing=true` und vorherigem Backup) - **erfordert `confirm=true`** |
+| `wp_search_replace` | `wp search-replace` über alle Tabellen mit Präfix (z.B. Staging-URL -> Live-Domain), Vorschau per `--dry-run`, vorher DB-Backup, danach Kontrolle - **erfordert `confirm=true`** |
 | `backup_list` | Vorhandene lokale Backup-Dateien (Server-/Domain-Backups unter `/var/lib/psa/dumps`) |
 | `wp_toolkit_list` | Vom WP Toolkit verwaltete WordPress-Installationen auflisten |
 | `wp_toolkit_info` | Detail-Infos zu einer WordPress-Installation (Version, Updates, Plugins/Themes) |
@@ -226,6 +233,16 @@ Die Funktionen des WordPress-MCP (Repo `tabside/wordpress-mcp`, Plugin `tabside-
 1. Vorschau: `domain_create(domain="example.ch", owner="kunde", service_plan="Standard 20GB")` - zeigt Inhaber, Servicepaket, IP und ob die Domain schon existiert. Ein unbekannter Paketname liefert die Liste der vorhandenen Pakete.
 2. Anlegen: derselbe Aufruf mit `confirm=true`. Die Rückgabe enthält die von Plesk angelegte DNS-Zone.
 3. DNS-Einträge anpassen: `dns_add_record` / `dns_update_record` / `dns_delete_record`.
+
+## Beispiel: WordPress-Website umziehen
+
+1. `subscription_create(domain="example.ch", owner="kunde", service_plan="Standard 20GB")`, dann mit `confirm=true`.
+2. Domain-Aliase: `domain_alias_create(domain="example.ch", alias="example.net", confirm=true)` (301 auf die Hauptdomain).
+3. Website-Archiv hochladen: grosse ZIPs lokal mit `split -b 24M site.zip site.zip.part` teilen und die Teile einzeln per `upload_begin` nach z.B. `upload/` laden; SQL-Dump ebenso.
+4. Entpacken: `extract_archive(domain="example.ch", dest="httpdocs", parts=["upload/site.zip.partaa", "upload/site.zip.partab"], overwrite=true, delete_source=true)` - erst Vorschau, dann `confirm=true`. Die Plesk-Standardseite (`httpdocs/index.html`) danach mit `delete_vhost_file` entfernen.
+5. Datenbank: `db_create(domain="example.ch", database="example_wp", db_user="example_wp", wp_config="httpdocs/wp-config.php", confirm=true)`.
+6. Import: `wp_db_import(domain="example.ch", wp_path="httpdocs", path="upload/site.sql", confirm=true)`.
+7. URLs anpassen: `wp_search_replace(domain="example.ch", wp_path="httpdocs", old="https://staging.example.net", new="https://example.ch", confirm=true)`.
 
 ## Beispiel: PageSpeed einer Kundenseite prüfen
 

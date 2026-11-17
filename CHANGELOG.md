@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.38
+
+- Neue Tools für den Umzug einer Website auf den Server:
+  - `subscription_create`: Subscription MIT Webhosting (`plesk bin subscription --create ... -hosting true -hst_type phys -login <system_user> -passwd ''`). Das Passwort des System-Users wird auf dem Server zufällig erzeugt und über `PSA_PASSWORD` übergeben, nie ausgegeben. Die Prüfungen von `domain_create` (Domain, Kunde, Paket, Shared-IP) sind in `_new_subscription_check` zusammengefasst.
+  - `domain_alias_create`: Domain-Alias (`plesk bin domalias --create`), Standard 301-Weiterleitung auf die Hauptdomain, Mail und DNS aus.
+  - `db_create`: Datenbank + Benutzer (`plesk bin database --create` / `--create-dbuser`), Zugangsdaten direkt in eine bestehende `wp-config.php` (sed als System-User, Programm über stdin), Kontrolle per Login und Passwortabgleich; Passwort nie im Chat oder in einer Kommandozeile. Optional `wp config shuffle-salts` (inkl. `WP_CACHE_KEY_SALT`).
+  - `extract_archive`: ZIP bzw. zusammengesetzte Teilstücke als System-User entpacken; Einträge mit `..`, absolutem Pfad oder Symlinks werden abgelehnt, danach `chmod -R go-w`.
+  - `wp_db_import`: `wp db import` als System-User mit den Zugangsdaten der `wp-config.php` (kann nur in diese Datenbank schreiben); bei vorhandenen Tabellen nur mit `replace_existing=true` und Backup.
+  - `wp_search_replace`: `wp search-replace --all-tables-with-prefix --precise` mit Vorschau (`--dry-run`), Backup, `wp cache flush` und Kontrolle.
+- Neue Umgebungsvariable `MIGRATE_TIMEOUT` (Standard 1800 s) für Entpacken/Import.
+- Tests: `tests/test_site_migration.py`.
+
 ## 0.37
 
 - Neues Tool `mail_dkim_set(domain, enabled, confirm)`: schaltet die DKIM-Signierung ausgehender Mails einer Domain ein/aus (`plesk bin domain_pref --update <domain> -sign_outgoing_mail true|false`). Vorschau ohne `confirm=true` (aktueller Status, vorhandene `_domainkey`-Records), danach Kontrolle des Status, Ausgabe der `_domainkey`-Records aus der Plesk-Zone und Eintrag im Audit-Log. Anlass: Ablehnungen durch Outlook/Hotmail ("Message lacks SPF/DKIM/DMARC Auth Records") bei Domains ohne DKIM.

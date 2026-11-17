@@ -92,7 +92,7 @@ _MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 # Commit mit einer neuen Basis ergibt also <Basis>.0.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.37"
+_VERSION_BASE = "0.38"
 _VERSION_PATHS = ["server.py", "wpsite", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -1754,32 +1754,10 @@ def _shared_ips() -> list[str]:
     return ips
 
 
-@mcp.tool()
-def domain_create(
-    domain: str,
-    owner: str,
-    service_plan: str,
-    ip: str = "",
-    notify: bool = False,
-    confirm: bool = False,
-) -> str:
-    """Legt eine Domain in Plesk als neue Subscription OHNE Hosting an
-    (Hosting-Typ "Kein Hosting", z.B. nur für DNS und Mail-Weiterleitungen).
-    Entspricht `plesk bin subscription --create <domain> -owner <login>
-    -service-plan <plan> -ip <ip> -hosting false -notify false`. Plesk legt
-    die DNS-Zone nach der Server-Vorlage an; Records danach mit dns_*.
-
-    owner: Login des Inhabers ("admin" oder Kunden-Login aus
-           plesk_api_get("clients")).
-    service_plan: exakter Name des Servicepakets (bei unbekanntem Namen
-                  listet die Fehlermeldung alle vorhandenen).
-    ip: lokale IPv4 des Servers; leer = die einzige Shared-IP, bei mehreren
-        muss sie angegeben werden.
-    notify: Plesk-Benachrichtigungsmails beim Anlegen (Standard aus).
-
-    Schreibt auf einem Produktivserver: ohne confirm=true nur Vorschau
-    (Inhaber, Plan, IP, Prüfung ob die Domain schon existiert).
-    """
+def _new_subscription_check(domain: str, owner: str, service_plan: str, ip: str) -> tuple[str, str, str, str, str]:
+    """Gemeinsame Prüfungen für domain_create/subscription_create: Domainname,
+    Login, Servicepaket, Shared-IP, Domain noch nicht vorhanden, Kunde vorhanden.
+    Rückgabe: (domain, login, plan, ip, inhaber_text)."""
     d = _wp_domain(domain)
     if "." not in d:
         raise ValueError(f"Ungültiger Domainname: {domain!r}")
@@ -1814,6 +1792,37 @@ def domain_create(
         owner_txt = f"{lg} ({name})" if name else lg
     else:
         owner_txt = "admin"
+
+    return d, lg, plan, addr, owner_txt
+
+
+@mcp.tool()
+def domain_create(
+    domain: str,
+    owner: str,
+    service_plan: str,
+    ip: str = "",
+    notify: bool = False,
+    confirm: bool = False,
+) -> str:
+    """Legt eine Domain in Plesk als neue Subscription OHNE Hosting an
+    (Hosting-Typ "Kein Hosting", z.B. nur für DNS und Mail-Weiterleitungen).
+    Entspricht `plesk bin subscription --create <domain> -owner <login>
+    -service-plan <plan> -ip <ip> -hosting false -notify false`. Plesk legt
+    die DNS-Zone nach der Server-Vorlage an; Records danach mit dns_*.
+
+    owner: Login des Inhabers ("admin" oder Kunden-Login aus
+           plesk_api_get("clients")).
+    service_plan: exakter Name des Servicepakets (bei unbekanntem Namen
+                  listet die Fehlermeldung alle vorhandenen).
+    ip: lokale IPv4 des Servers; leer = die einzige Shared-IP, bei mehreren
+        muss sie angegeben werden.
+    notify: Plesk-Benachrichtigungsmails beim Anlegen (Standard aus).
+
+    Schreibt auf einem Produktivserver: ohne confirm=true nur Vorschau
+    (Inhaber, Plan, IP, Prüfung ob die Domain schon existiert).
+    """
+    d, lg, plan, addr, owner_txt = _new_subscription_check(domain, owner, service_plan, ip)
 
     summary = (
         f"Domain: {d}\nInhaber: {owner_txt}\nServicepaket: {plan}\nIP: {addr}\n"
@@ -11794,6 +11803,578 @@ def _check_startup_config() -> list[str]:
             "alle Clients). IP(s) des Proxys, wie der Container sie sieht, eintragen."
         )
     return warnings
+
+
+# ---------------------------------------------------------------------------
+# Website-Umzug: Subscription mit Hosting, Domain-Aliase, Datenbank mit
+# wp-config, Archiv entpacken, WordPress-DB-Import, Suchen/Ersetzen (0.38)
+# ---------------------------------------------------------------------------
+
+_NEW_SYSUSER_RE = re.compile(r"^[a-z][a-z0-9_]{2,15}$")
+_NEW_DB_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+_NEW_DBUSER_RE = re.compile(r"^[A-Za-z0-9_]{1,32}$")
+_MIGRATE_TIMEOUT = int(os.environ.get("MIGRATE_TIMEOUT", "1800"))
+_EXTRACT_TMP_SUBDIR = ".plesk-mcp/extract-tmp"
+_WP_SR_BACKUP_SUBDIR = ".plesk-mcp/wp-search-replace-backups"
+_WP_IMPORT_BACKUP_SUBDIR = ".plesk-mcp/wp-db-import-backups"
+# Zufallspasswort, nur auf dem Server erzeugt (Bash-Variable PW). Es steht nie
+# in einer Kommandozeile (Plesk liest es aus PSA_PASSWORD, mysql aus
+# MYSQL_PWD, sed aus stdin) und verlässt den Server nie.
+_GEN_PW_BASH = (
+    'PW="$(head -c 64 /dev/urandom | base64 | tr -dc \'A-Za-z0-9\' | head -c 32)"\n'
+    '[ "${#PW}" -ge 24 ] || { echo "Passwort-Erzeugung fehlgeschlagen" >&2; exit 1; }\n'
+    'PW="${PW}_Q7"\n'
+)
+
+
+def _bool_arg(v: bool) -> str:
+    return "true" if v else "false"
+
+
+def _default_sysuser(domain: str) -> str:
+    label = re.sub(r"[^a-z0-9]", "", domain.split(".")[0].lower())
+    if not label or not label[0].isalpha():
+        label = "w" + label
+    return (label + "web")[:16] if len(label) < 3 else label[:16]
+
+
+@mcp.tool()
+def subscription_create(
+    domain: str,
+    owner: str,
+    service_plan: str,
+    system_user: str = "",
+    ip: str = "",
+    notify: bool = False,
+    confirm: bool = False,
+) -> str:
+    """Legt eine Domain als neue Subscription MIT Webhosting an (Website,
+    Docroot httpdocs, System-User). Entspricht `plesk bin subscription
+    --create <domain> -owner <login> -service-plan <plan> -ip <ip>
+    -hosting true -hst_type phys -login <system_user> -passwd ''`.
+
+    owner/service_plan/ip wie bei domain_create. system_user: Login des
+    System-/FTP-Users (3-16 Zeichen, a-z, 0-9, _; leer = aus dem Domainnamen,
+    z.B. example.ch -> example). Das Passwort des System-Users wird auf dem
+    Server zufällig erzeugt und NICHT ausgegeben (Plesk liest es aus
+    PSA_PASSWORD) - für FTP/SSH bei Bedarf in Plesk neu setzen.
+
+    Schreibt auf einem Produktivserver: ohne confirm=true nur Vorschau.
+    """
+    d, lg, plan, addr, owner_txt = _new_subscription_check(domain, owner, service_plan, ip)
+    su = (system_user or "").strip() or _default_sysuser(d)
+    if not _NEW_SYSUSER_RE.match(su):
+        raise ValueError(f"Ungültiger system_user {su!r} (3-16 Zeichen, a-z, 0-9, _; Beginn mit Buchstabe).")
+    _, _, code = _ssh_exec(f"id -u {shlex.quote(su)}")
+    if code == 0:
+        raise ValueError(f"System-User {su!r} existiert bereits - anderen system_user angeben.")
+    summary = (
+        f"Domain: {d}\nInhaber: {owner_txt}\nServicepaket: {plan}\nIP: {addr}\n"
+        f"Hosting: Webhosting (httpdocs)\nSystem-User: {su} (Passwort zufällig, wird nicht ausgegeben)\n"
+        f"Benachrichtigung: {'ja' if notify else 'nein'}"
+    )
+    if not confirm:
+        return f"Vorschau (nichts angelegt) - Subscription mit Hosting anlegen:\n{summary}\nZum Ausführen confirm=true setzen."
+    script = (
+        "set -euo pipefail\n" + _GEN_PW_BASH +
+        f'PSA_PASSWORD="$PW" plesk bin subscription --create {shlex.quote(d)} -owner {shlex.quote(lg)}'
+        f" -service-plan {shlex.quote(plan)} -ip {shlex.quote(addr)} -hosting true -hst_type phys"
+        f" -login {shlex.quote(su)} -passwd '' -notify {_bool_arg(notify)}\n"
+    )
+    client = _ssh_connect()
+    try:
+        out, err, rc = _client_exec(client, "bash -s", stdin_data=script.encode(), timeout=300)
+    finally:
+        client.close()
+    _audit("subscription_create", domain=d, owner=lg, service_plan=plan, ip=addr, system_user=su, rc=rc)
+    if rc != 0:
+        raise SSHError(f"Anlegen fehlgeschlagen (exit {rc}): {(err or out).strip()[-800:]}")
+    _, _, code = _ssh_exec(f"plesk bin subscription --info {shlex.quote(d)}")
+    check = "Subscription vorhanden" if code == 0 else "Subscription NICHT gefunden - bitte prüfen"
+    site = ssh_run(f"plesk bin site --info {shlex.quote(d)}")
+    return f"{summary}\n\n{out.strip()}\n\nKontrolle: {check}\n\nWebsite:\n{site}"
+
+
+@mcp.tool()
+def domain_alias_create(
+    domain: str,
+    alias: str,
+    seo_redirect: bool = True,
+    mail: bool = False,
+    dns: bool = False,
+    confirm: bool = False,
+) -> str:
+    """Legt einen Domain-Alias für eine bestehende Domain an. Entspricht
+    `plesk bin domalias --create <alias> -domain <domain> -web true
+    -mail <mail> -dns <dns> -seo-redirect <seo_redirect>`.
+
+    seo_redirect=true (Standard): Besucher des Alias werden per HTTP 301 auf
+    die Hauptdomain umgeleitet (kein doppelter Inhalt). mail: Mails an den
+    Alias in die Postfächer der Domain (Standard aus). dns: DNS-Zone des Alias
+    in Plesk (Standard aus, z.B. wenn der DNS extern liegt).
+    Ohne confirm=true nur Vorschau.
+    """
+    d = _wp_domain(domain)
+    a = _wp_domain(alias)
+    if "." not in d or "." not in a:
+        raise ValueError("Ungültiger Domainname.")
+    if a == d:
+        raise ValueError("Alias und Domain sind identisch.")
+    _, _, code = _ssh_exec(f"plesk bin domain --info {shlex.quote(d)}")
+    if code != 0:
+        raise ValueError(f"Domain {d!r} ist in Plesk nicht vorhanden.")
+    _, _, code = _ssh_exec(f"plesk bin domalias --info {shlex.quote(a)}")
+    if code == 0:
+        raise ValueError(f"Alias {a!r} existiert bereits, nichts angelegt.")
+    _, _, code = _ssh_exec(f"plesk bin domain --info {shlex.quote(a)}")
+    if code == 0:
+        raise ValueError(f"{a!r} existiert in Plesk bereits als Domain, nichts angelegt.")
+    summary = (
+        f"Alias: {a}\nfür Domain: {d}\nWeb: ja\n301-Weiterleitung auf {d}: {'ja' if seo_redirect else 'nein'}\n"
+        f"Mail: {'ja' if mail else 'nein'}\nDNS-Zone in Plesk: {'ja' if dns else 'nein'}"
+    )
+    if not confirm:
+        return f"Vorschau (nichts angelegt) - Domain-Alias anlegen:\n{summary}\nZum Ausführen confirm=true setzen."
+    out = ssh_run(
+        f"plesk bin domalias --create {shlex.quote(a)} -domain {shlex.quote(d)} -web true"
+        f" -mail {_bool_arg(mail)} -dns {_bool_arg(dns)} -seo-redirect {_bool_arg(seo_redirect)}"
+    )
+    _audit("domain_alias_create", domain=d, alias=a, seo_redirect=seo_redirect, mail=mail, dns=dns)
+    info = ssh_run(f"plesk bin domalias --info {shlex.quote(a)}")
+    return f"{summary}\n\n{out}\n\nKontrolle:\n{info}"
+
+
+def _run_as_sysuser(
+    client: paramiko.SSHClient,
+    login: str,
+    home: str,
+    script: str,
+    timeout: int | None = None,
+    stdin_data: bytes | None = None,
+) -> tuple[str, str, int]:
+    """Führt ein sh-Skript als System-User der Subscription aus (runuser,
+    leere Umgebung) - nie als root. Das Skript kommt als Argument (sh -c),
+    Werte darin müssen bereits mit shlex.quote maskiert sein."""
+    if not _WP_SYSUSER_RE.match(login) or login == "root":
+        raise ValueError(f"Unerwarteter System-User {login!r}.")
+    cmd = (
+        f"cd {shlex.quote(home)} && runuser -u {shlex.quote(login)} -- "
+        f"env -i HOME={shlex.quote(home)} PATH=/usr/bin:/bin LC_ALL=C sh -c {shlex.quote(script)}"
+    )
+    return _client_exec(client, cmd, timeout=timeout or _SSH_TIMEOUT,
+                        max_runtime=_MIGRATE_TIMEOUT + 60, stdin_data=stdin_data)
+
+
+@mcp.tool()
+def db_create(
+    domain: str,
+    database: str,
+    db_user: str,
+    wp_config: str,
+    shuffle_salts: bool = True,
+    confirm: bool = False,
+) -> str:
+    """Legt in der Subscription eine MySQL/MariaDB-Datenbank mit eigenem
+    Benutzer an und trägt die Zugangsdaten direkt in eine bestehende
+    wp-config.php ein (DB_NAME, DB_USER, DB_PASSWORD, DB_HOST=localhost).
+
+    Das Passwort wird auf dem Server zufällig erzeugt, nur in die
+    wp-config.php geschrieben und NIE ausgegeben (nicht im Chat, nicht in
+    einer Kommandozeile). Danach Kontrolle: Login mit dem neuen Benutzer und
+    Abgleich des Passworts in der wp-config.php.
+
+    domain: Hauptdomain der Subscription. database/db_user: Namen (A-Z, a-z,
+    0-9, _), dürfen auf dem Server noch nicht existieren. wp_config: Pfad
+    relativ zum Vhost-Root, z.B. "httpdocs/wp-config.php".
+    shuffle_salts=true (Standard): danach neue Keys/Salts per
+    `wp config shuffle-salts` (inkl. WP_CACHE_KEY_SALT, falls vorhanden).
+    Ohne confirm=true nur Vorschau.
+    """
+    d = _wp_domain(domain)
+    db = database.strip()
+    user = db_user.strip()
+    if not _NEW_DB_RE.match(db):
+        raise ValueError(f"Ungültiger Datenbankname {database!r} (A-Z, a-z, 0-9, _; max. 64).")
+    if not _NEW_DBUSER_RE.match(user):
+        raise ValueError(f"Ungültiger DB-Benutzer {db_user!r} (A-Z, a-z, 0-9, _; max. 32).")
+    parts = _strict_parts(wp_config)
+    if parts[-1] != "wp-config.php":
+        raise ValueError("wp_config muss auf eine wp-config.php zeigen.")
+    ctx = _vhost_ctx(d)
+    _check_not_protected(parts, ctx, "wp_config")
+    cfg = f"{ctx['base']}/{'/'.join(parts)}"
+    client = _ssh_connect()
+    try:
+        sftp = client.open_sftp()
+        try:
+            _assert_real_within_vhost(sftp, cfg, d)
+            try:
+                st = sftp.lstat(cfg)
+            except FileNotFoundError:
+                raise ValueError(f"{wp_config} nicht gefunden - zuerst die Website-Dateien ablegen.")
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError(f"{wp_config} ist keine reguläre Datei.")
+        finally:
+            sftp.close()
+        q = (f"SELECT 'db' FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = {_sql_quote(db)} "
+             f"UNION ALL SELECT 'user' FROM mysql.user WHERE User = {_sql_quote(user)}")
+        found = _mysql_exec(q, skip_column_names=True)
+        if "db" in found.split():
+            raise ValueError(f"Datenbank {db!r} existiert bereits, nichts angelegt.")
+        if "user" in found.split():
+            raise ValueError(f"DB-Benutzer {user!r} existiert bereits, nichts angelegt.")
+        summary = (
+            f"Domain: {d}\nDatenbank: {db}\nBenutzer: {user}\nHost: localhost\n"
+            f"wp-config: {wp_config} (DB_NAME, DB_USER, DB_PASSWORD, DB_HOST werden gesetzt)\n"
+            f"Passwort: zufällig auf dem Server, wird nicht ausgegeben\n"
+            f"Keys/Salts neu: {'ja' if shuffle_salts else 'nein'}"
+        )
+        if not confirm:
+            return f"Vorschau (nichts angelegt) - Datenbank anlegen:\n{summary}\nZum Ausführen confirm=true setzen."
+        sed_prog = "\n".join(
+            "s/(define\\([[:space:]]*['\"]" + key + "['\"][[:space:]]*,[[:space:]]*['\"])[^'\"]*/\\1" + val + "/"
+            for key, val in (("DB_NAME", db), ("DB_USER", user), ("DB_HOST", "localhost"), ("DB_PASSWORD", "@@PW@@"))
+        )
+        q_cfg = shlex.quote(cfg)
+        script = (
+            "set -euo pipefail\n" + _GEN_PW_BASH +
+            f"plesk bin database --create {shlex.quote(db)} -domain {shlex.quote(d)} -type mysql\n"
+            f"PSA_PASSWORD=\"$PW\" plesk bin database --create-dbuser {shlex.quote(user)} -passwd ''"
+            f" -domain {shlex.quote(d)} -type mysql -database {shlex.quote(db)}\n"
+            f"MYSQL_PWD=\"$PW\" mysql -u {shlex.quote(user)} --connect-timeout=10 -N -e 'SELECT 1' {shlex.quote(db)} >/dev/null\n"
+            "echo DB_LOGIN_OK\n"
+            f"if [ ! -f {q_cfg} ] || [ -L {q_cfg} ]; then echo 'wp-config fehlt oder ist ein Symlink' >&2; exit 1; fi\n"
+            "SEDPROG=$(cat <<'EOS'\n" + sed_prog + "\nEOS\n)\n"
+            f"printf '%s\\n' \"${{SEDPROG//@@PW@@/$PW}}\" | runuser -u {shlex.quote(ctx['login'])} -- "
+            f"env -i PATH=/usr/bin:/bin sed -i -E -f /dev/stdin {q_cfg}\n"
+            f"V=\"$(sed -nE \"s/.*define\\([[:space:]]*['\\\"]DB_PASSWORD['\\\"][[:space:]]*,[[:space:]]*['\\\"]([^'\\\"]*)['\\\"].*/\\1/p\" {q_cfg} | head -n 1)\"\n"
+            "if [ \"$V\" = \"$PW\" ]; then echo WPCONFIG_PW_OK; else echo WPCONFIG_PW_MISMATCH; fi\n"
+            f"grep -E \"define\\([[:space:]]*['\\\"]DB_(NAME|USER|HOST)['\\\"]\" {q_cfg} || true\n"
+        )
+        out, err, rc = _client_exec(client, "bash -s", stdin_data=script.encode(), timeout=300)
+        salts = ""
+        if rc == 0 and shuffle_salts:
+            wctx = _wp_context(client, d)
+            wp_dir = posixpath.dirname(cfg)
+            o, e, r = _wp_run_as_user(client, wctx, _wp_cli_argv(wctx, wp_dir, ["config", "shuffle-salts"]), cwd=wp_dir)
+            salts = "Keys/Salts neu gesetzt." if r == 0 else f"shuffle-salts fehlgeschlagen: {_wp_cli_error(o, e)}"
+            o, e, r = _wp_run_as_user(client, wctx, _wp_cli_argv(wctx, wp_dir, ["config", "has", "WP_CACHE_KEY_SALT"]), cwd=wp_dir)
+            if r == 0:
+                o, e, r = _wp_run_as_user(client, wctx, _wp_cli_argv(
+                    wctx, wp_dir, ["config", "shuffle-salts", "WP_CACHE_KEY_SALT", "--force"]), cwd=wp_dir)
+                salts += " WP_CACHE_KEY_SALT neu." if r == 0 else " WP_CACHE_KEY_SALT nicht geändert."
+    finally:
+        client.close()
+    _audit("db_create", domain=d, database=db, db_user=user, wp_config=wp_config, rc=rc)
+    if rc != 0:
+        raise SSHError(f"Fehlgeschlagen (exit {rc}) - Zwischenstand prüfen (db_list): {(err or out).strip()[-800:]}")
+    checks = []
+    checks.append("Login mit neuem Benutzer: ok" if "DB_LOGIN_OK" in out else "Login mit neuem Benutzer: FEHLER")
+    checks.append("Passwort in wp-config: ok" if "WPCONFIG_PW_OK" in out else "Passwort in wp-config: ABWEICHUNG - prüfen")
+    lines = [l for l in out.splitlines() if "define" in l and "DB_PASSWORD" not in l]
+    return f"{summary}\n\nKontrolle:\n" + "\n".join(checks) + "\n" + "\n".join(lines) + (f"\n{salts}" if salts else "")
+
+
+@mcp.tool()
+def extract_archive(
+    domain: str,
+    dest: str,
+    path: str = "",
+    parts: list[str] | None = None,
+    overwrite: bool = False,
+    delete_source: bool = False,
+    confirm: bool = False,
+) -> str:
+    """Entpackt ein ZIP-Archiv im Vhost-Verzeichnis als System-User der
+    Subscription (nie als root), z.B. das Backup einer Website nach httpdocs.
+
+    path: ZIP relativ zum Vhost-Root (z.B. "upload/site.zip"). parts:
+    alternativ eine Liste von Teilstücken in der richtigen Reihenfolge
+    (z.B. mit `split -b 24M` erzeugt und einzeln per upload_begin
+    hochgeladen) - sie werden zuerst zusammengesetzt. dest: Zielordner
+    relativ zum Vhost-Root (z.B. "httpdocs"); ist er nicht leer, braucht es
+    overwrite=true (bestehende Dateien werden überschrieben).
+    delete_source=true: Archiv bzw. Teilstücke nach erfolgreichem Entpacken
+    löschen.
+
+    Sicherheit: Einträge mit absolutem Pfad, ".." oder Symlinks im Archiv
+    werden abgelehnt; Gruppen-/Welt-Schreibrechte werden danach entfernt.
+    Das Archiv darf PHP-Code enthalten (Website) - nur vertrauenswürdige
+    Archive entpacken. Ohne confirm=true nur Vorschau (Anzahl Einträge,
+    Grösse, oberste Ebene, Zielordner).
+    """
+    d = _wp_domain(domain)
+    srcs = [p for p in (parts or []) if p and p.strip()]
+    if path and path.strip():
+        if srcs:
+            raise ValueError("Entweder path oder parts angeben, nicht beides.")
+        srcs = [path]
+    if not srcs:
+        raise ValueError("path oder parts angeben.")
+    if len(srcs) > 200:
+        raise ValueError("Höchstens 200 Teilstücke.")
+    ctx = _vhost_ctx(d)
+    src_parts = [_strict_parts(p) for p in srcs]
+    for sp in src_parts:
+        _check_not_protected(sp, ctx, "Quelle")
+    dparts = _strict_parts(dest)
+    if dparts not in ctx["docroots"]:
+        _check_not_protected(dparts, ctx, "Ziel")
+    base = ctx["base"]
+    src_full = [f"{base}/{'/'.join(sp)}" for sp in src_parts]
+    dest_full = f"{base}/{'/'.join(dparts)}"
+    client = _ssh_connect()
+    try:
+        sftp = client.open_sftp()
+        try:
+            total = 0
+            for f in src_full:
+                _assert_real_within_vhost(sftp, f, d)
+                try:
+                    st = sftp.lstat(f)
+                except FileNotFoundError:
+                    raise ValueError(f"{f[len(base) + 1:]} nicht gefunden.")
+                if not stat.S_ISREG(st.st_mode):
+                    raise ValueError(f"{f[len(base) + 1:]} ist keine reguläre Datei.")
+                total += st.st_size
+            _assert_real_within_vhost(sftp, dest_full, d)
+            existing: list[str] = []
+            try:
+                dst = sftp.lstat(dest_full)
+                if not stat.S_ISDIR(dst.st_mode):
+                    raise ValueError(f"Ziel {dest} ist kein Ordner.")
+                existing = sorted(sftp.listdir(dest_full))
+            except FileNotFoundError:
+                pass
+        finally:
+            sftp.close()
+        if existing and not overwrite:
+            raise ValueError(
+                f"Ziel {dest} ist nicht leer ({len(existing)} Einträge, z.B. {', '.join(existing[:8])}) - "
+                "overwrite=true setzen, um zu überschreiben."
+            )
+        login, home = ctx["login"], base
+        if len(src_full) == 1:
+            zip_path = src_full[0]
+            prep = ""
+        else:
+            zip_path = f"{base}/{_EXTRACT_TMP_SUBDIR}/{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}-{os.urandom(4).hex()}.zip"
+            prep = (f"umask 077 && mkdir -p {shlex.quote(posixpath.dirname(zip_path))} && "
+                    f"cat {' '.join(shlex.quote(f) for f in src_full)} > {shlex.quote(zip_path)} && ")
+        qz = shlex.quote(zip_path)
+        out, err, rc = _run_as_sysuser(client, login, home, prep + f"zipinfo -1 {qz}", timeout=_MIGRATE_TIMEOUT)
+        if rc != 0:
+            if prep:
+                _run_as_sysuser(client, login, home, f"rm -f {qz}")
+            raise ValueError(f"Kein gültiges ZIP-Archiv: {(err or out).strip()[-400:]}")
+        entries = [e for e in out.splitlines() if e.strip()]
+        bad = [e for e in entries if e.startswith("/") or "\\" in e or ".." in e.split("/")]
+        lout, _, _ = _run_as_sysuser(client, login, home, f"zipinfo {qz} | grep '^l' | head -n 5 || true",
+                                     timeout=_MIGRATE_TIMEOUT)
+        sizes, _, _ = _run_as_sysuser(client, login, home, f"zipinfo -t {qz} || true", timeout=_MIGRATE_TIMEOUT)
+        if bad or lout.strip():
+            if prep:
+                _run_as_sysuser(client, login, home, f"rm -f {qz}")
+            raise ValueError(
+                "Archiv abgelehnt - unsichere Einträge: "
+                + ", ".join((bad[:5] if bad else []) + ([l.split()[-1] for l in lout.splitlines()][:5]))
+            )
+        top = sorted({e.split("/")[0] + ("/" if "/" in e else "") for e in entries})
+        info = {
+            "domain": d, "archiv": srcs if len(srcs) > 1 else srcs[0], "groesse_archiv_bytes": total,
+            "eintraege": len(entries), "zusammenfassung": sizes.strip().splitlines()[-1] if sizes.strip() else "",
+            "oberste_ebene": top[:40], "ziel": dest,
+            "ziel_bestehend": len(existing), "ueberschreiben": bool(existing),
+            "quelle_loeschen": delete_source,
+        }
+        if not confirm:
+            if prep:
+                _run_as_sysuser(client, login, home, f"rm -f {qz}")
+            info["ergebnis"] = "Vorschau - nichts entpackt. Mit confirm=true ausführen."
+            return json.dumps(info, ensure_ascii=False, indent=2)
+        qd = shlex.quote(dest_full)
+        out, err, rc = _run_as_sysuser(
+            client, login, home,
+            f"umask 022 && mkdir -p {qd} && unzip -q -o {qz} -d {qd} && chmod -R go-w {qd}",
+            timeout=_MIGRATE_TIMEOUT,
+        )
+        if prep:
+            _run_as_sysuser(client, login, home, f"rm -f {qz}")
+        if rc == 0 and delete_source:
+            _run_as_sysuser(client, login, home, "rm -f " + " ".join(shlex.quote(f) for f in src_full))
+        cnt, _, _ = _run_as_sysuser(client, login, home, f"find {qd} -type f | wc -l", timeout=_MIGRATE_TIMEOUT)
+    finally:
+        client.close()
+    _audit("extract_archive", domain=d, archive=srcs[0] if len(srcs) == 1 else f"{len(srcs)} Teile",
+           dest=dest, rc=rc, delete_source=delete_source)
+    if rc != 0:
+        raise SSHError(f"Entpacken fehlgeschlagen (exit {rc}): {(err or out).strip()[-800:]}")
+    info["dateien_im_ziel"] = cnt.strip()
+    info["ergebnis"] = "Entpackt." + (" Quelle gelöscht." if delete_source else "")
+    return json.dumps(info, ensure_ascii=False, indent=2)
+
+
+def _wp_db_backup(client: paramiko.SSHClient, ctx: dict[str, Any], wp_dir: str, subdir: str,
+                  d: str, source: str, extra: dict[str, Any]) -> tuple[str, str]:
+    ts = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+    backup_id = f"{ts}-{os.urandom(4).hex()}@{d}"
+    bdir = f"{ctx['home']}/{subdir}/{backup_id}"
+    _, err, rc = _wp_run_as_user(client, ctx, ["/bin/sh", "-c", 'umask 077 && mkdir -p "$1"', "sh", bdir],
+                                 cwd=ctx["home"])
+    if rc != 0:
+        raise SSHError(f"Backup-Ordner konnte nicht angelegt werden - nichts geändert: {err.strip()}")
+    out, err, rc = _wp_cli_run(client, ctx, wp_dir, ["db", "export", f"{bdir}/db.sql", "--quiet"],
+                               timeout=_MIGRATE_TIMEOUT)
+    if rc != 0:
+        raise SSHError(f"Datenbank-Backup fehlgeschlagen - nichts geändert: {_wp_cli_error(out, err)}")
+    manifest = json.dumps({"id": backup_id, "created": datetime.datetime.now().isoformat(timespec="seconds"),
+                           "source": source, "domain": d, **extra}, ensure_ascii=False).encode()
+    _wp_run_as_user(client, ctx, ["/bin/sh", "-c", 'umask 077 && cat > "$1"', "sh", f"{bdir}/manifest.json"],
+                    cwd=ctx["home"], stdin_data=manifest)
+    return backup_id, bdir
+
+
+def _wp_db_tables(client: paramiko.SSHClient, ctx: dict[str, Any], wp_dir: str) -> list[str]:
+    out, err, rc = _wp_cli_run(client, ctx, wp_dir, ["db", "query", "SHOW TABLES", "--skip-column-names"])
+    if rc != 0:
+        raise ValueError(f"Datenbank nicht erreichbar (wp-config prüfen): {_wp_cli_error(out, err)}")
+    return [l.strip() for l in out.splitlines() if l.strip()]
+
+
+@mcp.tool()
+@_wp_reporting
+def wp_db_import(domain: str, wp_path: str, path: str, replace_existing: bool = False,
+                 confirm: bool = False) -> str:
+    """Importiert einen SQL-Dump in die Datenbank einer WordPress-Installation
+    (`wp db import` als System-User, mit den Zugangsdaten aus deren
+    wp-config.php - der Dump kann damit nur in diese eine Datenbank
+    schreiben).
+
+    domain/wp_path wie bei den übrigen wp_*-Tools (wp_path z.B. "httpdocs").
+    path: SQL-Datei relativ zum Vhost-Root (z.B. per upload_begin nach
+    "upload/site.sql" hochgeladen). Enthält die Datenbank schon Tabellen,
+    braucht es replace_existing=true; dann vorher Export als Backup unter
+    .plesk-mcp/wp-db-import-backups/<backup_id>/. Ohne confirm=true nur
+    Vorschau (Datei, Grösse, Datenbank, vorhandene Tabellen).
+    """
+    d = _wp_domain(domain)
+    sp = _strict_parts(path)
+    client = _ssh_connect()
+    try:
+        ctx = _wp_context(client, d)
+        vctx = _vhost_ctx(d)
+        _check_not_protected(sp, vctx, "path")
+        sql_full = f"{vctx['base']}/{'/'.join(sp)}"
+        sftp = client.open_sftp()
+        try:
+            wp_dir = _wp_install_dir(sftp, d, wp_path)
+            _assert_real_within_vhost(sftp, sql_full, d)
+            try:
+                st = sftp.lstat(sql_full)
+            except FileNotFoundError:
+                raise ValueError(f"{path} nicht gefunden.")
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError(f"{path} ist keine reguläre Datei.")
+        finally:
+            sftp.close()
+        tables = _wp_db_tables(client, ctx, wp_dir)
+        dbname = _wp_cli(client, ctx, wp_dir, ["config", "get", "DB_NAME"]).strip().splitlines()[-1].strip()
+        result: dict[str, Any] = {"domain": d, "wp_path": wp_dir, "datei": path, "groesse_bytes": st.st_size,
+                                  "datenbank": dbname, "tabellen_vorher": len(tables)}
+        if tables and not replace_existing:
+            raise ValueError(
+                f"Datenbank {dbname} enthält bereits {len(tables)} Tabellen - replace_existing=true setzen "
+                "(vorher wird ein Backup erstellt)."
+            )
+        if not confirm:
+            result["ergebnis"] = "Vorschau - nichts importiert. Mit confirm=true ausführen."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        if tables:
+            backup_id, bdir = _wp_db_backup(client, ctx, wp_dir, _WP_IMPORT_BACKUP_SUBDIR, d, "wp_db_import",
+                                            {"wp_path": wp_path, "datei": path})
+            result.update({"backup_id": backup_id, "backup_ordner": bdir})
+        out, err, rc = _wp_cli_run(client, ctx, wp_dir, ["db", "import", sql_full], timeout=_MIGRATE_TIMEOUT)
+        if rc != 0:
+            raise SSHError(f"Import fehlgeschlagen: {_wp_cli_error(out, err, lines=10)}")
+        after = _wp_db_tables(client, ctx, wp_dir)
+        prefix = _wp_cli(client, ctx, wp_dir, ["config", "get", "table_prefix"]).strip().splitlines()[-1].strip()
+        urls = ""
+        if re.match(r"^[A-Za-z0-9_]{0,64}$", prefix) and f"{prefix}options" in after:
+            o, _, r = _wp_cli_run(client, ctx, wp_dir, [
+                "db", "query",
+                f"SELECT option_name, option_value FROM `{prefix}options` WHERE option_name IN ('siteurl','home')",
+                "--skip-column-names"])
+            urls = o.strip() if r == 0 else ""
+    finally:
+        client.close()
+    _audit("wp_db_import", domain=d, wp_path=wp_path, datei=path, tabellen=len(after))
+    result.update({"tabellen_nachher": len(after), "tabellen_praefix": prefix,
+                   "siteurl_home": urls.splitlines(), "ergebnis": "Importiert."})
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+@_wp_reporting
+def wp_search_replace(domain: str, wp_path: str, old: str, new: str, include_guid: bool = False,
+                      confirm: bool = False) -> str:
+    """Ersetzt einen Text in allen Tabellen einer WordPress-Installation
+    (`wp search-replace --all-tables-with-prefix --precise`, serialisierte
+    Daten werden korrekt angepasst), z.B. die Staging-URL durch die
+    Live-Domain nach einem Umzug.
+
+    domain/wp_path wie bei den übrigen wp_*-Tools. old/new: Suchtext und
+    Ersatz (je max. 500 Zeichen, keine Zeilenumbrüche). include_guid=false
+    (Standard) lässt die Spalte guid unverändert. Ohne confirm=true nur
+    Vorschau (Anzahl Ersetzungen per --dry-run). Mit confirm=true vorher
+    Datenbank-Export als Backup unter .plesk-mcp/wp-search-replace-backups/,
+    danach `wp cache flush`.
+    """
+    o_, n_ = old or "", new or ""
+    for v, name in ((o_, "old"), (n_, "new")):
+        if len(v) > 500 or "\n" in v or "\r" in v or "\0" in v:
+            raise ValueError(f"{name}: max. 500 Zeichen, keine Zeilenumbrüche.")
+    if not o_:
+        raise ValueError("old darf nicht leer sein.")
+    if o_ == n_:
+        raise ValueError("old und new sind identisch.")
+    d = _wp_domain(domain)
+    base_args = ["search-replace", o_, n_, "--all-tables-with-prefix", "--precise",
+                 "--skip-plugins", "--skip-themes", "--format=count"]
+    if not include_guid:
+        base_args.append("--skip-columns=guid")
+    client = _ssh_connect()
+    try:
+        ctx = _wp_context(client, d)
+        sftp = client.open_sftp()
+        try:
+            wp_dir = _wp_install_dir(sftp, d, wp_path)
+        finally:
+            sftp.close()
+        out, err, rc = _wp_cli_run(client, ctx, wp_dir, base_args + ["--dry-run"], timeout=_MIGRATE_TIMEOUT)
+        if rc != 0:
+            raise SSHError(f"search-replace (Probe) fehlgeschlagen: {_wp_cli_error(out, err)}")
+        count = out.strip().splitlines()[-1].strip() if out.strip() else "0"
+        result: dict[str, Any] = {"domain": d, "wp_path": wp_dir, "alt": o_, "neu": n_,
+                                  "guid": include_guid, "ersetzungen": count}
+        if not confirm or count == "0":
+            result["ergebnis"] = ("Nichts zu ersetzen." if count == "0"
+                                  else "Vorschau - nichts geändert. Mit confirm=true ausführen.")
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        backup_id, bdir = _wp_db_backup(client, ctx, wp_dir, _WP_SR_BACKUP_SUBDIR, d, "wp_search_replace",
+                                        {"wp_path": wp_path, "alt": o_, "neu": n_})
+        out, err, rc = _wp_cli_run(client, ctx, wp_dir, base_args, timeout=_MIGRATE_TIMEOUT)
+        if rc != 0:
+            raise SSHError(f"search-replace fehlgeschlagen (Backup {backup_id}): {_wp_cli_error(out, err)}")
+        done = out.strip().splitlines()[-1].strip() if out.strip() else "?"
+        _wp_cli_run(client, ctx, wp_dir, ["cache", "flush", "--skip-plugins", "--skip-themes"])
+        out, _, _ = _wp_cli_run(client, ctx, wp_dir, base_args + ["--dry-run"], timeout=_MIGRATE_TIMEOUT)
+        rest = out.strip().splitlines()[-1].strip() if out.strip() else "?"
+    finally:
+        client.close()
+    _audit("wp_search_replace", domain=d, wp_path=wp_path, alt=o_, neu=n_, ersetzt=done, backup_id=backup_id)
+    result.update({"ersetzt": done, "verbleibend": rest, "backup_id": backup_id, "backup_ordner": bdir,
+                   "ergebnis": "Ersetzt und kontrolliert." if rest == "0" else "ACHTUNG: Kontrolle findet noch Treffer."})
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 def main() -> None:
