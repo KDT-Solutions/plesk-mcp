@@ -6566,14 +6566,27 @@ def _wc_coupon_find(client, ctx, wp_dir: str, uid: str, coupon: str) -> dict[str
         data = _wp_json(out)
         return data if isinstance(data, dict) and data.get("id") else None
     code = _wc_check_code(c)
-    rows = _wp_json(_wp_cli(client, ctx, wp_dir, [
-        "wc", "shop_coupon", "list", f"--user={uid}", f"--code={code}", "--status=any",
-        f"--fields={_WC_COUPON_LIST_FIELDS}", "--format=json",
-    ]))
-    if not isinstance(rows, list):
-        raise SSHError("Unerwartete Antwort von 'wp wc shop_coupon list'.")
-    exact = [r for r in rows if str(r.get("code", "")).lower() == code.lower()]
-    return exact[0] if exact else None
+    # `wp wc shop_coupon list` kennt kein --status (nur veröffentlichte Gutscheine);
+    # IDs deshalb über `wp post list` (alle Status ausser Papierkorb), Details per ID.
+    for cid in _wc_coupon_ids(client, ctx, wp_dir, "any", 20, title=code):
+        data = _wc_coupon_find(client, ctx, wp_dir, uid, str(cid))
+        if data and str(data.get("code", "")).lower() == code.lower():
+            return data
+    return None
+
+
+def _wc_coupon_ids(client, ctx, wp_dir: str, status: str, limit: int,
+                   search: str = "", title: str = "") -> list[int]:
+    """Gutschein-IDs über `wp post list`, neueste zuerst. status wie _WC_COUPON_STATUSES."""
+    args = ["post", "list", "--post_type=shop_coupon", f"--post_status={status}",
+            f"--posts_per_page={limit}", "--orderby=date", "--order=DESC", "--format=ids"]
+    if search:
+        args.append(f"--s={search}")
+    if title:
+        args.append(f"--title={title}")
+    out = _wp_strip_notices(_wp_cli(client, ctx, wp_dir, args)).strip()
+    ids = [int(x) for x in out.split() if x.isdigit()]
+    return ids[:limit]
 
 
 def _wc_coupon_backup(client, ctx, wp_path: str, coupon: dict[str, Any], source: str) -> str:
@@ -6639,16 +6652,13 @@ def wc_coupon_list(
         raise ValueError("Ungültiger Suchtext.")
     client, ctx, wp_dir, uid, d = _wc_open(domain, wp_path)
     try:
-        args = ["wc", "shop_coupon", "list", f"--user={uid}", f"--status={status}",
-                f"--per_page={limit}", "--orderby=date", "--order=desc",
-                f"--fields={_WC_COUPON_LIST_FIELDS}", "--format=json"]
-        if q:
-            args.append(f"--search={q}")
-        rows = _wp_json(_wp_cli(client, ctx, wp_dir, args))
+        rows = []
+        for cid in _wc_coupon_ids(client, ctx, wp_dir, status, limit, search=q):
+            data = _wc_coupon_find(client, ctx, wp_dir, uid, str(cid))
+            if data:
+                rows.append(data)
     finally:
         client.close()
-    if not isinstance(rows, list):
-        raise SSHError("Unerwartete Antwort von 'wp wc shop_coupon list'.")
     return json.dumps({"domain": d, "wp_path": wp_dir, "status": status, "anzahl": len(rows),
                        "gutscheine": [_wc_coupon_view(r) for r in rows]}, ensure_ascii=False, indent=2)
 

@@ -1,5 +1,6 @@
 """Tests für die Validierung der wc_coupon_*-Tools (ohne Serverzugriff)."""
 
+import json
 import os
 import sys
 
@@ -76,3 +77,32 @@ def test_create_validation_before_connect():
 def test_rollback_backup_id_validation():
     with pytest.raises(ValueError, match="Ungültige backup_id"):
         server.wc_coupon_rollback("x")
+
+
+def test_coupon_ids_uses_post_list(monkeypatch):
+    calls = []
+
+    def fake_cli(client, ctx, wp_dir, args):
+        calls.append(args)
+        return "12 7\n"
+
+    monkeypatch.setattr(server, "_wp_cli", fake_cli)
+    ids = server._wc_coupon_ids(None, {}, "/x", "any", 5, title="blackfriday20")
+    assert ids == [12, 7]
+    args = calls[0]
+    assert args[:2] == ["post", "list"] and "--post_type=shop_coupon" in args
+    assert "--post_status=any" in args and "--title=blackfriday20" in args
+    assert not any(a.startswith("--status") for a in args)
+
+
+def test_find_by_code_matches_exact_code(monkeypatch):
+    monkeypatch.setattr(server, "_wc_coupon_ids", lambda *a, **k: [3, 4])
+
+    def fake_run(client, ctx, wp_dir, args):
+        cid = args[3]
+        code = {"3": "other", "4": "blackfriday20"}[cid]
+        return json.dumps({"id": int(cid), "code": code}), "", 0
+
+    monkeypatch.setattr(server, "_wp_cli_run", fake_run)
+    found = server._wc_coupon_find(None, {}, "/x", "1", "BLACKFRIDAY20")
+    assert found["id"] == 4
