@@ -17,6 +17,9 @@ Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven K
 | `PLESK_SSH_USER` | nein | `root` | SSH-Benutzer |
 | `PLESK_SSH_PASSWORD` | ja, ausser bei Key-Auth | – | SSH-Passwort |
 | `PLESK_SSH_KEY_PATH` | nein | – | Alternative zu Passwort: Pfad zu einem privaten SSH-Key |
+| `PLESK_SSH_SUDO` | nein | – | `true`: Betrieb ohne root-Login. Mit einem `PLESK_SSH_USER` ungleich `root` laufen alle Kommandos als `sudo -n -H -- /bin/bash -c '<kommando>'` und SFTP über `sudo -n -H -- <sftp-server>`; der User braucht dafür zwei NOPASSWD-Einträge in sudoers (siehe "Betrieb ohne root"). Mit `root` wirkungslos (Warnung beim Start) |
+| `PLESK_SSH_SUDO_SHELL` | nein | `/bin/bash` | Shell für die sudo-Kommandos - muss exakt so im sudoers-Eintrag stehen |
+| `PLESK_SSH_SUDO_SFTP_SERVER` | nein | `/usr/libexec/openssh/sftp-server` | Pfad des SFTP-Servers auf dem Plesk-Server (RHEL/AlmaLinux/CloudLinux; Debian/Ubuntu: `/usr/lib/openssh/sftp-server`) - muss exakt so im sudoers-Eintrag stehen |
 | `PLESK_SSH_TIMEOUT` | nein | `20` | SSH-Verbindungs- und Inaktivitäts-Timeout in Sekunden |
 | `PLESK_SSH_MAX_RUNTIME` | nein | `1800` | Harte Gesamtlaufzeit pro SSH-Kommando in Sekunden (Sicherheitsnetz, unabhängig von fliessender Ausgabe); die Ausgabe ist zusätzlich je Kommando auf 4 MB begrenzt |
 | `PLESK_SSH_HOST_KEY` | ja (oder `PLESK_SSH_KNOWN_HOSTS`) | – | Host-Key des Plesk-Servers als `<typ> <base64>` (z.B. `ssh-ed25519 AAAAC3Nza...`), die Ausgabe von `ssh-keyscan -t ed25519 <host>` mit Hostname davor wird ebenfalls akzeptiert. Der Host-Key wird immer strikt geprüft (MITM-Schutz) - ohne einen der beiden Werte startet der Server nicht |
@@ -57,7 +60,9 @@ Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven K
 | `IMAGE_OPT_BG_TOOL_TIMEOUT` | nein | `300` | Timeout in Sekunden pro Aufruf von `jpegoptim`/`optipng` im Hintergrundmodus (`optimize_images(hintergrund=true)`) |
 | `REPLACE_MAX_BYTES` | nein | `5242880` | Maximale Dateigrösse in Bytes für `replace_in_vhost_file(s)` (Standard 5 MB) |
 | `AUDIT_LOG_FILE` | nein | – | Optionaler Pfad im Container für das Audit-Log (zusätzlich zu stderr) |
+| `SOURCE_URL` | nein | Adresse dieses Repos | Adresse des Quelltexts, die `get_version` meldet. Wer eine geänderte Version betreibt, trägt hier die Adresse des eigenen Quelltexts ein (siehe "Lizenz") |
 | `MCP_API_KEY` | ja | – | Statisches Bearer-Token zum Schutz des öffentlichen Endpoints, mindestens 32 Zeichen Zufall (z.B. `python -c "import secrets; print(secrets.token_urlsafe(32))"`). Ohne Token oder mit kürzerem Token startet der Server nicht (fail-safe) |
+| `MCP_READ_ONLY` | nein | – | `true`: Nur-Lese-Modus. Es werden nur Tools registriert, die ausdrücklich als lesend markiert sind; alle schreibenden Tools existieren für den Client nicht, der Upload-Endpunkt antwortet mit `403` (siehe "Nur-Lese-Modus") |
 | `AUTH_MAX_FAILURES` | nein | `10` | Brute-Force-Bremse: nach so vielen fehlgeschlagenen Bearer-Prüfungen innerhalb von `AUTH_FAILURE_WINDOW` antwortet der Server auf Requests ohne gültiges Token mit `429` statt `401` (ungültiger Wert = Standard) |
 | `AUTH_FAILURE_WINDOW` | nein | `600` | Zeitfenster der Brute-Force-Bremse in Sekunden, gleitend; wird auch als `Retry-After` gesendet (ungültiger Wert = Standard) |
 | `MCP_HOST` | nein | `0.0.0.0` | Bind-Adresse des HTTP-Servers *innerhalb* des Containers |
@@ -100,7 +105,7 @@ Der Container bindet standardmässig auf `0.0.0.0:8422` auf dem Docker-Host (all
 - `plesk_api_get` kann nur GET-Requests stellen - schreibender Zugriff auf die Plesk-REST-API ist über dieses Tool nicht möglich. Der Pfad ist auf `[A-Za-z0-9_/-]` unterhalb von `/api/v2/` begrenzt (`..`, `?`, `#` werden abgelehnt), Query-Parameter nur über `query`.
 - `.env` ist in `.gitignore` und wird nie committet.
 - Das Repo ist öffentlich - die Sicherheit beruht nicht auf Geheimhaltung des Codes, sondern auf `MCP_API_KEY`, den Einmal-Tokens für Uploads und den Prüfungen im Code. Secrets und echte Server-/Kundendaten nie committen.
-- Für produktiven Einsatz: dedizierten SSH-User mit eingeschränkten Rechten (statt root) und/oder Key-Auth statt Passwort erwägen; für `plesk_api_get` den Secret Key optional per `-ip-address` auf die Docker-Host-IP einschränken (siehe `plesk bin secret_key --create`).
+- Für produktiven Einsatz: eigener SSH-User statt root-Login (`PLESK_SSH_SUDO=true`, siehe "Betrieb ohne root") und Key-Auth statt Passwort; wer nur Diagnose braucht, zusätzlich `MCP_READ_ONLY=true` (siehe "Nur-Lese-Modus"); für `plesk_api_get` den Secret Key optional per `-ip-address` auf die Docker-Host-IP einschränken (siehe `plesk bin secret_key --create`).
 - `dns_add_record`/`dns_delete_record`/`dns_update_record` erfordern alle drei `confirm=true` als expliziten Parameter pro Aufruf (kein globaler Schreib-Schalter) und rufen ausschliesslich `plesk bin dns --add`/`--del <domain> -<typ> ...` auf - unterstützte Record-Typen: A, AAAA, CNAME, MX, NS, TXT, SRV (PTR/CAA/DS/HTTPS/TLSA sind nicht abgedeckt, dafür weiterhin `plesk`-CLI direkt auf dem Server nutzen). Legt Plesk bereits einen identischen Record vor, meldet der Server selbst einen Fehler zurück (kein stillschweigendes Überschreiben/Duplizieren). Plesk kennt kein natives Update für einzelne Records - `dns_update_record` bildet das als Delete (anhand der alten Werte) gefolgt von Add (mit den neuen Werten) ab; schlägt das Delete fehl, wird vorher abgebrochen und nichts geändert, schlägt das nachfolgende Add fehl, ist der alte Record bereits weg (Fehlermeldung wird vollständig zurückgegeben, damit er nötigenfalls per `dns_add_record` manuell wiederhergestellt werden kann). Alle drei Tools ändern live auflösbare DNS-Einträge auf einem Produktivserver.
 - `domain_create` ruft ausschliesslich `plesk bin subscription --create <domain> -owner <login> -service-plan <plan> -ip <ip> -hosting false -notify false|true` auf und erfordert `confirm=true` pro Aufruf (ohne nur Vorschau). Vorher wird geprüft: Domainname per Regex, Domain existiert in Plesk noch nicht, Kundenaccount vorhanden (oder `admin`), Servicepaket vorhanden (`psa.Templates`, Typ `domain`), IP ist eine Shared-IP aus `plesk bin ipmanage -l` (ohne Angabe die einzige Shared-IP, bei mehreren muss sie angegeben werden). Danach Kontrolle per `plesk bin subscription --info`, Ausgabe der angelegten DNS-Zone und Eintrag im Audit-Log. Hosting, FTP-Zugang oder Zusatzdomains in bestehenden Subscriptions legt das Tool nicht an.
 - `write_vhost_file`/`delete_vhost_backup` sind strikt auf `/var/www/vhosts/<domain>/` beschränkt (Path-Traversal wie `../../etc/passwd` wird blockiert) und erfordern beide `confirm=true` als expliziten Parameter pro Aufruf - es gibt keinen globalen Schreib-Schalter, ein Aufruf ohne `confirm=true` schlägt immer fehl.
@@ -127,6 +132,59 @@ Der Container bindet standardmässig auf `0.0.0.0:8422` auf dem Docker-Host (all
 **Bekannte Einschränkung von `run_diagnostic`:** Die Wort-Blacklist (restart, stop, start, kill, rm, add, del, set, reset, on, off, update, sh, ...) matcht auch dann, wenn das Wort z.B. in einem Suchmuster für `find`/`grep` oder in einem Optionscluster vorkommt (z.B. `find /var/log -iname "*kill*"` oder `du -sh` werden blockiert; `du -s -h` geht). Für den Anwendungsfall "Fehler/Support-Tickets diagnostizieren" ist das unkritisch, da die dedizierten Tools (`check_oom_kills`, `search_log`) die relevanten Fälle direkt abdecken. Die Woerter add/del/set/reset/on/off/update/start wurden nachtraeglich ergaenzt, nachdem aufgefallen ist, dass `plesk bin dns --add/--del/--set/...` darueber ausfuehrbar waren - ohne `confirm=true`-Absicherung und entgegen dem "read-only"-Anspruch des Tools. Fuer DNS-Aenderungen ausschliesslich `dns_add_record`/`dns_delete_record`/`dns_update_record` verwenden.
 
 **Bekannte Einschränkung von `db_query`/`db_search`:** Die SQL-Wort-Blacklist prüft auf ganze Wörter, blockt also z.B. eine Query mit einer Spalte, die exakt `start` heisst (nicht aber `start_date` o.ä.) - analog zur Einschränkung von `run_diagnostic`. `db_search` ist ein einfacher `LIKE '%term%'`-Scan ohne Index-Nutzung und daher bei sehr grossen Tabellen langsam; `max_tables`/`limit_per_table` begrenzen den Aufwand pro Aufruf.
+
+## Nur-Lese-Modus
+
+Mit `MCP_READ_ONLY=true` bietet der Server nur lesende Tools an - für reine Diagnose oder für einen zweiten, ungefährlichen Zugang neben dem vollen.
+
+- Registriert werden nur Tools mit der Markierung `readOnlyHint=true` (in `server.py`: `@mcp.tool(annotations=_READ_ONLY_TOOL)`, bei den WordPress-Tools `annotations=READ_ONLY`). Alles andere wird gar nicht erst registriert: Der Client sieht die schreibenden Tools nicht und kann sie nicht aufrufen. Ein neues Tool ohne Markierung fehlt im Nur-Lese-Modus automatisch (Standard: verweigern).
+- `PUT /upload/{id}` antwortet immer mit `403 {"error": "read_only"}`, das Papierkorb-Aufräumen beim Start (`VHOST_TRASH_AUTOCLEAN_DAYS`) läuft nicht.
+- `get_version` meldet `"read_only": true` und die Anzahl der ausgeblendeten Tools; der Start schreibt eine Zeile ins Log.
+- Lesend sind unter anderem `domain_info`, `dns_records`, `search_log`, `fpm_journal`, `check_oom_kills`, `server_load`, `read_vhost_file`, `list_vhost_dir`, `db_list`/`db_query`/`db_search`, `run_diagnostic`, `plesk_api_get`, die `*_show`- und `*_list`-Tools sowie die lesenden WordPress-Tools (`wp_post_get`, `wp_post_list` ...).
+- Grenzen: "Nur lesen" heisst nicht "harmlos". Die lesenden Tools kommen an alle Kundendaten (Dateien inkl. `wp-config.php`, Datenbanken, Logs). Und der Schalter wirkt im MCP-Server, nicht auf dem Plesk-Server: Der SSH-Zugang selbst hat weiterhin die Rechte seines Users. Der `MCP_API_KEY` bleibt also genauso schützenswert.
+- Die Regel "jedes Tool ist entweder als lesend markiert oder verlangt `confirm`" prüft `tests/test_read_only.py`.
+
+## Betrieb ohne root
+
+Standard ist ein SSH-Login als `root`. Mit `PLESK_SSH_SUDO=true` und einem eigenen `PLESK_SSH_USER` meldet sich der Container als normaler User an; jedes Kommando läuft dann als `sudo -n -H -- /bin/bash -c '<kommando>'`, SFTP über `sudo -n -H -- /usr/libexec/openssh/sftp-server`. Für die Tools ändert sich nichts.
+
+**Was das bringt - und was nicht:** Die zwei sudo-Einträge unten erlauben beliebige Kommandos als root. Die Rechte auf dem Server sind damit dieselben wie beim root-Login, eine Rechtebeschränkung ist das nicht. Der Gewinn liegt woanders: Der root-Login per SSH kann abgeschaltet werden (`PermitRootLogin no`) und es liegt kein root-Passwort mehr im Stack; der Zugang ist ein eigener Account mit eigenem Key, der sich auf die IP des Docker-Hosts beschränken lässt; jedes Kommando steht im sudo-Log des Servers (unabhängig vom Container); und der Zugang lässt sich über eine einzige Datei entziehen. Eine enge, serverseitig durchgesetzte Positivliste (z.B. ein root-eigenes Wrapper-Skript, das nur die Kommandos des Nur-Lese-Modus zulässt) gibt es noch nicht - Beiträge dazu sind willkommen.
+
+Einrichtung auf dem Plesk-Server (als root, Beispielwerte ersetzen):
+
+```bash
+# 1. System-User ohne Passwort-Login (System-User, damit ihn CageFS auf CloudLinux nicht einsperrt)
+useradd --system --create-home --shell /bin/bash plesk-mcp
+
+# 2. Öffentlichen Key des Containers eintragen, nur von der IP des Docker-Hosts aus gültig
+install -d -m 700 -o plesk-mcp -g plesk-mcp /home/plesk-mcp/.ssh
+echo 'from="203.0.113.10",no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-pty ssh-ed25519 AAAA... plesk-mcp' \
+  > /home/plesk-mcp/.ssh/authorized_keys
+chown plesk-mcp:plesk-mcp /home/plesk-mcp/.ssh/authorized_keys && chmod 600 /home/plesk-mcp/.ssh/authorized_keys
+
+# 3. sudoers-Eintrag: erst prüfen, dann installieren
+cat > /root/plesk-mcp.sudoers <<'EOF'
+Defaults:plesk-mcp !requiretty
+plesk-mcp ALL=(root) NOPASSWD: /bin/bash -c *, /usr/libexec/openssh/sftp-server
+EOF
+visudo -cf /root/plesk-mcp.sudoers && install -m 0440 -o root -g root /root/plesk-mcp.sudoers /etc/sudoers.d/plesk-mcp
+rm -f /root/plesk-mcp.sudoers
+
+# 4. Kontrolle: beide Zeilen müssen "0" bzw. "/root" ausgeben
+runuser -u plesk-mcp -- sudo -n -H -- /bin/bash -c 'id -u; echo $HOME'
+```
+
+Danach im Stack `PLESK_SSH_USER=plesk-mcp`, `PLESK_SSH_SUDO=true` und `PLESK_SSH_KEY_PATH` (gemounteter privater Key) setzen, `PLESK_SSH_PASSWORD` leeren und neu ausrollen. `get_version` meldet dann `"ssh_sudo": true`.
+
+Hinweise:
+
+- Die Pfade im sudoers-Eintrag müssen exakt zu `PLESK_SSH_SUDO_SHELL` und `PLESK_SSH_SUDO_SFTP_SERVER` passen. Auf Debian/Ubuntu liegt der SFTP-Server unter `/usr/lib/openssh/sftp-server`.
+- CloudLinux: Der User darf nicht in CageFS laufen, sonst gibt es dort kein sudo (`cagefsctl --user-status plesk-mcp`, bei Bedarf `cagefsctl --disable plesk-mcp`).
+- Schränkt `sshd_config` die Anmeldung ein (`AllowUsers`/`AllowGroups`), den User dort aufnehmen.
+- Lehnt sudo ab (Eintrag fehlt oder Pfad passt nicht), melden die Tools "sudo auf dem Plesk-Server hat das Kommando abgelehnt" bzw. "SFTP ueber sudo konnte nicht gestartet werden" statt einer irreführenden Ausgabe.
+- Ist `PLESK_SSH_USER` nicht `root` und `PLESK_SSH_SUDO` nicht gesetzt, warnt der Server beim Start - ohne sudo scheitern die meisten Tools an fehlenden Rechten.
+- sudo protokolliert jede Kommandozeile vollständig im Log des Servers (z.B. `/var/log/secure`). Passwörter stehen dort nicht (sie werden erst auf dem Server erzeugt bzw. gelesen), wohl aber Domainnamen, Pfade und der Text von `db_query`-Abfragen. Dateioperationen und die Bildoptimierung übergeben ihr Hilfsprogramm als Argument (rund 30-40 KB pro Aufruf) - das Log wächst entsprechend schneller, die Logrotation des Servers sollte das abdecken.
+- root-Login erst abschalten, wenn der neue Zugang geprüft ist (z.B. `domain_info`, `read_vhost_file`, `search_log`).
 
 ## Verfügbare Tools
 
@@ -517,11 +575,24 @@ Imunify360 meldet gelegentlich "Malware" in rotierten Logdateien, weil dort prot
 
 ## Tests
 
-Die Positiv-Listen von `run_diagnostic` (`tests/test_diagnostic.py`), Bearer-/Startprüfungen (`tests/test_http_auth.py`), SSH-Ausgabegrenze, Deadline und Host-Key-Pinning gegen einen lokalen paramiko-Mini-SSH-Server (`tests/test_ssh_exec.py`), die Pfadvalidierung der Imunify-Tools, URL-Validierung und Auswertung von `pagespeed_insights`, die Validierung von `wp_option_update`, `wp_custom_css_update`, `wp_comment_moderate` und der `wc_coupon_*`-Tools sowie Upload, Fetch (SSRF), Dateiverwaltung, Textersetzung, die PHP-Handler-, PHP-Einstellungs- und Webserver-Tools (mit simuliertem SSH bzw. Plesk) sowie die Bildoptimierung (Worker lokal, Testbilder per Pillow; auch Hintergrundjobs, Abbruch und Verbindungsverlust) sind ohne Plesk-Server testbar. `tests/test_wpsite.py` prüft die WordPress-Tools (Seitenangabe, PHP-Skript, Auswertung, Registrierung) und optional echt gegen eine lokale WordPress-Installation ohne Plugin (`WPSITE_TEST_WP=<pfad>`, siehe Kopf der Datei). `tests/test_vhost_files.py` und `tests/test_replace.py` starten den Datei-Helper lokal gegen ein temporäres Verzeichnis und brauchen dafür Linux und root (`chown`), sonst werden diese Tests übersprungen:
+Die Positiv-Listen von `run_diagnostic` (`tests/test_diagnostic.py`), Bearer-/Startprüfungen (`tests/test_http_auth.py`), SSH-Ausgabegrenze, Deadline und Host-Key-Pinning gegen einen lokalen paramiko-Mini-SSH-Server (`tests/test_ssh_exec.py`), die Pfadvalidierung der Imunify-Tools, URL-Validierung und Auswertung von `pagespeed_insights`, die Validierung von `wp_option_update`, `wp_custom_css_update`, `wp_comment_moderate` und der `wc_coupon_*`-Tools sowie Upload, Fetch (SSRF), Dateiverwaltung, Textersetzung, die PHP-Handler-, PHP-Einstellungs- und Webserver-Tools (mit simuliertem SSH bzw. Plesk) sowie die Bildoptimierung (Worker lokal, Testbilder per Pillow; auch Hintergrundjobs, Abbruch und Verbindungsverlust) sind ohne Plesk-Server testbar. `tests/test_read_only.py` prüft den Nur-Lese-Modus (registrierte Tools, Upload-Sperre) und die Markierung aller Tools, `tests/test_ssh_sudo.py` den Betrieb ohne root (sudo-Präfix für Kommandos, Datei-Helper und SFTP, Ablehnung durch sudo) gegen einen lokalen Mini-SSH-Server. `tests/test_wpsite.py` prüft die WordPress-Tools (Seitenangabe, PHP-Skript, Auswertung, Registrierung) und optional echt gegen eine lokale WordPress-Installation ohne Plugin (`WPSITE_TEST_WP=<pfad>`, siehe Kopf der Datei). `tests/test_vhost_files.py` und `tests/test_replace.py` starten den Datei-Helper lokal gegen ein temporäres Verzeichnis und brauchen dafür Linux und root (`chown`), sonst werden diese Tests übersprungen:
 
 ```bash
 pip install -r requirements.txt pytest pytest-asyncio
 pytest
 ```
 
-Die Tests laufen nicht in GitHub Actions und landen nicht im Docker-Image (dort werden nur `server.py` und `wpsite/` kopiert).
+Die Tests laufen nicht in GitHub Actions und landen nicht im Docker-Image (dort werden nur `server.py`, `wpsite/` und `LICENSE` kopiert).
+
+## Lizenz
+
+Copyright (C) 2026 KDT-Solutions GmbH
+
+plesk-mcp ist freie Software unter der GNU Affero General Public License, Version 3 (AGPL-3.0-only). Der vollständige Wortlaut steht in `LICENSE`.
+
+- Nutzen, Ändern und Weitergeben sind erlaubt. Wer eine geänderte Version weitergibt oder als Netzwerkdienst für andere betreibt, muss den Quelltext dieser Version unter derselben Lizenz zugänglich machen.
+- Es gibt keine Gewährleistung.
+- `get_version` meldet Lizenz und Adresse des Quelltexts. Wer eine geänderte Version betreibt, trägt die Adresse des eigenen Quelltexts über `SOURCE_URL` ein.
+- Beiträge (Pull Requests) werden unter derselben Lizenz angenommen.
+- Der PHP-Code unter `wpsite/php/tabside-mcp/` stammt aus dem Plugin `tabside-mcp` (Repo `tabside/wordpress-mcp`) und steht dort unter GPL-2.0-or-later; diese Lizenz gilt für diese Dateien auch hier.
+- Die Abhängigkeiten aus `requirements.txt` stehen unter ihren eigenen Lizenzen (MIT, BSD, Apache-2.0, LGPL-2.1, MPL-2.0 und weitere).

@@ -18,6 +18,10 @@ services:
       - PLESK_SSH_PASSWORD=${PLESK_SSH_PASSWORD}
       - PLESK_SSH_KEY_PATH=${PLESK_SSH_KEY_PATH:-}
       - PLESK_SSH_TIMEOUT=${PLESK_SSH_TIMEOUT:-20}
+      # Betrieb ohne root-Login (README "Betrieb ohne root")
+      - PLESK_SSH_SUDO=${PLESK_SSH_SUDO:-}
+      - PLESK_SSH_SUDO_SHELL=${PLESK_SSH_SUDO_SHELL:-/bin/bash}
+      - PLESK_SSH_SUDO_SFTP_SERVER=${PLESK_SSH_SUDO_SFTP_SERVER:-/usr/libexec/openssh/sftp-server}
       - PLESK_SSH_KNOWN_HOSTS=${PLESK_SSH_KNOWN_HOSTS:-}
       # Pflicht (einer von beiden): ohne gepinnten Host-Key startet der Server nicht
       - PLESK_SSH_HOST_KEY=${PLESK_SSH_HOST_KEY:-}
@@ -54,8 +58,11 @@ services:
       - PLESK_HELPER_PYTHON=${PLESK_HELPER_PYTHON:-/usr/libexec/platform-python}
       - PLESK_HELPER_TIMEOUT=${PLESK_HELPER_TIMEOUT:-600}
       - AUDIT_LOG_FILE=${AUDIT_LOG_FILE:-}
+      - SOURCE_URL=${SOURCE_URL:-}
       # Mindestens 32 Zeichen, sonst kein Start
       - MCP_API_KEY=${MCP_API_KEY}
+      # true = nur lesende Tools (README "Nur-Lese-Modus")
+      - MCP_READ_ONLY=${MCP_READ_ONLY:-}
       - AUTH_MAX_FAILURES=${AUTH_MAX_FAILURES:-10}
       - AUTH_FAILURE_WINDOW=${AUTH_FAILURE_WINDOW:-600}
       - MCP_HOST=0.0.0.0
