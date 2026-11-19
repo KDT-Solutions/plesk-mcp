@@ -153,7 +153,7 @@ Standard ist ein SSH-Login als `root`. Mit `PLESK_SSH_SUDO=true` und einem eigen
 Einrichtung auf dem Plesk-Server (als root, Beispielwerte ersetzen):
 
 ```bash
-# 1. System-User ohne Passwort-Login (System-User, damit ihn CageFS auf CloudLinux nicht einsperrt)
+# 1. System-User ohne Passwort-Login. CloudLinux: zusätzlich --uid <frei, unter 500> angeben (siehe Hinweise)
 useradd --system --create-home --shell /bin/bash plesk-mcp
 
 # 2. Öffentlichen Key des Containers eintragen, nur von der IP des Docker-Hosts aus gültig
@@ -165,6 +165,7 @@ chown plesk-mcp:plesk-mcp /home/plesk-mcp/.ssh/authorized_keys && chmod 600 /hom
 # 3. sudoers-Eintrag: erst prüfen, dann installieren
 cat > /root/plesk-mcp.sudoers <<'EOF'
 Defaults:plesk-mcp !requiretty
+Defaults:plesk-mcp secure_path = /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 plesk-mcp ALL=(root) NOPASSWD: /bin/bash -c *, /usr/libexec/openssh/sftp-server
 EOF
 visudo -cf /root/plesk-mcp.sudoers && install -m 0440 -o root -g root /root/plesk-mcp.sudoers /etc/sudoers.d/plesk-mcp
@@ -179,7 +180,18 @@ Danach im Stack `PLESK_SSH_USER=plesk-mcp`, `PLESK_SSH_SUDO=true` und `PLESK_SSH
 Hinweise:
 
 - Die Pfade im sudoers-Eintrag müssen exakt zu `PLESK_SSH_SUDO_SHELL` und `PLESK_SSH_SUDO_SFTP_SERVER` passen. Auf Debian/Ubuntu liegt der SFTP-Server unter `/usr/lib/openssh/sftp-server`.
-- CloudLinux: Der User darf nicht in CageFS laufen, sonst gibt es dort kein sudo (`cagefsctl --user-status plesk-mcp`, bei Bedarf `cagefsctl --disable plesk-mcp`).
+- `secure_path`: sudo ersetzt den Suchpfad durch seinen eigenen (RHEL-Standard ohne `/usr/local/bin` und `/usr/local/sbin`). Die Zeile im sudoers-Eintrag stellt den Suchpfad her, den root bei einer SSH-Anmeldung hat.
+- CloudLinux: `pam_lve` steckt SSH-Sitzungen von Usern ab einer Mindest-UID in ein LVE mit Ressourcenlimits (Standard 500, siehe `grep pam_lve /etc/pam.d/sshd`), und alle über sudo gestarteten Kommandos bleiben darin. Den User deshalb mit einer freien UID unter diesem Wert anlegen (`useradd --system --uid 450 ...`, Gruppe mit `groupadd --system --gid 450` vorab) und prüfen: `cagefsctl --user-status plesk-mcp` muss `Disabled` melden, `lvectl list` darf die UID nicht führen.
+- Ohne gemounteten Key geht auch ein Passwort (`PLESK_SSH_PASSWORD`). Die Beschränkung auf die IP des Docker-Hosts übernimmt dann `sshd_config` statt `authorized_keys` (am Ende der Datei, vorher mit `sshd -t` prüfen, danach `systemctl reload sshd`):
+
+  ```
+  Match User plesk-mcp Address *,!203.0.113.10
+      PasswordAuthentication no
+      PubkeyAuthentication no
+      KbdInteractiveAuthentication no
+      GSSAPIAuthentication no
+  Match all
+  ```
 - Schränkt `sshd_config` die Anmeldung ein (`AllowUsers`/`AllowGroups`), den User dort aufnehmen.
 - Lehnt sudo ab (Eintrag fehlt oder Pfad passt nicht), melden die Tools "sudo auf dem Plesk-Server hat das Kommando abgelehnt" bzw. "SFTP ueber sudo konnte nicht gestartet werden" statt einer irreführenden Ausgabe.
 - Ist `PLESK_SSH_USER` nicht `root` und `PLESK_SSH_SUDO` nicht gesetzt, warnt der Server beim Start - ohne sudo scheitern die meisten Tools an fehlenden Rechten.
