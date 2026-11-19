@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.41
+
+- Neu: Nur-Lese-Modus (`MCP_READ_ONLY=true`). Registriert werden nur Tools mit `readOnlyHint=true`; schreibende Tools existieren für den Client nicht, `PUT /upload/{id}` antwortet mit `403`, das Papierkorb-Aufräumen beim Start läuft nicht. Die 37 lesenden Tools in `server.py` sind dafür als lesend markiert (`annotations=_READ_ONLY_TOOL`) - Clients sehen die Markierung auch im normalen Betrieb.
+- Neu: Betrieb ohne root-Login (`PLESK_SSH_SUDO=true` mit eigenem `PLESK_SSH_USER`). Kommandos laufen als `sudo -n -H -- /bin/bash -c '<kommando>'`, SFTP über `sudo -n -H -- <sftp-server>`; lehnt sudo ab, kommt eine klare Fehlermeldung. Neue Variablen `PLESK_SSH_SUDO_SHELL` und `PLESK_SSH_SUDO_SFTP_SERVER`. Einrichtung und Grenzen (die Rechte bleiben die von root) im README unter "Betrieb ohne root".
+- `get_version` meldet zusätzlich `read_only` und `ssh_sudo`.
+- Ohne die neuen Variablen ändert sich am Verhalten nichts.
+- Tests: `tests/test_read_only.py`, `tests/test_ssh_sudo.py`.
+
 ## 0.40
 
 - Fix `wc_coupon_get`, `wc_coupon_list`, `wc_coupon_create`, `wc_coupon_update` und `wc_coupon_delete`: `wp wc shop_coupon list` kennt kein `--status` ("unknown --status parameter"), dadurch schlugen alle Gutschein-Tools fehl, die per Code suchen. Gutschein-IDs kommen jetzt über `wp post list --post_type=shop_coupon` (inkl. Entwürfe/geplante), Details per ID mit `wp wc shop_coupon get`.

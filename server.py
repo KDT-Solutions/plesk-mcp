@@ -79,6 +79,7 @@ from typing import Any
 import paramiko
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from mcp_types import ToolAnnotations
 
 
 _HTTP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
@@ -92,7 +93,7 @@ _MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
 # Commit mit einer neuen Basis ergibt also <Basis>.0.
 # Im Docker-Image setzt GitHub Actions die fertige Version als APP_VERSION,
 # lokal (Git-Checkout) wird sie direkt aus der Git-Historie berechnet.
-_VERSION_BASE = "0.40"
+_VERSION_BASE = "0.41"
 _VERSION_PATHS = ["server.py", "wpsite", "Dockerfile", "requirements.txt", ".github/workflows/docker-publish.yml"]
 
 
@@ -128,7 +129,48 @@ class _UserError(ToolError, ValueError):
     """Ablehnung/Validierungsfehler mit Klartext-Meldung für den Client."""
 
 
-_mcp_tool = mcp.tool
+_mcp_tool_unfiltered = mcp.tool
+
+
+def _env_flag(name: str) -> bool:
+    """Schalter aus der Umgebung: 1/true/yes/on (ohne Gross-/Kleinschreibung)."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+# Nur-Lese-Modus (MCP_READ_ONLY=true): Es werden nur Tools registriert, die
+# ausdruecklich als lesend markiert sind (annotations mit readOnlyHint=True).
+# Alles andere - auch ein neues Tool, bei dem die Markierung vergessen wurde -
+# existiert fuer den Client dann nicht (Default: verweigern). Der Upload-
+# Endpunkt und das Papierkorb-Aufraeumen beim Start sind ebenfalls aus.
+_READ_ONLY = _env_flag("MCP_READ_ONLY")
+# Markierung fuer lesende Tools in diesem Modul (die WordPress-Tools unter
+# wpsite/ bringen ihre eigenen Annotationen mit).
+_READ_ONLY_TOOL = ToolAnnotations(readOnlyHint=True, destructiveHint=False)
+# Im Nur-Lese-Modus nicht registrierte Tools (Namen), fuer get_version/Startlog.
+_READ_ONLY_HIDDEN: list[str] = []
+
+
+def _is_read_only_tool(annotations: Any) -> bool:
+    """True nur bei ausdruecklichem readOnlyHint=True (Feldname je nach
+    Bibliotheksversion read_only_hint oder readOnlyHint)."""
+    for field in ("read_only_hint", "readOnlyHint"):
+        if getattr(annotations, field, None) is True:
+            return True
+    return False
+
+
+def _mcp_tool(*args: Any, **kwargs: Any):
+    """mcp.tool() mit Nur-Lese-Filter: Im Nur-Lese-Modus wird ein Tool ohne
+    readOnlyHint=True nicht registriert, die Funktion selbst bleibt im Modul."""
+    if _READ_ONLY and not _is_read_only_tool(kwargs.get("annotations")):
+        def skip(fn):
+            name = kwargs.get("name") or fn.__name__
+            if name not in _READ_ONLY_HIDDEN:
+                _READ_ONLY_HIDDEN.append(name)
+            return fn
+
+        return skip
+    return _mcp_tool_unfiltered(*args, **kwargs)
 
 
 def _tool_with_messages(*args: Any, **kwargs: Any):
@@ -166,6 +208,18 @@ _SSH_USER = os.environ.get("PLESK_SSH_USER", "root")
 _SSH_PASSWORD = os.environ.get("PLESK_SSH_PASSWORD")
 _SSH_KEY_PATH = os.environ.get("PLESK_SSH_KEY_PATH")  # Alternative zu Passwort
 _SSH_TIMEOUT = int(os.environ.get("PLESK_SSH_TIMEOUT", "20"))
+# Betrieb ohne root-Login (PLESK_SSH_SUDO=true, nur mit PLESK_SSH_USER != root):
+# Jedes Kommando laeuft als "sudo -n -H -- <shell> -c '<kommando>'", SFTP ueber
+# "sudo -n -H -- <sftp-server>". Der SSH-User braucht dafuer genau diese zwei
+# NOPASSWD-Eintraege in sudoers (siehe README "Betrieb ohne root"). Die Rechte
+# auf dem Server bleiben damit die von root - gewonnen wird: kein root-Login
+# per SSH noetig, eigener Account mit eigenem Key, jedes Kommando im sudo-Log
+# des Servers, Entzug ueber eine einzige sudoers-Datei.
+_SSH_SUDO = _env_flag("PLESK_SSH_SUDO") and _SSH_USER != "root"
+_SSH_SUDO_SHELL = os.environ.get("PLESK_SSH_SUDO_SHELL", "").strip() or "/bin/bash"
+_SSH_SUDO_SFTP_SERVER = (
+    os.environ.get("PLESK_SSH_SUDO_SFTP_SERVER", "").strip() or "/usr/libexec/openssh/sftp-server"
+)
 # Host-Key-Verifikation (MITM-Schutz). Beide Werte kommen aus der Umgebung -
 # im oeffentlichen Repo darf kein Host-Key hinterlegt sein.
 #   PLESK_SSH_KNOWN_HOSTS: Pfad zu einer known_hosts-Datei (gemountet).
@@ -436,12 +490,73 @@ def _key_fingerprint(key: paramiko.PKey) -> str:
     return "SHA256:" + _b64.b64encode(hashlib.sha256(key.asbytes()).digest()).decode().rstrip("=")
 
 
+def _sudo_wrap(command: str) -> str:
+    """Kommando fuer den Betrieb ohne root-Login: als root ueber sudo in einer
+    Shell. -n: nie nach einem Passwort fragen (scheitert stattdessen sofort),
+    -H: HOME des Zielusers (wie beim root-Login), --: Ende der sudo-Optionen."""
+    return f"sudo -n -H -- {shlex.quote(_SSH_SUDO_SHELL)} -c {shlex.quote(command)}"
+
+
+def _ssh_command(command: str) -> str:
+    """Das Kommando, wie es tatsaechlich an den Server geht (mit oder ohne sudo)."""
+    return _sudo_wrap(command) if _SSH_SUDO else command
+
+
+_SUDO_REFUSED_PREFIXES = ("sudo:", "Sorry, user ", "Leider darf der Benutzer ")
+
+
+def _check_sudo_refused(err: str, exit_code: int) -> None:
+    """sudo selbst hat abgelehnt (kein/zu enger sudoers-Eintrag, Passwort noetig):
+    als klaren Fehler melden statt als Ausgabe des eigentlichen Kommandos."""
+    if not _SSH_SUDO or exit_code != 1:
+        return
+    first = err.strip().splitlines()[0] if err.strip() else ""
+    if first.startswith(_SUDO_REFUSED_PREFIXES):
+        raise SSHError(
+            f"sudo auf dem Plesk-Server hat das Kommando abgelehnt ({first[:200]}). "
+            f"sudoers-Eintrag des SSH-Users {_SSH_USER} pruefen (README 'Betrieb ohne root')."
+        )
+
+
+class _SudoSSHClient(paramiko.SSHClient):
+    """SSH-Verbindung als Nicht-root-User: Kommandos und SFTP laufen ueber sudo."""
+
+    def exec_command(self, command, *args: Any, **kwargs: Any):  # type: ignore[override]
+        return super().exec_command(_sudo_wrap(command), *args, **kwargs)
+
+    def open_sftp(self) -> paramiko.SFTPClient:  # type: ignore[override]
+        transport = self.get_transport()
+        if transport is None:
+            raise SSHError("SSH-Verbindung ist nicht (mehr) offen.")
+        chan = transport.open_session()
+        chan.settimeout(_SSH_TIMEOUT)
+        chan.exec_command(f"sudo -n -H -- {shlex.quote(_SSH_SUDO_SFTP_SERVER)}")
+        try:
+            sftp = paramiko.SFTPClient(chan)
+        except (paramiko.SSHException, EOFError, OSError) as e:
+            detail = ""
+            try:
+                if chan.recv_stderr_ready():
+                    detail = chan.recv_stderr(2000).decode("utf-8", errors="replace").strip()
+            except Exception:
+                pass
+            chan.close()
+            raise SSHError(
+                "SFTP ueber sudo konnte nicht gestartet werden"
+                + (f" ({detail.splitlines()[0][:200]})" if detail else "")
+                + f". sudoers-Eintrag fuer {_SSH_SUDO_SFTP_SERVER} und den Pfad "
+                "(PLESK_SSH_SUDO_SFTP_SERVER) pruefen (README 'Betrieb ohne root')."
+            ) from e
+        chan.settimeout(None)
+        return sftp
+
+
 def _ssh_connect() -> paramiko.SSHClient:
     if not _SSH_HOST or not _SSH_USER:
         raise SSHError(
             "PLESK_SSH_HOST/PLESK_SSH_USER sind nicht gesetzt (Umgebungsvariablen fehlen)."
         )
-    client = paramiko.SSHClient()
+    client = _SudoSSHClient() if _SSH_SUDO else paramiko.SSHClient()
     try:
         _configure_host_keys(client)
     except SSHError:
@@ -575,6 +690,7 @@ def _ssh_exec(
         client.close()
     out = raw_out.decode("utf-8", errors="replace")
     err = raw_err.decode("utf-8", errors="replace")
+    _check_sudo_refused(err, exit_code)
     if truncated:
         out += _TRUNCATED_NOTE
     return out, err, exit_code
@@ -975,9 +1091,11 @@ def _client_exec(
         stdout.channel, timeout or _SSH_TIMEOUT, max_runtime or _SSH_MAX_RUNTIME
     )
     out = raw_out.decode("utf-8", errors="replace")
+    err = raw_err.decode("utf-8", errors="replace")
+    _check_sudo_refused(err, exit_code)
     if truncated:
         out += _TRUNCATED_NOTE
-    return out, raw_err.decode("utf-8", errors="replace"), exit_code
+    return out, err, exit_code
 
 
 # ---------------------------------------------------------------------------
@@ -1172,13 +1290,18 @@ def _mysql_exec(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def get_version() -> str:
     """Version des laufenden Plesk-MCP-Servers abfragen (Redeploy-Kontrolle)."""
-    return json.dumps({"name": "plesk-mcp", "version": __version__, "commit": os.environ.get("GIT_SHA", "unbekannt")})
+    info: dict[str, Any] = {"name": "plesk-mcp", "version": __version__,
+                            "commit": os.environ.get("GIT_SHA", "unbekannt"),
+                            "read_only": _READ_ONLY, "ssh_sudo": _SSH_SUDO}
+    if _READ_ONLY:
+        info["hidden_write_tools"] = len(_READ_ONLY_HIDDEN)
+    return json.dumps(info)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def domain_info(domain: str) -> str:
     """Zeigt allgemeine Plesk-Domain-Infos: Status, Disk-Space (Limit/Nutzung),
     Traffic, Hosting-Typ, IP, SSL-Zertifikat, Subscription/Service-Plan.
@@ -1188,7 +1311,7 @@ def domain_info(domain: str) -> str:
     return ssh_run(f"plesk bin domain -i {shlex.quote(d)}")
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def dns_records(domain: str) -> str:
     """Zeigt die DNS-Resource-Records der Domain-Zone.
     Entspricht `plesk bin dns --info <domain>`.
@@ -1468,7 +1591,7 @@ def dns_update_record(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def backup_list(domain: str = "") -> str:
     """Listet vorhandene lokale Backup-Dateien auf (Server- und
     Domain-/Subscription-Backups unter /var/lib/psa/dumps, dem Plesk-
@@ -1494,7 +1617,7 @@ def backup_list(domain: str = "") -> str:
     return out
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def wp_toolkit_list(with_plugins: bool = False) -> str:
     """Listet alle vom WP Toolkit verwalteten WordPress-Installationen auf.
     Entspricht `plesk ext wp-toolkit --list` (optional mit -plugins für
@@ -1506,7 +1629,7 @@ def wp_toolkit_list(with_plugins: bool = False) -> str:
     return ssh_run(cmd)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def wp_toolkit_info(instance_id: str) -> str:
     """Zeigt Detail-Infos zu einer einzelnen WordPress-Installation (Version,
     Pfad, Updates, Plugins/Themes). instance_id kommt aus wp_toolkit_list.
@@ -1518,7 +1641,7 @@ def wp_toolkit_info(instance_id: str) -> str:
     return ssh_run(f"plesk ext wp-toolkit --info -instance-id {iid}")
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def plesk_api_get(path: str, query: str = "") -> str:
     """Read-only GET-Request gegen die Plesk-REST-API für strukturierte
     JSON-Daten (Domains, Subscriptions, Kunden etc.), als Ergänzung zu den
@@ -1890,7 +2013,7 @@ def customer_delete(login: str, confirm_login: str = "", confirm: bool = False) 
     gone = "gelöscht" if code != 0 else "NOCH VORHANDEN - bitte prüfen"
     return f"Vorher:\n{summary}\n\n{res}\n\nKontrolle: Kundenaccount {gone}"
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def lve_stats(domain: str) -> str:
     """Sucht die aktuellen LVE-Ressourcenwerte (CPU/IO-Limits und -Faults)
     für die angegebene Domain, z.B. um kurzzeitige Nichterreichbarkeit durch
@@ -1904,7 +2027,7 @@ def lve_stats(domain: str) -> str:
     return out or f"Keine LVE-Daten für '{d}' gefunden."
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def fpm_service_status(domain: str) -> str:
     """Findet den PHP-FPM-systemd-Service der Domain (Plesk erstellt pro Domain
     einen eigenen Pool-Service, z.B. plesk-php82-fpm_domain.ch_216.service)
@@ -1919,7 +2042,7 @@ def fpm_service_status(domain: str) -> str:
     return f"Gefundene Units:\n{units}\n\nStatus von {first_unit}:\n{status}"
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def fpm_journal(domain: str, since: str = "-2h", until: str = "") -> str:
     """Zeigt systemd-Journal-Einträge (Start/Stop/Crash/Fehler) des
     FPM-Service der Domain im angegebenen Zeitfenster.
@@ -1950,7 +2073,7 @@ def _clamp_lines(lines: Any) -> int:
     return max(1, min(_LOG_LINES_MAX, n))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def search_log(
     domain: str,
     log_type: str = "proxy_error_log",
@@ -1994,7 +2117,7 @@ def search_log(
     return ssh_run(cmd)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def search_main_nginx_log(
     pattern: str,
     log: str = "access",
@@ -2025,7 +2148,7 @@ def search_main_nginx_log(
     return ssh_run(cmd)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def check_oom_kills(since: str = "-24h", until: str = "", domain: str = "") -> str:
     """Prüft im Kernel-Journal auf Out-Of-Memory-Kills im angegebenen
     Zeitfenster - klassischer Grund für "Seite bricht immer wieder weg".
@@ -2044,7 +2167,7 @@ def check_oom_kills(since: str = "-24h", until: str = "", domain: str = "") -> s
     return out
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def disk_usage(domain: str) -> str:
     """Zeigt die Disk-Nutzung des Vhost-Verzeichnisses der Domain
     (httpdocs, logs, etc. einzeln aufgeschlüsselt)."""
@@ -2052,7 +2175,7 @@ def disk_usage(domain: str) -> str:
     return ssh_run(f"du -sh /var/www/vhosts/{shlex.quote(d)}/* 2>&1")
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def read_vhost_file(domain: str, path: str, encoding: str = "text") -> str:
     """Liest eine Datei aus dem Vhost-Verzeichnis der Domain
     (/var/www/vhosts/<domain>/<path>, path relativ, z.B. "httpdocs/index.php").
@@ -3665,7 +3788,7 @@ class _SSHHelperSession:
         try:
             self.chan = self.client.get_transport().open_session()
             self.chan.settimeout(_HELPER_TIMEOUT)
-            self.chan.exec_command(cmd)
+            self.chan.exec_command(_ssh_command(cmd))
         except Exception:
             self.client.close()
             raise
@@ -3980,7 +4103,7 @@ def upload_begin(
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def upload_status(upload_id: str) -> str:
     """Status eines Uploads: pending/uploading/completed/expired/failed, mit
     path, size und sha256 - zur Kontrolle nach dem Upload."""
@@ -4254,7 +4377,7 @@ def fetch_to_vhost(
 # --- Dateiverwaltung ---------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def list_vhost_dir(domain: str, path: str = ".", depth: int = 1) -> str:
     """Listet ein Verzeichnis unter /var/www/vhosts/<domain>/ (rein lesend):
     Name, Typ (file/dir/symlink), Grösse, Rechte, Besitzer, Änderungsdatum.
@@ -5223,7 +5346,7 @@ def _wp_css_change(domain: str, wp_path: str, stylesheet: str, new_css: str,
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 @_wp_reporting
 def wp_custom_css_show(domain: str, wp_path: str, stylesheet: str = "") -> str:
     """Zeigt das "Zusätzliche CSS" aus dem WordPress-Customizer (Design >
@@ -5409,7 +5532,7 @@ def _wp_comment_fetch(client, ctx, wp_dir: str, ids: list[int]) -> dict[int, dic
     return {int(r["comment_ID"]): r for r in rows if r.get("comment_ID")}
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 @_wp_reporting
 def wp_comment_list(
     domain: str,
@@ -6014,7 +6137,7 @@ def _wp_ext_rollback(kind: str, backup_id: str, items: list[str] | None, confirm
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 @_wp_reporting
 def wp_plugin_list(domain: str, wp_path: str, only_updates: bool = False) -> str:
     """Listet die Plugins einer WordPress-Installation per WP-CLI mit Status,
@@ -6071,7 +6194,7 @@ def wp_plugin_rollback(backup_id: str, plugins: list[str] | None = None, confirm
     return _wp_ext_rollback("plugin", backup_id, plugins, confirm)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 @_wp_reporting
 def wp_theme_list(domain: str, wp_path: str, only_updates: bool = False) -> str:
     """Listet die Themes einer WordPress-Installation per WP-CLI mit Status
@@ -6215,7 +6338,7 @@ def _ts_to_iso(raw: str | None) -> str | None:
         return None
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def wp_sites_overview(filter: str = "", max_backup_age_days: int = 3) -> str:
     """Übersicht aller WordPress-Installationen auf dem Server (Suche nach
     wp-config.php unter /var/www/vhosts, unabhängig vom WP Toolkit).
@@ -6625,7 +6748,7 @@ def _wc_open(domain: str, wp_path: str):
     return client, ctx, wp_dir, uid, d
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 @_wp_reporting
 def wc_coupon_list(
     domain: str,
@@ -6663,7 +6786,7 @@ def wc_coupon_list(
                        "gutscheine": [_wc_coupon_view(r) for r in rows]}, ensure_ascii=False, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 @_wp_reporting
 def wc_coupon_get(domain: str, wp_path: str, coupon: str) -> str:
     """Zeigt einen WooCommerce-Gutschein mit allen Feldern - coupon ist die
@@ -7026,7 +7149,7 @@ def _wc_order_eval(client, ctx, wp_dir: str, php: str, payload: dict[str, Any]) 
     return data
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 @_wp_reporting
 def wc_order_get(domain: str, wp_path: str, order_id: str) -> str:
     """Zeigt eine WooCommerce-Bestellung: Status, Betrag, Rechnungs-/Lieferadresse,
@@ -7572,7 +7695,7 @@ def _wc_check_note(note: str) -> str:
     return s
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 @_wp_reporting
 def wc_stock_get(domain: str, wp_path: str, product: str) -> str:
     """Zeigt den Lagerbestand eines WooCommerce-Produkts oder einer Variante.
@@ -7853,7 +7976,7 @@ def _parse_site_hosting(text: str) -> dict[str, str]:
     return out
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def hosting_settings(domain: str) -> str:
     """Zeigt die Hosting-Einstellungen einer Domain: aktueller PHP-Handler
     (ID, PHP-Version, Typ fpm/fastcgi/cgi), PHP-Einstellungen (memory_limit,
@@ -8441,7 +8564,7 @@ def _phps_change(domain: str, target_fn, confirm: bool, source: str) -> str:
         lock.release()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def php_settings_show(domain: str) -> str:
     """Zeigt die PHP-Einstellungen einer Domain (Plesk "PHP-Einstellungen"):
     die Abschnitte von `plesk bin site --show-php-settings` ("General
@@ -9090,7 +9213,7 @@ def _web_nginx_change(domain: str, target_fn, confirm: bool, source: str) -> str
         lock.release()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def web_server_settings_show(domain: str) -> str:
     """Zeigt die Webserver-Einstellungen einer Domain (Plesk "Apache &
     nginx-Einstellungen"), u.a. Expires-Header (Browser-Caching),
@@ -10712,7 +10835,7 @@ def _json(obj: Any) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def imunify_malware_list(
     domain: str = "",
     path: str = "",
@@ -10787,7 +10910,7 @@ def _imunify_ignore_entries(search: str, limit: int = 500, offset: int = 0) -> d
     return _imunify_run(args)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def imunify_ignore_list(search: str = "", limit: int = 50, offset: int = 0) -> str:
     """Listet die Einträge der Imunify360-Malware-Ignore-Liste auf
     (imunify360-agent malware ignore list) - read-only.
@@ -10902,7 +11025,7 @@ def imunify_ignore_remove(path: str, confirm: bool = False, skip_rescan: bool = 
     })
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def db_list(domain: str = "") -> str:
     """Listet MySQL/MariaDB-Datenbanken auf dem Server auf (SHOW DATABASES,
     authentifiziert über den Plesk-internen Admin-DB-Zugang aus
@@ -10947,7 +11070,7 @@ def db_list(domain: str = "") -> str:
     return "\n".join(lines).strip()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def db_query(database: str, sql: str) -> str:
     """Führt eine einzelne, reine Lese-Query gegen eine MySQL/MariaDB-
     Datenbank auf dem Server aus (SELECT/SHOW/EXPLAIN/DESCRIBE). Nutzt
@@ -10973,7 +11096,7 @@ def db_query(database: str, sql: str) -> str:
     return out or "(keine Ausgabe)"
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def db_search(
     database: str,
     term: str,
@@ -11043,7 +11166,7 @@ def db_search(
     return header + "\n\n".join(results)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def server_load() -> str:
     """Zeigt allgemeine Serverlast: uptime/Load-Average, freier Speicher,
     Anzahl laufender Prozesse - für Checks, ob der ganze Server unter
@@ -11051,7 +11174,7 @@ def server_load() -> str:
     return ssh_run("uptime && echo --- && free -h && echo --- && ps aux | wc -l")
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def run_diagnostic(command: str) -> str:
     """Führt einen read-only Diagnose-Befehl auf dem Server aus, für Fälle,
     die von den anderen Tools nicht abgedeckt sind. Nur eine Whitelist an
@@ -11488,7 +11611,7 @@ def _psi_run(url: str, strategy: str, categories: list[str], locale: str) -> dic
     return resp.json()
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY_TOOL)
 def pagespeed_insights(
     url: str,
     strategy: str = "mobile",
@@ -11690,6 +11813,10 @@ def _build_http_app():
         # /upload/{id}: eigenes Einmal-Token statt MCP_API_KEY (siehe upload_begin),
         # ohne gültiges Token immer 401 - gleich stark wie der MCP-Endpunkt.
         if scope["type"] == "http" and scope["path"].startswith("/upload/"):
+            if _READ_ONLY:
+                # Nur-Lese-Modus: kein Schreibweg, auch nicht mit einem Token
+                await JSONResponse({"error": "read_only"}, status_code=403)(scope, receive, send)
+                return
             await _upload_asgi(scope, receive, send)
             return
         await cors_app(scope, receive, send)
@@ -11704,7 +11831,12 @@ async def _run_http_server() -> None:
     config = uvicorn.Config(app, host=_HTTP_HOST, port=_HTTP_PORT, log_level="info")
     srv = uvicorn.Server(config)
     print(f"plesk-mcp HTTP server running on {_HTTP_HOST}:{_HTTP_PORT}", flush=True)
-    if _TRASH_AUTOCLEAN_DAYS > 0:
+    if _READ_ONLY:
+        print(f"Nur-Lese-Modus (MCP_READ_ONLY): {len(_READ_ONLY_HIDDEN)} schreibende Tools nicht registriert, "
+              "Upload-Endpunkt aus.", flush=True)
+    if _SSH_SUDO:
+        print("SSH ohne root-Login (PLESK_SSH_SUDO): Kommandos und SFTP laufen ueber sudo.", flush=True)
+    if _TRASH_AUTOCLEAN_DAYS > 0 and not _READ_ONLY:
         threading.Thread(target=_trash_autoclean, daemon=True).start()
     await srv.serve()
 
@@ -11806,6 +11938,8 @@ _wpsite_runner = _WPSiteRunner(
 _WPSITE_TOOLS = _wpsite_register_all(
     _mcp_tool, _wpsite_runner, {t.name for t in mcp._tool_manager.list_tools()}
 )
+if _READ_ONLY:
+    _WPSITE_TOOLS["registered"] = [n for n in _WPSITE_TOOLS["registered"] if n not in set(_READ_ONLY_HIDDEN)]
 
 
 def _check_startup_config() -> list[str]:
@@ -11833,6 +11967,22 @@ def _check_startup_config() -> list[str]:
             "WARNUNG: PUBLIC_BASE_URL ist gesetzt, aber UPLOAD_TRUSTED_PROXIES ist leer - das "
             "Upload-Rate-Limit sieht nur die IP des Reverse-Proxys (ein gemeinsamer Bucket fuer "
             "alle Clients). IP(s) des Proxys, wie der Container sie sieht, eintragen."
+        )
+    if _env_flag("PLESK_SSH_SUDO") and _SSH_USER == "root":
+        warnings.append(
+            "WARNUNG: PLESK_SSH_SUDO ist gesetzt, aber PLESK_SSH_USER ist root - sudo wird nicht "
+            "verwendet. Fuer den Betrieb ohne root-Login einen eigenen SSH-User eintragen."
+        )
+    if _SSH_USER != "root" and not _SSH_SUDO:
+        warnings.append(
+            f"WARNUNG: PLESK_SSH_USER ist {_SSH_USER} (nicht root) und PLESK_SSH_SUDO ist nicht gesetzt - "
+            "die meisten Tools brauchen root-Rechte und scheitern so. PLESK_SSH_SUDO=true setzen "
+            "(README 'Betrieb ohne root')."
+        )
+    if _READ_ONLY and _TRASH_AUTOCLEAN_DAYS > 0:
+        warnings.append(
+            "WARNUNG: VHOST_TRASH_AUTOCLEAN_DAYS ist gesetzt, im Nur-Lese-Modus (MCP_READ_ONLY) "
+            "wird der Papierkorb aber nicht aufgeraeumt."
         )
     return warnings
 
