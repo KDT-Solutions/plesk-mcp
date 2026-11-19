@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 KDT-Solutions GmbH
 """
 plesk-mcp
 
@@ -85,6 +87,11 @@ from mcp_types import ToolAnnotations
 _HTTP_HOST = os.environ.get("MCP_HOST", "0.0.0.0")
 _HTTP_PORT = int(os.environ.get("MCP_PORT", "8000"))
 _MCP_API_KEY = os.environ.get("MCP_API_KEY", "")
+# Lizenz und Adresse des Quelltexts, abfragbar ueber get_version. Wer eine
+# geaenderte Version als Dienst betreibt, traegt hier die Adresse des eigenen
+# Quelltexts ein (AGPL-3.0, Abschnitt 13).
+_LICENSE_ID = "AGPL-3.0-only"
+_SOURCE_URL = os.environ.get("SOURCE_URL", "").strip() or "https://github.com/KDT-Solutions/plesk-mcp"
 
 # Version = <Major.Minor>.<Patch>. Major.Minor wird hier von Hand gepflegt, der
 # Patch-Teil zaehlt automatisch: Anzahl Commits seit dem Commit, der diese
@@ -1295,7 +1302,8 @@ def get_version() -> str:
     """Version des laufenden Plesk-MCP-Servers abfragen (Redeploy-Kontrolle)."""
     info: dict[str, Any] = {"name": "plesk-mcp", "version": __version__,
                             "commit": os.environ.get("GIT_SHA", "unbekannt"),
-                            "read_only": _READ_ONLY, "ssh_sudo": _SSH_SUDO}
+                            "read_only": _READ_ONLY, "ssh_sudo": _SSH_SUDO,
+                            "license": _LICENSE_ID, "source": _SOURCE_URL}
     if _READ_ONLY:
         info["hidden_write_tools"] = len(_READ_ONLY_HIDDEN)
     return json.dumps(info)

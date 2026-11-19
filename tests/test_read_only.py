@@ -98,6 +98,8 @@ def test_get_version_reports_mode():
     info = json.loads(server.get_version())
     assert info["read_only"] is False and info["ssh_sudo"] is False
     assert "hidden_write_tools" not in info
+    assert info["license"] == "AGPL-3.0-only"
+    assert info["source"].startswith("https://")
 
 
 @pytest.fixture

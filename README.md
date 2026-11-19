@@ -60,6 +60,7 @@ Fast alle Tools sind read-only: kein Neustart von Services, keine destruktiven K
 | `IMAGE_OPT_BG_TOOL_TIMEOUT` | nein | `300` | Timeout in Sekunden pro Aufruf von `jpegoptim`/`optipng` im Hintergrundmodus (`optimize_images(hintergrund=true)`) |
 | `REPLACE_MAX_BYTES` | nein | `5242880` | Maximale Dateigrösse in Bytes für `replace_in_vhost_file(s)` (Standard 5 MB) |
 | `AUDIT_LOG_FILE` | nein | – | Optionaler Pfad im Container für das Audit-Log (zusätzlich zu stderr) |
+| `SOURCE_URL` | nein | Adresse dieses Repos | Adresse des Quelltexts, die `get_version` meldet. Wer eine geänderte Version betreibt, trägt hier die Adresse des eigenen Quelltexts ein (siehe "Lizenz") |
 | `MCP_API_KEY` | ja | – | Statisches Bearer-Token zum Schutz des öffentlichen Endpoints, mindestens 32 Zeichen Zufall (z.B. `python -c "import secrets; print(secrets.token_urlsafe(32))"`). Ohne Token oder mit kürzerem Token startet der Server nicht (fail-safe) |
 | `MCP_READ_ONLY` | nein | – | `true`: Nur-Lese-Modus. Es werden nur Tools registriert, die ausdrücklich als lesend markiert sind; alle schreibenden Tools existieren für den Client nicht, der Upload-Endpunkt antwortet mit `403` (siehe "Nur-Lese-Modus") |
 | `AUTH_MAX_FAILURES` | nein | `10` | Brute-Force-Bremse: nach so vielen fehlgeschlagenen Bearer-Prüfungen innerhalb von `AUTH_FAILURE_WINDOW` antwortet der Server auf Requests ohne gültiges Token mit `429` statt `401` (ungültiger Wert = Standard) |
@@ -581,4 +582,17 @@ pip install -r requirements.txt pytest pytest-asyncio
 pytest
 ```
 
-Die Tests laufen nicht in GitHub Actions und landen nicht im Docker-Image (dort werden nur `server.py` und `wpsite/` kopiert).
+Die Tests laufen nicht in GitHub Actions und landen nicht im Docker-Image (dort werden nur `server.py`, `wpsite/` und `LICENSE` kopiert).
+
+## Lizenz
+
+Copyright (C) 2026 KDT-Solutions GmbH
+
+plesk-mcp ist freie Software unter der GNU Affero General Public License, Version 3 (AGPL-3.0-only). Der vollständige Wortlaut steht in `LICENSE`.
+
+- Nutzen, Ändern und Weitergeben sind erlaubt. Wer eine geänderte Version weitergibt oder als Netzwerkdienst für andere betreibt, muss den Quelltext dieser Version unter derselben Lizenz zugänglich machen.
+- Es gibt keine Gewährleistung.
+- `get_version` meldet Lizenz und Adresse des Quelltexts. Wer eine geänderte Version betreibt, trägt die Adresse des eigenen Quelltexts über `SOURCE_URL` ein.
+- Beiträge (Pull Requests) werden unter derselben Lizenz angenommen.
+- Der PHP-Code unter `wpsite/php/tabside-mcp/` stammt aus dem Plugin `tabside-mcp` (Repo `tabside/wordpress-mcp`) und steht dort unter GPL-2.0-or-later; diese Lizenz gilt für diese Dateien auch hier.
+- Die Abhängigkeiten aus `requirements.txt` stehen unter ihren eigenen Lizenzen (MIT, BSD, Apache-2.0, LGPL-2.1, MPL-2.0 und weitere).

@@ -5,8 +5,11 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY server.py ./
+COPY server.py LICENSE ./
 COPY wpsite ./wpsite
+
+LABEL org.opencontainers.image.licenses="AGPL-3.0-only" \
+      org.opencontainers.image.source="https://github.com/KDT-Solutions/plesk-mcp"
 
 # Nicht als root laufen (wie infra-mcp, UID 10001). Der Container braucht
 # keine Root-Rechte: nur ausgehende SSH-/HTTPS-Verbindungen und Port 8000.

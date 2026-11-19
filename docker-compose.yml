@@ -58,6 +58,7 @@ services:
       - PLESK_HELPER_PYTHON=${PLESK_HELPER_PYTHON:-/usr/libexec/platform-python}
       - PLESK_HELPER_TIMEOUT=${PLESK_HELPER_TIMEOUT:-600}
       - AUDIT_LOG_FILE=${AUDIT_LOG_FILE:-}
+      - SOURCE_URL=${SOURCE_URL:-}
       # Mindestens 32 Zeichen, sonst kein Start
       - MCP_API_KEY=${MCP_API_KEY}
       # true = nur lesende Tools (README "Nur-Lese-Modus")

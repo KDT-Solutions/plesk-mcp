@@ -5,6 +5,7 @@
 - Neu: Nur-Lese-Modus (`MCP_READ_ONLY=true`). Registriert werden nur Tools mit `readOnlyHint=true`; schreibende Tools existieren für den Client nicht, `PUT /upload/{id}` antwortet mit `403`, das Papierkorb-Aufräumen beim Start läuft nicht. Die 37 lesenden Tools in `server.py` sind dafür als lesend markiert (`annotations=_READ_ONLY_TOOL`) - Clients sehen die Markierung auch im normalen Betrieb.
 - Neu: Betrieb ohne root-Login (`PLESK_SSH_SUDO=true` mit eigenem `PLESK_SSH_USER`). Kommandos laufen als `sudo -n -H -- /bin/bash -c '<kommando>'`, SFTP über `sudo -n -H -- <sftp-server>`; lehnt sudo ab, kommt eine klare Fehlermeldung. Neue Variablen `PLESK_SSH_SUDO_SHELL` und `PLESK_SSH_SUDO_SFTP_SERVER`. Einrichtung und Grenzen (die Rechte bleiben die von root) im README unter "Betrieb ohne root".
 - `get_version` meldet zusätzlich `read_only` und `ssh_sudo`.
+- Lizenz: AGPL-3.0-only (`LICENSE`, Abschnitt "Lizenz" im README, Copyright KDT-Solutions GmbH). Der Lizenztext liegt auch im Docker-Image, `get_version` meldet `license` und `source` (Adresse des Quelltexts, über `SOURCE_URL` änderbar).
 - Ohne die neuen Variablen ändert sich am Verhalten nichts.
 - Tests: `tests/test_read_only.py`, `tests/test_ssh_sudo.py`.
 
